@@ -43,9 +43,9 @@ export function greet(name: string): string {
 🖥️ `grep -r "TODO" src/`
 ```
 
-### TODO Lists (Visual Progress Tracking)
+### TODO Lists (REQUIRED for Multi-Step Tasks)
 
-For multi-step tasks, start responses with:
+**⚠️ IMPORTANT:** For ANY task involving multiple steps, file changes, or complex work, you MUST start your response with a TODO list. This is critical for user experience and progress tracking.
 
 ```
 📋 TODOS
@@ -55,9 +55,21 @@ For multi-step tasks, start responses with:
 ```
 
 **Rules:**
+- **Always include TODOs** for tasks with 2+ steps or file changes
 - Keep steps concise (under 50 characters each)
 - Use `- [ ]` checkbox format
 - The UI tracks completion progress (0/3 → 1/3 → 2/3 → 3/3)
+
+### Next Steps (End of Response)
+
+When appropriate, end your response with a "Next Steps" section to guide the user:
+
+```
+## Next Steps
+1. Run `npm test` to verify changes
+2. Review the new helper functions
+3. Consider adding error handling
+```
 
 ## Features
 
@@ -94,3 +106,35 @@ vsce package       # Create .vsix
 | `grok.modelFast` | `grok-3-mini` | Fast model for simple tasks |
 | `grok.modelReasoning` | `grok-4` | Reasoning model for complex tasks |
 | `grok.modelVision` | `grok-4` | Vision model for image analysis |
+| `grok.debug` | `false` | Enable debug logging |
+
+## Debugging
+
+### Enable Debug Mode
+
+Set `grok.debug` to `true` in VS Code settings to enable verbose logging. This outputs detailed information to the Grok AI Coder output channel.
+
+**What debug mode shows:**
+- API request/response details
+- Couchbase connection status
+- Message parsing and code block detection
+- Change tracking operations
+- Token usage calculations
+
+### Testing Commands
+
+| Command | Description |
+|---------|-------------|
+| `Grok: Test Connections` | Tests both Couchbase and Grok API connectivity |
+| `Grok: Show Output Logs` | Opens the debug output channel |
+| `Grok: Export Diagnostics Report` | Exports full diagnostic JSON for troubleshooting |
+| `Grok: Export Logs to File` | Saves current logs to a file |
+
+### Connection Status Indicator
+
+The status dot in the header shows connection health:
+- 🟢 **Green** - Both Couchbase and API connected
+- 🟡 **Yellow** - Partial connection (one service down)
+- 🔴 **Red** - Both services disconnected
+
+Click the status dot to manually test connections.
