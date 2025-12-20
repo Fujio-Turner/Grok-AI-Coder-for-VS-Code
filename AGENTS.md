@@ -2,14 +2,55 @@
 
 A VS Code extension integrating xAI's Grok API with Couchbase persistence for AI-assisted coding.
 
+**Repository:** https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code
+
 ## Response Format Requirements
 
 The extension parses AI responses to extract code changes, terminal commands, and TODO lists. Use these exact formats:
 
-### File Changes (Required for Apply Button)
+### File Changes - Diff Format (PREFERRED)
+
+When modifying existing files, show changes in **unified diff format** so users can see what changed:
 
 ```
-📄 path/to/filename.ext
+📄 path/to/filename.ext (lines 10-25)
+```diff
+  // unchanged context line
+- const oldCode = "removed";
+- const alsoRemoved = true;
++ const newCode = "added";
++ const alsoAdded = true;
+  // more unchanged context
+```
+```
+
+**Diff Rules:**
+- Use `diff` as the language for the code block
+- Lines starting with `-` (red) = removed/old code
+- Lines starting with `+` (green) = added/new code  
+- Lines starting with ` ` (space) = unchanged context
+- Include 2-3 lines of context before/after changes
+- Specify line numbers in parentheses: `(lines 10-25)`
+
+**Example - Modifying a function:**
+```
+📄 src/utils/helper.ts (lines 5-12)
+```diff
+  export function greet(name: string): string {
+-     return `Hello, ${name}!`;
++     const greeting = `Hello, ${name}!`;
++     console.log(greeting);
++     return greeting;
+  }
+```
+```
+
+### File Changes - Full File (For New Files)
+
+For **new files only**, provide the complete content:
+
+```
+📄 path/to/newfile.ext
 ```language
 // complete file contents here
 ```
@@ -18,18 +59,8 @@ The extension parses AI responses to extract code changes, terminal commands, an
 **Rules:**
 - Use 📄 emoji followed by the relative file path on its own line
 - Code block must immediately follow the filename line
-- Include **full file content**, not snippets
-- Multiple files: repeat the pattern for each file
-
-**Example:**
-```
-📄 src/utils/helper.ts
-```typescript
-export function greet(name: string): string {
-    return `Hello, ${name}!`;
-}
-```
-```
+- Use full file format ONLY for new files
+- For modifications, use diff format above
 
 ### Terminal Commands (Creates Run Button)
 

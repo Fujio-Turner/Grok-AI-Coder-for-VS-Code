@@ -10,12 +10,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fujio-turner/grok-ai-coder"
+    "url": "https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code"
   },
   "bugs": {
-    "url": "https://github.com/fujio-turner/grok-ai-coder/issues"
+    "url": "https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code/issues"
   },
-  "homepage": "https://github.com/fujio-turner/grok-ai-coder#readme",
+  "homepage": "https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -153,17 +153,23 @@
           "description": "Vision model for image analysis",
           "order": 4
         },
-        "grok.defaultModelType": {
+        "grok.modelBase": {
+          "type": "string",
+          "default": "grok-3",
+          "description": "Base model (standard)",
+          "order": 5
+        },
+        "grok.modelMode": {
           "type": "string",
           "default": "fast",
-          "enum": ["fast", "reasoning", "vision"],
+          "enum": ["fast", "smart", "base"],
           "enumDescriptions": [
-            "Fast model - quick responses, simple tasks",
-            "Reasoning model - complex analysis, multi-step planning",
-            "Vision model - image understanding and analysis"
+            "Fast (F) - Quick responses, cost-efficient",
+            "Smart (S) - Reasoning model for complex tasks",
+            "Base (B) - Standard model"
           ],
-          "description": "Which model type to use by default",
-          "order": 5
+          "description": "Which model mode to use (toggle with F/S/B button)",
+          "order": 6
         },
         "grok.couchbaseDeployment": {
           "type": "string",

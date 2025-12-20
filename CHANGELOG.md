@@ -59,5 +59,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[0.1.0]: https://github.com/your-username/grok-ai-coder/releases/tag/v0.1.0
-[Unreleased]: https://github.com/your-username/grok-ai-coder/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code/compare/v0.1.0...HEAD

@@ -12,7 +12,8 @@
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#usage">Usage</a> •
-  <a href="#configuration">Configuration</a>
+  <a href="#configuration">Configuration</a> •
+  <a href="https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code">GitHub</a>
 </p>
 
 ---
@@ -25,7 +26,7 @@
 - **💾 Persistent History** — Chat sessions saved to Couchbase, never lose context
 - **🔄 Change Tracking** — Every edit tracked with full rewind/forward capability
 - **📸 Multimodal** — Attach images for visual context using Grok's vision model
-- **⚡ Smart Models** — Auto-selects fast (grok-3-mini) or reasoning (grok-4) based on task
+- **⚡ Model Picker** — Toggle between Fast (F), Smart (S), and Base (B) models
 - **📋 TODO Progress** — Visual tracking of multi-step tasks
 - **🖥️ Run Commands** — Execute suggested terminal commands with one click
 
@@ -69,23 +70,9 @@ CREATE INDEX `find_chats_v1` ON `grokCoder`(`projectId`,`updatedAt` DESC) WHERE 
 
 Click the **Grok AI** icon in the Activity Bar to open the chat sidebar.
 
-```
-┌─────────────────────────────────────┐
-│ ▼ Session Name          ● A + ⚙️   │  ← Header
-├─────────────────────────────────────┤
-│ 📋 TODOs (1/3)                      │  ← Progress
-├─────────────────────────────────────┤
-│   💬 Chat messages                  │
-│   📄 file.ts                        │
-│   ┌─────────────────────────────┐   │
-│   │ // AI-generated code        │   │
-│   └─────────────────────────────┘   │
-├─────────────────────────────────────┤
-│ 3 files +42 -12   $0.02   ◐ 15%    │  ← Changes Bar
-├─────────────────────────────────────┤
-│ 📎 [Type message...        ] Send   │  ← Input
-└─────────────────────────────────────┘
-```
+<p align="center">
+  <img src="media/screenshot.png" alt="Grok AI Coder Interface" width="400">
+</p>
 
 ### Header Controls
 
@@ -93,6 +80,7 @@ Click the **Grok AI** icon in the Activity Bar to open the chat sidebar.
 |---------|-------------|
 | **▼ Session** | View/switch chat history |
 | **●** | Connection status (click to test) |
+| **F/S/B** | Model picker: Fast, Smart, or Base (click to cycle) |
 | **A/M** | Toggle Auto/Manual apply mode |
 | **+** | New chat session |
 | **⚙️** | Settings |
@@ -120,9 +108,11 @@ Every code change is tracked. Click the **Changes Bar** to see history:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `grok.modelFast` | `grok-3-mini` | Fast model for simple tasks |
-| `grok.modelReasoning` | `grok-4` | Reasoning model for complex tasks |
-| `grok.modelVision` | `grok-4` | Vision model for images |
+| `grok.modelMode` | `fast` | Model mode: `fast`, `smart`, or `base` |
+| `grok.modelFast` | `grok-3-mini` | Model used in Fast mode |
+| `grok.modelReasoning` | `grok-4` | Model used in Smart mode |
+| `grok.modelBase` | `grok-3` | Model used in Base mode |
+| `grok.modelVision` | `grok-4` | Model used for images |
 | `grok.autoApply` | `true` | Auto-apply code changes |
 
 ### Couchbase Settings

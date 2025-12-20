@@ -150,6 +150,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'toggleAutoApply':
                     this.toggleAutoApply();
                     break;
+                case 'setModelMode':
+                    this.setModelMode(message.mode);
+                    break;
                 case 'testConnections':
                     this._testAndSendConnectionStatus();
                     break;
@@ -169,7 +172,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({
             type: 'config',
             enterToSend: config.get<boolean>('enterToSend', false),
-            autoApply: config.get<boolean>('autoApply', true)
+            autoApply: config.get<boolean>('autoApply', true),
+            modelMode: config.get<string>('modelMode', 'fast')
         });
     }
 
@@ -177,6 +181,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const config = vscode.workspace.getConfiguration('grok');
         const current = config.get<boolean>('autoApply', true);
         config.update('autoApply', !current, vscode.ConfigurationTarget.Global);
+        this._sendConfig();
+    }
+
+    public setModelMode(mode: string) {
+        const config = vscode.workspace.getConfiguration('grok');
+        config.update('modelMode', mode, vscode.ConfigurationTarget.Global);
         this._sendConfig();
     }
 
@@ -471,9 +481,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             this._abortController = new AbortController();
 
-            const modelType = detectModelType(messageText, hasImages);
-            const model = getModelName(modelType);
-            debug('Auto-detected model type:', { modelType, model, hasImages });
+            const config = vscode.workspace.getConfiguration('grok');
+            const modelMode = config.get<string>('modelMode', 'fast');
+            
+            let model: string;
+            if (hasImages) {
+                model = config.get<string>('modelVision', 'grok-4');
+            } else if (modelMode === 'smart') {
+                model = config.get<string>('modelReasoning', 'grok-4');
+            } else if (modelMode === 'base') {
+                model = config.get<string>('modelBase', 'grok-3');
+            } else {
+                model = config.get<string>('modelFast', 'grok-3-mini');
+            }
+            
+            info('Using model: ' + model + ' (mode: ' + modelMode + ')');
             
             request.model = model;
 
@@ -844,9 +866,12 @@ As you complete each step, the UI will track progress. Keep steps concise (under
 body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-foreground);background:var(--vscode-sideBar-background);height:100vh;display:flex;flex-direction:column}
 #hdr{padding:6px 10px;border-bottom:1px solid var(--vscode-panel-border);display:flex;justify-content:space-between;align-items:center;font-size:11px}
 #hdr-btns{display:flex;gap:6px;align-items:center}
-#auto-btn{border:none;border-radius:4px;padding:4px 8px;font-size:12px;font-weight:700;cursor:pointer;min-width:24px}
+#auto-btn,#model-btn{border:none;border-radius:4px;padding:4px 8px;font-size:12px;font-weight:700;cursor:pointer;min-width:24px}
 #auto-btn.auto{background:#2d7d46;color:#fff}
 #auto-btn.manual{background:#333;color:#fff}
+#model-btn.fast{background:#0099ff;color:#fff}
+#model-btn.smart{background:#7c3aed;color:#fff}
+#model-btn.base{background:#666;color:#fff}
 #new{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;padding:4px 10px;font-size:11px;font-weight:500;cursor:pointer}
 #new:hover{background:var(--vscode-button-hoverBackground)}
 #cfg{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:none;border-radius:4px;padding:4px 8px;font-size:16px;cursor:pointer}
@@ -868,15 +893,16 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .hist-sum{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hist-meta{font-size:10px;color:var(--vscode-descriptionForeground)}
 
-/* TODO Panel */
-#todo-bar{display:none;padding:4px 10px;background:var(--vscode-titleBar-activeBackground);border-bottom:1px solid var(--vscode-panel-border);align-items:center;gap:8px;font-size:11px;cursor:pointer}
-#todo-bar.show{display:flex}
+/* TODO Panel - Always visible */
+#todo-bar{display:flex;padding:6px 10px;background:var(--vscode-titleBar-activeBackground);border-bottom:1px solid var(--vscode-panel-border);align-items:center;gap:8px;font-size:11px;cursor:pointer}
 #todo-bar:hover{background:var(--vscode-list-hoverBackground)}
+#todo-bar.has-todos{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:4px;margin:4px 6px}
 #todo-toggle{font-size:10px;transition:transform .2s}
 #todo-toggle.open{transform:rotate(90deg)}
 #todo-title{font-weight:600}
 #todo-count{color:var(--vscode-descriptionForeground)}
-#todo-list{display:none;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border);font-size:11px}
+#todo-count.active{color:var(--vscode-charts-green);font-weight:600}
+#todo-list{display:none;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);font-size:11px;margin:0 6px 4px 6px;border:1px solid var(--vscode-panel-border);border-top:none;border-radius:0 0 4px 4px}
 #todo-list.show{display:block}
 .todo-item{padding:3px 0;display:flex;align-items:center;gap:6px}
 .todo-item.done{text-decoration:line-through;color:var(--vscode-descriptionForeground)}
@@ -959,12 +985,8 @@ pre code{background:none;padding:0}
 .term-body{padding:10px;font-family:var(--vscode-editor-font-family);font-size:11px;color:#d4d4d4;white-space:pre-wrap;max-height:200px;overflow-y:auto}
 .term-cmd{color:#569cd6}
 </style></head><body>
-<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
+<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
-
-<!-- TODO Panel -->
-<div id="todo-bar"><span id="todo-toggle">▶</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
-<div id="todo-list"></div>
 
 <div id="chat"></div>
 
@@ -975,6 +997,10 @@ pre code{background:none;padding:0}
 </div>
 
 <div id="inp">
+<!-- TODO Panel - above stats bar -->
+<div id="todo-bar"><span id="todo-toggle">▶</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
+<div id="todo-list"></div>
+
 <div id="stats">
     <div id="stats-left"><span id="stats-changes">0 files</span><span class="changes-info"><span class="stat-add">+0</span><span class="stat-rem">-0</span><span class="stat-mod">~0</span></span></div>
     <div id="stats-right"><span class="cost" id="stats-cost">$0.00</span><span class="pct">○ <span id="stats-pct">0%</span></span></div>
@@ -988,8 +1014,9 @@ const vs=acquireVsCodeApi(),chat=document.getElementById('chat'),msg=document.ge
 const changesPanel=document.getElementById('changes-panel'),changesList=document.getElementById('changes-list'),changesClose=document.getElementById('changes-close');
 const todoBar=document.getElementById('todo-bar'),todoToggle=document.getElementById('todo-toggle'),todoCount=document.getElementById('todo-count'),todoList=document.getElementById('todo-list');
 const autoBtn=document.getElementById('auto-btn');
+const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
-let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true;
+let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=false;
 const CTX_LIMIT=128000;
 
@@ -1009,6 +1036,22 @@ updateStatusDot();
 // Auto/Manual toggle
 autoBtn.onclick=()=>vs.postMessage({type:'toggleAutoApply'});
 
+// Model mode toggle (F=Fast, S=Smart, O=Old)
+modelBtn.onclick=()=>{
+    const modes=['fast','smart','base'];
+    const idx=(modes.indexOf(modelMode)+1)%modes.length;
+    modelMode=modes[idx];
+    updateModelBtn();
+    vs.postMessage({type:'setModelMode',mode:modelMode});
+};
+function updateModelBtn(){
+    const labels={fast:'F',smart:'S',base:'B'};
+    const titles={fast:'Fast - Quick responses, cost-efficient',smart:'Smart - Reasoning model for complex tasks',base:'Base - Standard model'};
+    modelBtn.textContent=labels[modelMode]||'F';
+    modelBtn.className=modelMode||'fast';
+    modelBtn.title='Model: '+titles[modelMode]+'\\nClick to cycle: F→S→B';
+}
+
 // TODO bar toggle
 todoBar.onclick=()=>{todoExpanded=!todoExpanded;todoToggle.classList.toggle('open',todoExpanded);todoList.classList.toggle('show',todoExpanded);};
 
@@ -1020,9 +1063,17 @@ document.addEventListener('click',e=>{if(!statsEl.contains(e.target)&&!changesPa
 function updateAutoBtn(){autoBtn.textContent=autoApply?'A':'M';autoBtn.className=autoApply?'auto':'manual';autoBtn.title=autoApply?'Auto Apply (click for Manual)':'Manual Apply (click for Auto)';}
 
 function renderTodos(){
-    if(currentTodos.length===0){todoBar.classList.remove('show');todoList.classList.remove('show');return;}
-    todoBar.classList.add('show');
-    todoCount.textContent='('+todosCompleted+'/'+currentTodos.length+')';
+    if(currentTodos.length===0){
+        todoBar.classList.remove('has-todos');
+        todoCount.classList.remove('active');
+        todoCount.textContent='(no tasks)';
+        todoList.innerHTML='<div style="color:var(--vscode-descriptionForeground);font-style:italic">No active tasks. AI will populate this when given multi-step work.</div>';
+        return;
+    }
+    todoBar.classList.add('has-todos');
+    const allDone=todosCompleted>=currentTodos.length;
+    todoCount.classList.toggle('active',!allDone);
+    todoCount.textContent=allDone?'✓ Complete':'('+todosCompleted+'/'+currentTodos.length+')';
     todoList.innerHTML=currentTodos.map((t,i)=>'<div class="todo-item'+(i<todosCompleted?' done':'')+'"><span class="check">'+(i<todosCompleted?'✓':'○')+'</span>'+esc(t)+'</div>').join('');
 }
 
@@ -1102,7 +1153,7 @@ case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});todosCompleted=Math.min(todosCompleted+1,currentTodos.length);renderTodos();}break;
-case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;updateAutoBtn();break;
+case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
