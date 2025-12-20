@@ -205,7 +205,7 @@ export function parseCodeBlocksFromResponse(responseText: string): ProposedEdit[
         return edits;
     }
     
-    const filePattern = /[📄🗎]\s*([^\s\n(]+)\s*(?:\(lines?\s*(\d+)(?:-(\d+))?\))?[\s\n]*```(\w+)?\n([\s\S]*?)```/g;
+    const filePattern = /[\u{1F4C4}\u{1F5CE}]\s*([^\s\n(]+)\s*(?:\(lines?\s*(\d+)(?:-(\d+))?\))?[\s\n]*```(\w+)?\n([\s\S]*?)```/gu;
     
     let match;
     let editIndex = 0;

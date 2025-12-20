@@ -1,17 +1,47 @@
 {
-  "name": "grok-coder",
+  "name": "grok-ai-coder",
   "displayName": "Grok AI Coder",
-  "description": "VS Code AI assistant powered by xAI Grok with Couchbase persistence",
-  "version": "0.0.1",
-  "publisher": "grok-coder",
+  "description": "AI-powered coding assistant with xAI's Grok models, persistent chat history, and full change tracking with rollback",
+  "version": "0.1.0",
+  "publisher": "fujio-turner",
+  "author": {
+    "name": "Fujio Turner"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fujio-turner/grok-ai-coder"
+  },
+  "bugs": {
+    "url": "https://github.com/fujio-turner/grok-ai-coder/issues"
+  },
+  "homepage": "https://github.com/fujio-turner/grok-ai-coder#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Programming Languages",
     "Machine Learning",
+    "Chat",
     "Other"
   ],
+  "keywords": [
+    "ai",
+    "grok",
+    "xai",
+    "coding assistant",
+    "chat",
+    "couchbase",
+    "code generation",
+    "refactoring",
+    "copilot",
+    "llm"
+  ],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1a1a2e",
+    "theme": "dark"
+  },
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -282,18 +312,22 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
+    
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "test": "npm run compile && mocha 'out/test/unit/**/*.test.js' --timeout 10000",
+    "test:vscode": "node ./out/test/runTest.js"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.6",
     "@types/node": "^20.10.0",
     "@types/uuid": "^9.0.7",
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
-    "@vscode/test-electron": "^2.3.8",
+    "@vscode/test-electron": "^2.5.2",
     "eslint": "^8.54.0",
+    "glob": "^10.3.10",
+    "mocha": "^10.2.0",
     "typescript": "^5.3.2"
   },
   "dependencies": {
