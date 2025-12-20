@@ -16,6 +16,8 @@ import {
     ChatSessionDocument
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
+import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
+import { parseResponse, GrokStructuredResponse } from '../prompts/responseParser';
 import { getModelName, ModelType, debug, info, error as logError, detectModelType } from '../utils/logger';
 import { 
     parseCodeBlocksFromResponse, 
@@ -29,6 +31,7 @@ import {
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
+import { runAgentWorkflow } from '../agent/agentOrchestrator';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -477,12 +480,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             info('API key found (starts with xai-), calling Grok API...');
             debug('API key length:', apiKey.length);
 
-            const messages = await this._buildMessages(messageText, hasImages ? images : undefined);
-
             this._abortController = new AbortController();
 
             const config = vscode.workspace.getConfiguration('grok');
             const modelMode = config.get<string>('modelMode', 'fast');
+            const fastModel = config.get<string>('modelFast', 'grok-3-mini');
             
             let model: string;
             if (hasImages) {
@@ -492,12 +494,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             } else if (modelMode === 'base') {
                 model = config.get<string>('modelBase', 'grok-3');
             } else {
-                model = config.get<string>('modelFast', 'grok-3-mini');
+                model = fastModel;
             }
             
             info('Using model: ' + model + ' (mode: ' + modelMode + ')');
             
             request.model = model;
+
+            // Agent workflow: analyze if files are needed and load them
+            let finalMessageText = messageText;
+            if (!hasImages) {
+                try {
+                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔍 Analyzing request...\n' });
+                    
+                    const agentResult = await runAgentWorkflow(
+                        messageText,
+                        apiKey,
+                        fastModel,
+                        (progress) => {
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📂 ${progress}\n` });
+                        }
+                    );
+                    
+                    if (agentResult.filesLoaded.length > 0) {
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `✅ Loaded ${agentResult.filesLoaded.length} file(s)\n\n` 
+                        });
+                        finalMessageText = agentResult.augmentedMessage;
+                        info(`Agent loaded ${agentResult.filesLoaded.length} files`);
+                    } else if (!agentResult.skipped) {
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files found\n\n' });
+                    }
+                } catch (agentError) {
+                    debug('Agent workflow error (continuing without files):', agentError);
+                }
+            }
+
+            const messages = await this._buildMessages(finalMessageText, hasImages ? images : undefined);
 
             const grokResponse = await sendChatCompletion(
                 messages,
@@ -512,6 +547,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     });
                 }
             );
+
+            // Parse structured JSON response (with legacy fallback)
+            const structured = parseResponse(grokResponse.text);
+            debug('Parsed structured response:', { 
+                hasTodos: !!structured.todos?.length,
+                hasFileChanges: !!structured.fileChanges?.length,
+                hasCommands: !!structured.commands?.length
+            });
 
             const successResponse: ChatResponse = {
                 text: grokResponse.text,
@@ -533,10 +576,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (pairIndex === 0) {
-                await this._generateSessionSummary(messageText, grokResponse.text);
+                await this._generateSessionSummary(messageText, structured.message || grokResponse.text);
             }
 
-            const edits = parseCodeBlocksFromResponse(grokResponse.text);
+            // Convert structured fileChanges to edits for apply functionality
+            let edits: ProposedEdit[] = [];
+            if (structured.fileChanges && structured.fileChanges.length > 0) {
+                const workspaceFolders = vscode.workspace.workspaceFolders;
+                if (workspaceFolders) {
+                    edits = structured.fileChanges.map((fc, idx) => ({
+                        id: `edit-${idx}`,
+                        fileUri: vscode.Uri.joinPath(workspaceFolders[0].uri, fc.path),
+                        range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                        newText: fc.content
+                    }));
+                }
+            } else {
+                // Fallback to legacy parsing if no structured fileChanges
+                edits = parseCodeBlocksFromResponse(grokResponse.text);
+            }
+
             let diffPreview: { file: string; stats: { added: number; removed: number; modified: number } }[] = [];
             if (edits.length > 0) {
                 diffPreview = await previewDiffStats(edits);
@@ -546,7 +605,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 type: 'requestComplete',
                 pairIndex,
                 response: successResponse,
-                diffPreview
+                diffPreview,
+                structured: {
+                    todos: structured.todos || [],
+                    summary: structured.summary || '',
+                    message: structured.message,
+                    sections: structured.sections || [],
+                    codeBlocks: structured.codeBlocks || [],
+                    fileChanges: structured.fileChanges || [],
+                    commands: structured.commands || [],
+                    nextSteps: structured.nextSteps || []
+                }
             });
 
             vscode.window.showInformationMessage('Grok completed the request.');
@@ -781,49 +850,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async _buildMessages(userText: string, images?: string[]): Promise<GrokMessage[]> {
         const messages: GrokMessage[] = [];
 
-        const agentContext = await readAgentContext();
-        let systemPrompt = `You are Grok, an AI coding assistant integrated into VS Code. Help the user with their coding tasks.
-
-IMPORTANT: When creating or modifying files, you MUST use this exact format so the IDE can apply changes automatically:
-
-📄 filename.ext
-\`\`\`language
-// complete file contents here
-\`\`\`
-
-For example, to create a Python file:
-📄 script.py
-\`\`\`python
-print("Hello World")
-\`\`\`
-
-Rules:
-- Always use the 📄 emoji followed by the filename on its own line
-- The code block must immediately follow the filename
-- Include the full file content, not snippets
-- You may include explanatory text before or after, but the 📄 filename + code block pattern is required for the Apply button to work
-
-TERMINAL COMMANDS: You can suggest terminal commands for the user to run. Use this format:
-🖥️ \`command here\`
-
-For example:
-🖥️ \`grep -r "TODO" src/\`
-🖥️ \`python script.py\`
-
-The user can click to execute these commands and see the output.
-
-TODO LIST: For any task involving multiple steps or file changes, START your response with a TODO list in this exact format:
-📋 TODOS
-- [ ] First step description
-- [ ] Second step description  
-- [ ] Third step description
-
-As you complete each step, the UI will track progress. Keep steps concise (under 50 chars each).
-`;
-
-        if (agentContext) {
-            systemPrompt += `\n\nProject Context:\n${agentContext}`;
-        }
+        // Use hardcoded system prompt with workspace info (project-agnostic)
+        const workspaceInfo = getWorkspaceInfo();
+        const systemPrompt = buildSystemPrompt(workspaceInfo);
 
         messages.push({ role: 'system', content: systemPrompt });
 
@@ -955,8 +984,45 @@ pre code{background:none;padding:0}
 .btn-p{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
 .btn-s{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 .btn-ok{background:var(--vscode-testing-iconPassed);color:#fff}
-.done{display:flex;align-items:center;gap:8px;margin-top:12px;padding:8px 10px;background:rgba(80,200,80,.1);border-radius:6px;border:1px solid var(--vscode-testing-iconPassed);font-size:12px}
-.done-txt{font-weight:600;color:var(--vscode-testing-iconPassed)}
+.done{display:flex;align-items:center;gap:6px;margin-top:8px;padding:4px 8px;background:rgba(80,200,80,.08);border-radius:4px;border-left:2px solid var(--vscode-testing-iconPassed);font-size:11px}
+.done-txt{font-weight:500;color:var(--vscode-testing-iconPassed)}
+.summary{font-size:13px;font-weight:500;color:var(--vscode-foreground);margin:0 0 12px 0;line-height:1.5}
+.section{margin-bottom:16px}
+.section h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 8px 0;padding-bottom:4px;border-bottom:1px solid var(--vscode-panel-border)}
+.section p{font-size:12px;line-height:1.5;margin:0 0 8px 0;color:var(--vscode-foreground)}
+.code-caption{font-size:11px;color:var(--vscode-descriptionForeground);margin:8px 0 4px 0;font-style:italic}
+.todos-panel{margin-bottom:12px;padding:10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-charts-blue)}
+.todos-hdr{font-size:12px;font-weight:600;color:var(--vscode-foreground);margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.todos-prog{font-size:10px;color:var(--vscode-descriptionForeground);font-weight:normal}
+.todos-list{list-style:none;margin:0;padding:0}
+.todo-item{display:flex;align-items:flex-start;gap:6px;padding:3px 0;font-size:12px;color:var(--vscode-foreground)}
+.todo-item.done{color:var(--vscode-descriptionForeground);text-decoration:line-through}
+.todo-box{color:var(--vscode-charts-blue);font-size:13px}
+.next-steps{margin-top:12px;padding:10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-textLink-foreground)}
+.next-steps-hdr{font-size:11px;font-weight:600;color:var(--vscode-textLink-foreground);margin-bottom:8px}
+.next-steps-btns{display:flex;flex-wrap:wrap;gap:6px}
+.next-step-btn{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:1px solid var(--vscode-panel-border);border-radius:12px;font-size:11px;cursor:pointer;transition:all .15s}
+.next-step-btn:hover{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border-color:var(--vscode-button-background)}
+.next-step-btn::before{content:'→';font-size:10px;opacity:.7}
+/* Checklists */
+.checklist{list-style:none;display:flex;align-items:flex-start;gap:6px;margin:4px 0}
+.checklist .check-box{color:var(--vscode-descriptionForeground);font-size:14px}
+.checklist.done{color:var(--vscode-descriptionForeground);text-decoration:line-through}
+.checklist.done .check-box{color:var(--vscode-testing-iconPassed)}
+/* Markdown tables */
+table{border-collapse:collapse;margin:10px 0;font-size:12px;width:100%}
+th,td{border:1px solid var(--vscode-panel-border);padding:6px 10px;text-align:left}
+th{background:var(--vscode-titleBar-activeBackground);font-weight:600}
+tr:nth-child(even){background:var(--vscode-editor-background)}
+/* Better code blocks - lighter background */
+pre{background:var(--vscode-editor-background);padding:12px;border-radius:6px;overflow-x:auto;margin:8px 0;font-size:12px;line-height:1.6;border:1px solid var(--vscode-panel-border)}
+pre code{background:none;padding:0;color:var(--vscode-editor-foreground);font-family:var(--vscode-editor-font-family);display:block}
+code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCodeBlock-background);padding:2px 6px;border-radius:3px;font-size:11px;color:var(--vscode-textPreformat-foreground)}
+/* Diff line highlighting */
+.diff-add{background:rgba(40,167,69,.15);color:#2ea043;display:block;margin:0 -12px;padding:0 12px}
+.diff-rem{background:rgba(248,81,73,.15);color:#f85149;display:block;margin:0 -12px;padding:0 12px;text-decoration:line-through;text-decoration-color:rgba(248,81,73,.5)}
+.diff-add::before{content:'+';margin-right:6px;font-weight:700}
+.diff-rem::before{content:'-';margin-right:6px;font-weight:700}
 #inp{padding:8px;border-top:1px solid var(--vscode-panel-border);display:flex;flex-direction:column;gap:6px}
 #stats{display:flex;justify-content:space-between;font-size:10px;color:var(--vscode-descriptionForeground);padding:0 4px;cursor:pointer}
 #stats:hover{background:var(--vscode-list-hoverBackground);margin:0 -4px;padding:2px 8px;border-radius:4px}
@@ -1071,17 +1137,24 @@ function renderTodos(){
         return;
     }
     todoBar.classList.add('has-todos');
-    const allDone=todosCompleted>=currentTodos.length;
+    const completedCount=currentTodos.filter(t=>t.completed).length;
+    const allDone=completedCount>=currentTodos.length;
     todoCount.classList.toggle('active',!allDone);
-    todoCount.textContent=allDone?'✓ Complete':'('+todosCompleted+'/'+currentTodos.length+')';
-    todoList.innerHTML=currentTodos.map((t,i)=>'<div class="todo-item'+(i<todosCompleted?' done':'')+'"><span class="check">'+(i<todosCompleted?'✓':'○')+'</span>'+esc(t)+'</div>').join('');
+    todoCount.textContent=allDone?'✓ Complete':'('+completedCount+'/'+currentTodos.length+')';
+    todoList.innerHTML=currentTodos.map((t,i)=>'<div class="todo-item'+(t.completed?' done':'')+'"><span class="check">'+(t.completed?'✓':'○')+'</span>'+esc(t.text)+'</div>').join('');
 }
 
+function parseTodosFromStructured(structured){
+    if(structured&&structured.todos&&structured.todos.length>0){
+        return structured.todos.map(t=>({text:t.text,completed:t.completed}));
+    }
+    return [];
+}
 function parseTodos(text){
     const match=text.match(/📋\\s*TODOS?\\s*\\n([\\s\\S]*?)(?=\\n\\n|📄|$)/i);
     if(match){
         const lines=match[1].split('\\n').filter(l=>l.trim().match(/^-\\s*\\[.?\\]/));
-        return lines.map(l=>l.replace(/^-\\s*\\[.?\\]\\s*/,'').trim()).filter(t=>t);
+        return lines.map(l=>({text:l.replace(/^-\\s*\\[.?\\]\\s*/,'').trim(),completed:false})).filter(t=>t.text);
     }
     return [];
 }
@@ -1141,10 +1214,13 @@ d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'load
 case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
-if(curDiv){curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML=fmtFinal(m.response.text||'',m.response.usage,m.diffPreview);updStats(m.response.usage);}
-// Parse TODOs from response
-const todos=parseTodos(m.response.text||'');if(todos.length>0){currentTodos=todos;todosCompleted=0;renderTodos();}
-// Auto-apply if enabled and has code blocks
+if(curDiv){curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML=fmtFinalStructured(m.structured,m.response.usage,m.diffPreview);updStats(m.response.usage);}
+// Use structured TODOs if available, fallback to legacy parsing
+let todos=[];
+if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
+else{todos=parseTodos(m.response.text||'');}
+if(todos.length>0){currentTodos=todos;renderTodos();}
+// Auto-apply if enabled and has file changes
 if(autoApply&&m.diffPreview&&m.diffPreview.length>0){vs.postMessage({type:'applyEdits',editId:'all'});}
 busy=0;curDiv=null;stream='';updUI();scrollToBottom();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');curDiv.querySelector('.c').innerHTML+='<div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
@@ -1152,7 +1228,11 @@ case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');cu
 case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
-case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});todosCompleted=Math.min(todosCompleted+1,currentTodos.length);renderTodos();}break;
+case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
+// Mark next uncompleted todo as done
+const nextIdx=currentTodos.findIndex(t=>!t.completed);
+if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
+renderTodos();}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 }});
@@ -1165,8 +1245,19 @@ else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div clas
 else if(p.response.status==='cancelled'){a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',null,null)+'<div style="color:#c44;margin-top:6px">⏹ Cancelled</div></div>';}
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
-function updStream(){if(!curDiv)return;curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div><div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:200px;overflow:hidden;line-height:1.5;margin-top:8px">'+fmtMd(stream.slice(-600))+'</div>';}
-function fmtFinal(t,u,diffPreview){let h=fmtCode(t,diffPreview);const uInfo=u?'<span style="margin-left:auto;font-size:11px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:14px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
+function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:200px;overflow:hidden;line-height:1.5;margin-top:8px">'+fmtMd(stream.slice(-600))+'</div>');}
+function fmtFinal(t,u,diffPreview){let h=fmtCode(t,diffPreview);const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
+function fmtFinalStructured(s,u,diffPreview){
+if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
+let h='';
+if(s.summary){h+='<p class="summary">'+esc(s.summary)+'</p>';}
+if(s.sections&&s.sections.length>0){s.sections.forEach(sec=>{h+='<div class="section"><h3>'+esc(sec.heading)+'</h3>';const content=(sec.content||'').replace(/\\\\n/g,'\\n');h+=fmtMd(content);if(sec.codeBlocks&&sec.codeBlocks.length>0){sec.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}h+='</div>';});}
+if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}
+if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);}
+if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const stats=previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+esc(fc.content)+'</code></pre></div></div>';});}
+if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<span style="color:var(--vscode-descriptionForeground);margin-left:8px">'+esc(cmd.description)+'</span>':'';h+='<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd.command)+'</span>'+desc+'<button class="btn btn-s" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" style="margin-left:auto">▶ Run</button></div></div>';});}
+if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
+const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
 function fmtCode(t,diffPreview){
 let out=t;const fileBlocks=[];const bt=String.fromCharCode(96);
 const pat=new RegExp('[📄🗎]\\\\s*([^\\\\s\\\\n(]+)\\\\s*(?:\\\\(lines?\\\\s*(\\\\d+)(?:-(\\\\d+))?\\\\))?[\\\\s\\\\n]*'+bt+bt+bt+'(\\\\w+)?\\\\n([\\\\s\\\\S]*?)'+bt+bt+bt,'g');
@@ -1179,23 +1270,78 @@ const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="sta
 const diffHtml='<div class="diff"><div class="diff-h"><span>📄 '+esc(b.file)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(b.file)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+esc(b.code)+'</code></pre></div></div>';out=out.replace(b.full,diffHtml);});
 return fmtMd(out);}
 function fmtMd(t){const bt=String.fromCharCode(96);
-t=t.replace(new RegExp(bt+bt+bt+'(\\\\w+)?\\\\n([\\\\s\\\\S]*?)'+bt+bt+bt,'g'),'<pre><code>$2</code></pre>');
-t=t.replace(new RegExp('🖥️\\\\s*'+bt+'([^'+bt+']+)'+bt,'g'),'<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ $1</span><button class="btn btn-s" onclick="runCmd(\\'$1\\')">▶ Run</button></div></div>');
-t=t.replace(new RegExp(bt+'([^'+bt+'\\\\n]+)'+bt,'g'),'<code>$1</code>');
+// Store code blocks to protect from other transformations
+const codeBlocks=[];
+t=t.replace(new RegExp(bt+bt+bt+'(\\\\w+)?\\\\n([\\\\s\\\\S]*?)'+bt+bt+bt,'g'),function(m,lang,code){
+    const highlighted=code.split('\\n').map(line=>{
+        if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}
+        if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}
+        return esc(line);
+    }).join('\\n');
+    codeBlocks.push('<pre><code>'+highlighted+'</code></pre>');
+    return '%%CODE'+codeBlocks.length+'%%';
+});
+// Inline code - protect these too
+const inlineCodes=[];
+t=t.replace(new RegExp(bt+'([^'+bt+'\\\\n]+)'+bt,'g'),function(m,code){
+    inlineCodes.push('<code>'+esc(code)+'</code>');
+    return '%%INLINE'+inlineCodes.length+'%%';
+});
+// Terminal commands
+t=t.replace(/🖥️\\s*%%INLINE(\\d+)%%/g,function(m,idx){
+    const code=inlineCodes[parseInt(idx)-1]||'';
+    const cmd=code.replace(/<\\/?code>/g,'');
+    return '<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+cmd+'</span><button class="btn btn-s" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div>';
+});
+// Markdown tables - greedy match for rows to capture full line
+t=t.replace(/^\\|(.+)\\|\\s*\\n\\|[-:|\\s]+\\|\\s*\\n((?:\\|.+\\|\\s*\\n?)+)/gm,function(m,header,body){
+    const hCells=header.split('|').map(c=>c.trim()).filter(c=>c);
+    const bRows=body.trim().split('\\n').filter(r=>r.trim());
+    let tbl='<table><thead><tr>';
+    hCells.forEach(c=>{tbl+='<th>'+c+'</th>';});
+    tbl+='</tr></thead><tbody>';
+    bRows.forEach(row=>{
+        const cells=row.replace(/^\\|/,'').replace(/\\|$/,'').split('|').map(c=>c.trim()).filter(c=>c);
+        tbl+='<tr>';
+        cells.forEach(c=>{tbl+='<td>'+c+'</td>';});
+        tbl+='</tr>';
+    });
+    tbl+='</tbody></table>';
+    return tbl;
+});
+// Headers
 t=t.replace(/^### (.+)$/gm,'<h3>$1</h3>');
 t=t.replace(/^## (.+)$/gm,'<h2>$1</h2>');
 t=t.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+// Checklists - [ ] and [x]
+t=t.replace(/^-\\s*\\[\\s*\\]\\s*(.+)$/gm,'<li class="checklist"><span class="check-box">☐</span> $1</li>');
+t=t.replace(/^-\\s*\\[[xX]\\]\\s*(.+)$/gm,'<li class="checklist done"><span class="check-box">☑</span> $1</li>');
+// Lists
 t=t.replace(/^- (.+)$/gm,'<li>$1</li>');
 t=t.replace(/^\\d+\\. (.+)$/gm,'<li>$1</li>');
+// Bold/italic
 t=t.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
 t=t.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
+// Paragraphs
 t=t.replace(/\\n\\n/g,'</p><p>');
 t=t.replace(/\\n/g,'<br>');
+// Restore code blocks and inline code
+t=t.replace(/%%CODE(\\d+)%%/g,function(m,idx){return codeBlocks[parseInt(idx)-1]||'';});
+t=t.replace(/%%INLINE(\\d+)%%/g,function(m,idx){return inlineCodes[parseInt(idx)-1]||'';});
 return '<p>'+t+'</p>';}
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
+function escCode(t){const d=document.createElement('div');d.textContent=(t||'').replace(/\\\\n/g,'\\n');return d.innerHTML;}
 function applyFile(f){vs.postMessage({type:'applyEdits',editId:f});}
 function applyAll(){vs.postMessage({type:'applyEdits',editId:'all'});}
 function runCmd(c){vs.postMessage({type:'runCommand',command:c});}
+function sendNextStep(step){msg.value=step;doSend();}
+document.addEventListener('click',e=>{
+    const btn=e.target.closest('.next-step-btn');
+    if(btn&&btn.dataset.step){
+        const step=decodeURIComponent(atob(btn.dataset.step));
+        sendNextStep(step);
+    }
+});
 function updUI(){stop.classList.toggle('vis',busy);send.disabled=busy;msg.disabled=busy;if(!busy)msg.focus();}
 vs.postMessage({type:'ready'});
 vs.postMessage({type:'getConfig'});
