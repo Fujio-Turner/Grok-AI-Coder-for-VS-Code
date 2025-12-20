@@ -54,6 +54,16 @@ export interface ChatPair {
     response: ChatResponse;
 }
 
+export type StepType = 'planning' | 'execute' | 'main' | 'cleanup';
+
+export interface StepTrackerEntry {
+    step: StepType;
+    timeMs: number;        // Cumulative time in ms for this step type
+    tokensIn: number;      // Cumulative prompt tokens for this step type
+    tokensOut: number;     // Cumulative completion tokens for this step type
+    callCount: number;     // Number of times this step was invoked
+}
+
 export interface ChatSessionDocument {
     id: string;
     docType: 'chat';
@@ -66,6 +76,7 @@ export interface ChatSessionDocument {
     tokensIn: number;  // Total input/prompt tokens
     tokensOut: number; // Total output/completion tokens
     pairs: ChatPair[];
+    stepTracker: StepTrackerEntry[];  // Cumulative stats per step type
 }
 
 /**
@@ -112,7 +123,8 @@ export async function createSession(): Promise<ChatSessionDocument> {
         cost: 0,
         tokensIn: 0,
         tokensOut: 0,
-        pairs: []
+        pairs: [],
+        stepTracker: []
     };
 
     const success = await client.insert(id, doc);
@@ -274,6 +286,58 @@ export async function updateSessionUsage(
     }
     
     console.log('Updated usage for session:', sessionId, '- cost:', doc.cost.toFixed(6));
+}
+
+/**
+ * Update step tracker for a specific step type (cumulative stats).
+ */
+export async function updateStepTracker(
+    sessionId: string,
+    step: StepType,
+    timeMs: number,
+    tokensIn: number,
+    tokensOut: number
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize stepTracker if not present (for existing sessions)
+    if (!doc.stepTracker) {
+        doc.stepTracker = [];
+    }
+    
+    // Find existing entry for this step type or create new one
+    let entry = doc.stepTracker.find(e => e.step === step);
+    if (entry) {
+        entry.timeMs += timeMs;
+        entry.tokensIn += tokensIn;
+        entry.tokensOut += tokensOut;
+        entry.callCount += 1;
+    } else {
+        doc.stepTracker.push({
+            step,
+            timeMs,
+            tokensIn,
+            tokensOut,
+            callCount: 1
+        });
+    }
+    
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update step tracker');
+    }
+    
+    console.log('Updated step tracker for session:', sessionId, '- step:', step, 'timeMs:', timeMs, 'tokensIn:', tokensIn, 'tokensOut:', tokensOut);
 }
 
 /**

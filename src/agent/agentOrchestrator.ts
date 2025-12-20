@@ -95,6 +95,13 @@ User: "What's the best way to handle errors in JavaScript?"
 
 Respond with ONLY the JSON, no other text.`;
 
+export interface PlanResult {
+    plan: AgentPlan;
+    timeMs: number;
+    tokensIn: number;
+    tokensOut: number;
+}
+
 /**
  * Pass 1: Create a plan from user request.
  */
@@ -103,8 +110,11 @@ export async function createPlan(
     apiKey: string,
     fastModel: string,
     onProgress?: (update: ProgressUpdate) => void
-): Promise<AgentPlan> {
+): Promise<PlanResult> {
     debug('Creating plan for request...');
+    const startTime = Date.now();
+    let tokensIn = 0;
+    let tokensOut = 0;
     
     const messages: GrokMessage[] = [
         { role: 'system', content: PLANNING_PROMPT },
@@ -119,6 +129,12 @@ export async function createPlan(
             undefined,
             undefined
         );
+
+        // Capture token usage
+        if (response.usage) {
+            tokensIn = response.usage.promptTokens;
+            tokensOut = response.usage.completionTokens;
+        }
 
         const text = response.text.trim();
         debug('Planning response:', text);
@@ -153,7 +169,12 @@ export async function createPlan(
                 }
             });
 
-            return plan;
+            return {
+                plan,
+                timeMs: Date.now() - startTime,
+                tokensIn,
+                tokensOut
+            };
         }
     } catch (error) {
         debug('Planning failed:', error);
@@ -161,10 +182,20 @@ export async function createPlan(
 
     // Default empty plan
     return {
-        summary: 'Processing request',
-        todos: [{ text: 'Analyze and respond', order: 1, status: 'pending' }],
-        actions: []
+        plan: {
+            summary: 'Processing request',
+            todos: [{ text: 'Analyze and respond', order: 1, status: 'pending' }],
+            actions: []
+        },
+        timeMs: Date.now() - startTime,
+        tokensIn,
+        tokensOut
     };
+}
+
+export interface ExecuteResult {
+    execution: ExecutionResult;
+    timeMs: number;
 }
 
 /**
@@ -173,7 +204,8 @@ export async function createPlan(
 export async function executeActions(
     plan: AgentPlan,
     onProgress?: (update: ProgressUpdate) => void
-): Promise<ExecutionResult> {
+): Promise<ExecuteResult> {
+    const startTime = Date.now();
     const results: ActionResult[] = [];
     const filesContent = new Map<string, string>();
     const urlsContent = new Map<string, string>();
@@ -298,7 +330,10 @@ export async function executeActions(
         }
     }
 
-    return { plan, results, filesContent, urlsContent };
+    return { 
+        execution: { plan, results, filesContent, urlsContent },
+        timeMs: Date.now() - startTime
+    };
 }
 
 /**
@@ -344,6 +379,17 @@ export function buildAugmentedMessage(
     return augmented;
 }
 
+export interface AgentWorkflowResult {
+    augmentedMessage: string;
+    filesLoaded: FileContent[];
+    skipped: boolean;
+    plan?: AgentPlan;
+    stepMetrics: {
+        planning: { timeMs: number; tokensIn: number; tokensOut: number };
+        execute: { timeMs: number };
+    };
+}
+
 /**
  * Full three-pass agent workflow.
  */
@@ -352,7 +398,7 @@ export async function runAgentWorkflow(
     apiKey: string,
     fastModel: string,
     onProgress?: (message: string) => void
-): Promise<{ augmentedMessage: string; filesLoaded: FileContent[]; skipped: boolean; plan?: AgentPlan }> {
+): Promise<AgentWorkflowResult> {
     
     // Convert string progress to ProgressUpdate for internal use
     const progressHandler = (update: ProgressUpdate) => {
@@ -361,7 +407,8 @@ export async function runAgentWorkflow(
 
     // Pass 1: Create plan
     onProgress?.('🧠 Planning...');
-    const plan = await createPlan(userMessage, apiKey, fastModel, progressHandler);
+    const planResult = await createPlan(userMessage, apiKey, fastModel, progressHandler);
+    const plan = planResult.plan;
     
     if (plan.actions.length === 0) {
         debug('No actions in plan, proceeding directly');
@@ -369,14 +416,19 @@ export async function runAgentWorkflow(
             augmentedMessage: userMessage,
             filesLoaded: [],
             skipped: true,
-            plan
+            plan,
+            stepMetrics: {
+                planning: { timeMs: planResult.timeMs, tokensIn: planResult.tokensIn, tokensOut: planResult.tokensOut },
+                execute: { timeMs: 0 }
+            }
         };
     }
 
     info(`Plan created: ${plan.todos.length} todos, ${plan.actions.length} actions`);
 
     // Pass 2: Execute actions
-    const execution = await executeActions(plan, progressHandler);
+    const executeResult = await executeActions(plan, progressHandler);
+    const execution = executeResult.execution;
     
     // Collect loaded files for return value
     const filesLoaded: FileContent[] = [];
@@ -412,7 +464,11 @@ export async function runAgentWorkflow(
         augmentedMessage: augmented,
         filesLoaded,
         skipped: false,
-        plan
+        plan,
+        stepMetrics: {
+            planning: { timeMs: planResult.timeMs, tokensIn: planResult.tokensIn, tokensOut: planResult.tokensOut },
+            execute: { timeMs: executeResult.timeMs }
+        }
     };
 }
 

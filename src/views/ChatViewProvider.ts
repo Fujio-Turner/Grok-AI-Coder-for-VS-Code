@@ -30,7 +30,7 @@ import {
     reapplyFromChangeSet,
     previewDiffStats
 } from '../edits/codeActions';
-import { updateUsage, setCurrentSession } from '../usage/tokenTracker';
+import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
 import { runAgentWorkflow } from '../agent/agentOrchestrator';
 
@@ -517,6 +517,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         }
                     );
                     
+                    // Record planning step metrics
+                    if (agentResult.stepMetrics) {
+                        const { planning, execute } = agentResult.stepMetrics;
+                        recordStep(
+                            this._currentSessionId!, 
+                            'planning', 
+                            planning.timeMs, 
+                            planning.tokensIn, 
+                            planning.tokensOut
+                        );
+                        if (execute.timeMs > 0) {
+                            recordStep(this._currentSessionId!, 'execute', execute.timeMs, 0, 0);
+                        }
+                    }
+                    
                     if (agentResult.filesLoaded.length > 0) {
                         this._postMessage({ 
                             type: 'updateResponseChunk', 
@@ -535,6 +550,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             const messages = await this._buildMessages(finalMessageText, hasImages ? images : undefined);
 
+            // Track main response step timing
+            const mainStepStart = startStepTimer();
+            
             const grokResponse = await sendChatCompletion(
                 messages,
                 model,
@@ -547,6 +565,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         deltaText: chunk
                     });
                 }
+            );
+            
+            const mainStepTime = endStepTimer(mainStepStart);
+            
+            // Record main step metrics
+            recordStep(
+                this._currentSessionId!,
+                'main',
+                mainStepTime,
+                grokResponse.usage?.promptTokens || 0,
+                grokResponse.usage?.completionTokens || 0
             );
 
             // Parse structured JSON response (with optional cleanup pass)
@@ -567,6 +596,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     if (usedCleanup) {
                         info('Used model cleanup to fix JSON');
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '\n🔧 JSON cleaned up\n' });
+                        
+                        // Record cleanup step metrics if model was used
+                        if (cleanupResult.cleanupMetrics) {
+                            recordStep(
+                                this._currentSessionId!,
+                                'cleanup',
+                                cleanupResult.cleanupMetrics.timeMs,
+                                cleanupResult.cleanupMetrics.tokensIn,
+                                cleanupResult.cleanupMetrics.tokensOut
+                            );
+                        }
                     }
                 } else {
                     // Fall back to legacy parser

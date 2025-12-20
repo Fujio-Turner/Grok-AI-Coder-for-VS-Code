@@ -1,5 +1,14 @@
 import * as vscode from 'vscode';
 import { GrokUsage } from '../api/grokClient';
+import { StepType, updateStepTracker } from '../storage/chatSessionRepository';
+
+export interface StepMetrics {
+    step: StepType;
+    startTime: number;
+    endTime?: number;
+    tokensIn: number;
+    tokensOut: number;
+}
 
 export interface SessionUsage {
     promptTokens: number;
@@ -122,4 +131,31 @@ export function showUsageSummary(): void {
 • Estimated cost: $${usage.estimatedCostUsd.toFixed(4)}`;
     
     vscode.window.showInformationMessage(message, { modal: true });
+}
+
+// Step tracking utilities
+export function startStepTimer(): number {
+    return Date.now();
+}
+
+export function endStepTimer(startTime: number): number {
+    return Date.now() - startTime;
+}
+
+/**
+ * Record step metrics to Couchbase (cumulative tracking).
+ * This is fire-and-forget - errors are logged but don't block the main flow.
+ */
+export async function recordStep(
+    sessionId: string,
+    step: StepType,
+    timeMs: number,
+    tokensIn: number = 0,
+    tokensOut: number = 0
+): Promise<void> {
+    try {
+        await updateStepTracker(sessionId, step, timeMs, tokensIn, tokensOut);
+    } catch (err: any) {
+        console.error('Failed to record step metrics:', err.message);
+    }
 }

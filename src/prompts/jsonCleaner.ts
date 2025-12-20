@@ -37,6 +37,9 @@ export interface CleanupResult {
     rawCleaned?: string;
     error?: string;
     usedCleanup: boolean;
+    timeMs?: number;
+    tokensIn?: number;
+    tokensOut?: number;
 }
 
 /**
@@ -48,6 +51,7 @@ export async function cleanJsonWithModel(
     fastModel: string
 ): Promise<CleanupResult> {
     debug('Attempting JSON cleanup with model...');
+    const startTime = Date.now();
     
     // First, try our regex repair
     const regexResult = safeParseJson(brokenJson);
@@ -58,7 +62,8 @@ export async function cleanJsonWithModel(
             return {
                 success: true,
                 cleaned: validated,
-                usedCleanup: false
+                usedCleanup: false,
+                timeMs: Date.now() - startTime
             };
         }
     }
@@ -83,6 +88,9 @@ export async function cleanJsonWithModel(
         const cleanedText = response.text.trim();
         debug('Model cleanup response length:', cleanedText.length);
 
+        const tokensIn = response.usage?.promptTokens || 0;
+        const tokensOut = response.usage?.completionTokens || 0;
+
         // Try to parse the cleaned response
         const parseResult = safeParseJson(cleanedText);
         if (parseResult) {
@@ -93,7 +101,10 @@ export async function cleanJsonWithModel(
                     success: true,
                     cleaned: validated,
                     rawCleaned: cleanedText,
-                    usedCleanup: true
+                    usedCleanup: true,
+                    timeMs: Date.now() - startTime,
+                    tokensIn,
+                    tokensOut
                 };
             }
         }
@@ -104,7 +115,10 @@ export async function cleanJsonWithModel(
             success: false,
             error: 'Model cleanup returned invalid JSON',
             rawCleaned: cleanedText,
-            usedCleanup: true
+            usedCleanup: true,
+            timeMs: Date.now() - startTime,
+            tokensIn,
+            tokensOut
         };
 
     } catch (err: any) {
@@ -112,9 +126,20 @@ export async function cleanJsonWithModel(
         return {
             success: false,
             error: err.message,
-            usedCleanup: true
+            usedCleanup: true,
+            timeMs: Date.now() - startTime
         };
     }
+}
+
+export interface ParseWithCleanupResult {
+    structured: GrokStructuredResponse | null;
+    usedCleanup: boolean;
+    cleanupMetrics?: {
+        timeMs: number;
+        tokensIn: number;
+        tokensOut: number;
+    };
 }
 
 /**
@@ -125,7 +150,7 @@ export async function parseWithCleanup(
     apiKey?: string,
     fastModel?: string,
     enableCleanup: boolean = true
-): Promise<{ structured: GrokStructuredResponse | null; usedCleanup: boolean }> {
+): Promise<ParseWithCleanupResult> {
     
     // Quick check for HTTP errors
     if (isHttpError(responseText)) {
@@ -145,7 +170,15 @@ export async function parseWithCleanup(
     if (enableCleanup && apiKey && fastModel) {
         const cleanupResult = await cleanJsonWithModel(responseText, apiKey, fastModel);
         if (cleanupResult.success && cleanupResult.cleaned) {
-            return { structured: cleanupResult.cleaned, usedCleanup: true };
+            return { 
+                structured: cleanupResult.cleaned, 
+                usedCleanup: true,
+                cleanupMetrics: cleanupResult.usedCleanup ? {
+                    timeMs: cleanupResult.timeMs || 0,
+                    tokensIn: cleanupResult.tokensIn || 0,
+                    tokensOut: cleanupResult.tokensOut || 0
+                } : undefined
+            };
         }
     }
 
