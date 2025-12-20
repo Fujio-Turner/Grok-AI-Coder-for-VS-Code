@@ -77,6 +77,22 @@
       {
         "command": "grok.showUsage",
         "title": "Grok: Show Token Usage"
+      },
+      {
+        "command": "grok.showLogs",
+        "title": "Grok: Show Output Logs"
+      },
+      {
+        "command": "grok.exportLogs",
+        "title": "Grok: Export Logs to File"
+      },
+      {
+        "command": "grok.testConnections",
+        "title": "Grok: Test Connections (Couchbase + API)"
+      },
+      {
+        "command": "grok.exportDiagnostics",
+        "title": "Grok: Export Diagnostics Report"
       }
     ],
     "configuration": {
@@ -196,6 +212,18 @@
           "default": true,
           "description": "Auto-apply code changes from AI responses (A=Auto). When false (M=Manual), requires clicking Apply.",
           "order": 24
+        },
+        "grok.couchbaseTimeout": {
+          "type": "number",
+          "default": 30,
+          "description": "Timeout in seconds for Couchbase operations (queries, inserts, etc.)",
+          "order": 25
+        },
+        "grok.apiTimeout": {
+          "type": "number",
+          "default": 300,
+          "description": "Timeout in seconds for Grok API requests (5 minutes default for complex responses)",
+          "order": 26
         }
       }
     },

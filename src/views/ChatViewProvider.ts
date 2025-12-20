@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { v4 as uuidv4 } from 'uuid';
-import { sendChatCompletion, GrokMessage, createVisionMessage } from '../api/grokClient';
+import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection } from '../api/grokClient';
+import { getCouchbaseClient } from '../storage/couchbaseClient';
 import { 
     createSession, 
     getSession, 
@@ -45,6 +46,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         tracker.onChange((changes, position) => {
             this._sendChangesUpdate(changes, position);
         });
+    }
+
+    public getCurrentSessionId(): string | undefined {
+        return this._currentSessionId;
     }
 
     private _sendChangesUpdate(changes: ChangeSet[], position: number) {
@@ -92,7 +97,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
             switch (message.type) {
                 case 'sendMessage':
-                    info('Processing sendMessage:', message.text?.substring(0, 30), 'images:', message.images?.length || 0);
+                    info('Processing sendMessage:', { text: message.text?.substring(0, 30), imageCount: message.images?.length || 0 });
                     await this.sendMessage(message.text, message.images);
                     break;
                 case 'retryMessage':
@@ -116,6 +121,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'ready':
                     await this._initializeSession();
                     this._sendInitialChanges();
+                    this._testAndSendConnectionStatus();
                     break;
                 case 'loadSession':
                     await this.loadSession(message.sessionId);
@@ -144,6 +150,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'toggleAutoApply':
                     this.toggleAutoApply();
                     break;
+                case 'testConnections':
+                    this._testAndSendConnectionStatus();
+                    break;
             }
         });
     }
@@ -169,6 +178,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const current = config.get<boolean>('autoApply', true);
         config.update('autoApply', !current, vscode.ConfigurationTarget.Global);
         this._sendConfig();
+    }
+
+    private async _testAndSendConnectionStatus() {
+        try {
+            // Test Couchbase
+            const cbClient = getCouchbaseClient();
+            const cbResult = await cbClient.ping();
+
+            // Test Grok API
+            const apiKey = await this._context.secrets.get('grokApiKey');
+            let apiResult = false;
+            if (apiKey) {
+                const result = await testApiConnection(apiKey);
+                apiResult = result.success;
+            }
+
+            this._postMessage({
+                type: 'connectionStatus',
+                couchbase: cbResult,
+                api: apiResult
+            });
+        } catch (error) {
+            this._postMessage({
+                type: 'connectionStatus',
+                couchbase: false,
+                api: false
+            });
+        }
     }
 
     private async _rewindToChangeSet(changeSetId: string) {
@@ -355,7 +392,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     public async sendMessage(text: string, images?: string[]) {
         const messageText = text || '';
-        debug('sendMessage called with:', messageText.substring(0, 50) || '(empty)', 'images:', images?.length || 0);
+        debug('sendMessage called with:', { text: messageText.substring(0, 50) || '(empty)', imageCount: images?.length || 0 });
         
         if (this._isRequestInProgress) {
             debug('Request already in progress, ignoring');
@@ -422,7 +459,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
             
             if (!apiKey.startsWith('xai-')) {
-                logError('API key format invalid. Expected key starting with "xai-", got:', apiKey.substring(0, 4) + '...');
+                logError('API key format invalid', { expected: 'xai-', got: apiKey.substring(0, 4) + '...' });
                 vscode.window.showErrorMessage('Invalid API key format. xAI keys should start with "xai-". Re-run "Grok: Set API Key".');
                 throw new Error('Invalid API key format. xAI keys should start with "xai-"');
             }
@@ -436,7 +473,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             const modelType = detectModelType(messageText, hasImages);
             const model = getModelName(modelType);
-            debug('Auto-detected model type:', modelType, '→ Using model:', model, hasImages ? '(with images)' : '');
+            debug('Auto-detected model type:', { modelType, model, hasImages });
             
             request.model = model;
 
@@ -595,7 +632,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (edits.length === 0) {
                 const hasEmoji = lastSuccessPair.response.text.includes('📄');
                 const hasCodeBlock = lastSuccessPair.response.text.includes('```');
-                logError('No edits found. Has emoji:', hasEmoji, 'Has code block:', hasCodeBlock);
+                logError('No edits found', { hasEmoji, hasCodeBlock });
                 vscode.window.showWarningMessage(
                     `No code blocks with 📄 filename pattern found. ` +
                     `Ask Grok to format changes as: 📄 filename.py followed by a code block.`
@@ -814,6 +851,12 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #new:hover{background:var(--vscode-button-hoverBackground)}
 #cfg{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:none;border-radius:4px;padding:4px 8px;font-size:16px;cursor:pointer}
 #cfg:hover{background:var(--vscode-button-secondaryHoverBackground)}
+#status-dot{font-size:12px;cursor:pointer;transition:color .3s}
+#status-dot.ok{color:#4ec9b0}
+#status-dot.warn{color:#dcdcaa}
+#status-dot.err{color:#f14c4c}
+#status-dot.checking{animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #sess{cursor:pointer;display:flex;align-items:center;gap:4px;max-width:60%;overflow:hidden}
 #sess-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #sess:hover{color:var(--vscode-textLink-foreground)}
@@ -916,7 +959,7 @@ pre code{background:none;padding:0}
 .term-body{padding:10px;font-family:var(--vscode-editor-font-family);font-size:11px;color:#d4d4d4;white-space:pre-wrap;max-height:200px;overflow-y:auto}
 .term-cmd{color:#569cd6}
 </style></head><body>
-<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
+<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
 
 <!-- TODO Panel -->
@@ -949,6 +992,19 @@ let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,to
 let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true;
 let currentTodos=[],todosCompleted=0,todoExpanded=false;
 const CTX_LIMIT=128000;
+
+// Status indicator
+const statusDot=document.getElementById('status-dot');
+let connectionStatus={couchbase:null,api:null};
+function updateStatusDot(){
+    const cb=connectionStatus.couchbase,api=connectionStatus.api;
+    if(cb===null||api===null){statusDot.className='checking';statusDot.title='Checking connections...';}
+    else if(cb&&api){statusDot.className='ok';statusDot.title='All connections OK';}
+    else if(cb||api){statusDot.className='warn';statusDot.title=(cb?'':'Couchbase: Failed\\n')+(api?'':'API: Failed');}
+    else{statusDot.className='err';statusDot.title='All connections failed';}
+}
+statusDot.onclick=()=>vs.postMessage({type:'testConnections'});
+updateStatusDot();
 
 // Auto/Manual toggle
 autoBtn.onclick=()=>vs.postMessage({type:'toggleAutoApply'});
@@ -1047,6 +1103,7 @@ case'commandOutput':showCmdOutput(m.command,m.output,m.isError);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});todosCompleted=Math.min(todosCompleted+1,currentTodos.length);renderTodos();}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;updateAutoBtn();break;
+case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}

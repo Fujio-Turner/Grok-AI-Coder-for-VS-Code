@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import { ChatViewProvider } from './views/ChatViewProvider';
-import { shutdownCouchbase } from './storage/couchbaseClient';
-import { initLogger, info, debug, getConfig } from './utils/logger';
+import { shutdownCouchbase, getCouchbaseClient } from './storage/couchbaseClient';
+import { initLogger, info, debug, getConfig, showOutput, exportLogsToFile, exportDiagnosticsReport } from './utils/logger';
 import { initStatusBar, showUsageSummary } from './usage/tokenTracker';
 import { getChangeTracker } from './edits/codeActions';
+import { testApiConnection } from './api/grokClient';
+import { listSessions } from './storage/chatSessionRepository';
 
 export function activate(context: vscode.ExtensionContext) {
     // Initialize logger first
@@ -127,6 +129,102 @@ export function activate(context: vscode.ExtensionContext) {
             const tracker = getChangeTracker();
             tracker.clear();
             vscode.window.showInformationMessage('Change history cleared');
+        })
+    );
+
+    // Diagnostics commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.showLogs', () => {
+            showOutput();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.exportLogs', async () => {
+            const path = await exportLogsToFile();
+            if (path) {
+                vscode.window.showInformationMessage(`Logs exported to: ${path}`);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.testConnections', async () => {
+            const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+            statusBarItem.text = '$(sync~spin) Testing connections...';
+            statusBarItem.show();
+
+            try {
+                // Test Couchbase
+                const cbClient = getCouchbaseClient();
+                const cbResult = await cbClient.ping();
+
+                // Test Grok API
+                const apiKey = await context.secrets.get('grokApiKey');
+                let apiResult: { success: boolean; error?: string; latencyMs?: number } = { success: false, error: 'No API key set' };
+                if (apiKey) {
+                    apiResult = await testApiConnection(apiKey);
+                }
+
+                statusBarItem.hide();
+                statusBarItem.dispose();
+
+                const message = [
+                    `Couchbase: ${cbResult ? '✅ Connected' : '❌ Failed'}`,
+                    `Grok API: ${apiResult.success ? `✅ Connected (${apiResult.latencyMs || 0}ms)` : `❌ ${apiResult.error || 'Failed'}`}`
+                ].join('\n');
+
+                vscode.window.showInformationMessage(message, { modal: true });
+            } catch (error: any) {
+                statusBarItem.hide();
+                statusBarItem.dispose();
+                vscode.window.showErrorMessage(`Connection test failed: ${error.message}`);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.exportDiagnostics', async () => {
+            const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+            statusBarItem.text = '$(sync~spin) Generating diagnostics...';
+            statusBarItem.show();
+
+            try {
+                // Gather connection status
+                const cbClient = getCouchbaseClient();
+                const cbResult = await cbClient.ping();
+                
+                const apiKey = await context.secrets.get('grokApiKey');
+                let apiResult = { success: false };
+                if (apiKey) {
+                    apiResult = await testApiConnection(apiKey);
+                }
+
+                // Get session info
+                let sessionCount = 0;
+                try {
+                    const sessions = await listSessions(100);
+                    sessionCount = sessions.length;
+                } catch {
+                    // Ignore session count errors
+                }
+
+                statusBarItem.hide();
+                statusBarItem.dispose();
+
+                const path = await exportDiagnosticsReport(
+                    { couchbase: cbResult, grokApi: apiResult.success },
+                    { currentSessionId: chatViewProvider.getCurrentSessionId(), sessionCount }
+                );
+
+                if (path) {
+                    vscode.window.showInformationMessage(`Diagnostics exported to: ${path}`);
+                }
+            } catch (error: any) {
+                statusBarItem.hide();
+                statusBarItem.dispose();
+                vscode.window.showErrorMessage(`Failed to export diagnostics: ${error.message}`);
+            }
         })
     );
 

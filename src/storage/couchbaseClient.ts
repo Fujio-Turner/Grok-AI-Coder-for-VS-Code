@@ -27,6 +27,15 @@ export class CouchbaseRestClient {
         return `\`${config.couchbaseBucket}\`.\`${config.couchbaseScope}\`.\`${config.couchbaseCollection}\``;
     }
 
+    private getTimeoutMs(): number {
+        const config = getConfig();
+        return (config.couchbaseTimeout || 30) * 1000;
+    }
+
+    private createTimeoutSignal(): AbortSignal {
+        return AbortSignal.timeout(this.getTimeoutMs());
+    }
+
     // Get a document by key using the REST API
     async get<T>(key: string): Promise<CouchbaseDocument<T> | null> {
         const config = getConfig();
@@ -45,12 +54,13 @@ export class CouchbaseRestClient {
                 body: JSON.stringify({
                     statement: query,
                     $key: key
-                })
+                }),
+                signal: this.createTimeoutSignal()
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
-                error('Couchbase GET HTTP error:', response.status, errorText);
+                error('Couchbase GET HTTP error:', { status: response.status, error: errorText });
                 return null;
             }
 
@@ -60,7 +70,7 @@ export class CouchbaseRestClient {
                 errors?: Array<{msg: string}>;
             };
 
-            debug('Couchbase GET result:', result.status, result.results?.length);
+            debug('Couchbase GET result:', { status: result.status, count: result.results?.length });
 
             if (result.results && result.results.length > 0) {
                 const row = result.results[0];
@@ -99,12 +109,13 @@ export class CouchbaseRestClient {
                     statement: query,
                     $key: key,
                     $doc: doc
-                })
+                }),
+                signal: this.createTimeoutSignal()
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
-                error('Couchbase INSERT HTTP error:', response.status, errorText);
+                error('Couchbase INSERT HTTP error:', { status: response.status, error: errorText });
                 return false;
             }
 
@@ -140,12 +151,13 @@ export class CouchbaseRestClient {
                     statement: query,
                     $key: key,
                     $doc: doc
-                })
+                }),
+                signal: this.createTimeoutSignal()
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
-                error('Couchbase REPLACE HTTP error:', response.status, errorText);
+                error('Couchbase REPLACE HTTP error:', { status: response.status, error: errorText });
                 return false;
             }
 
@@ -180,12 +192,13 @@ export class CouchbaseRestClient {
                 body: JSON.stringify({
                     statement: query,
                     $key: key
-                })
+                }),
+                signal: this.createTimeoutSignal()
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
-                error('Couchbase DELETE HTTP error:', response.status, errorText);
+                error('Couchbase DELETE HTTP error:', { status: response.status, error: errorText });
                 return false;
             }
 
@@ -217,17 +230,18 @@ export class CouchbaseRestClient {
                     'Authorization': this.getAuthHeader(),
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify(body)
+                body: JSON.stringify(body),
+                signal: this.createTimeoutSignal()
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
-                error('Couchbase QUERY HTTP error:', response.status, errorText);
+                error('Couchbase QUERY HTTP error:', { status: response.status, error: errorText });
                 return [];
             }
 
             const result = await response.json() as { results?: T[]; status?: string; errors?: Array<{msg: string}> };
-            debug('Couchbase QUERY result:', result.status, result.results?.length);
+            debug('Couchbase QUERY result:', { status: result.status, count: result.results?.length });
             
             if (result.status !== 'success') {
                 error('Couchbase QUERY failed:', result.errors?.[0]?.msg || 'Unknown error');
@@ -249,7 +263,8 @@ export class CouchbaseRestClient {
             const response = await fetch(`${this.getManagementUrl()}/pools`, {
                 headers: {
                     'Authorization': this.getAuthHeader()
-                }
+                },
+                signal: this.createTimeoutSignal()
             });
             
             const success = response.ok;

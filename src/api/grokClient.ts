@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import { createScopedLogger } from '../utils/logger';
+
+const log = createScopedLogger('GrokAPI');
 
 export interface GrokMessageContent {
     type: 'text' | 'image_url';
@@ -49,6 +52,22 @@ export async function sendChatCompletion(
 ): Promise<GrokResponse> {
     const config = vscode.workspace.getConfiguration('grok');
     const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
+    const timeoutSeconds = config.get<number>('apiTimeout') || 300;
+
+    log.info(`Sending request to ${model}`, { 
+        messageCount: messages.length, 
+        streaming: !!onChunk,
+        baseUrl,
+        timeoutSeconds
+    });
+
+    const startTime = Date.now();
+
+    // Combine user abort signal with timeout
+    const timeoutSignal = AbortSignal.timeout(timeoutSeconds * 1000);
+    const combinedSignal = signal 
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
 
     const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
@@ -62,7 +81,7 @@ export async function sendChatCompletion(
             stream: !!onChunk,
             stream_options: onChunk ? { include_usage: true } : undefined
         }),
-        signal
+        signal: combinedSignal
     });
 
     if (!response.ok) {
@@ -77,6 +96,13 @@ export async function sendChatCompletion(
                 errorMessage = errorBody;
             }
         }
+
+        log.error(`API request failed`, { 
+            status: response.status, 
+            model, 
+            error: errorMessage,
+            durationMs: Date.now() - startTime 
+        });
 
         if (response.status === 401) {
             throw new Error('Invalid API key. Please run "Grok: Set API Key" to update.');
@@ -135,6 +161,13 @@ export async function sendChatCompletion(
             reader.releaseLock();
         }
 
+        log.info(`Streaming response complete`, {
+            model,
+            durationMs: Date.now() - startTime,
+            responseLength: fullText.length,
+            usage
+        });
+
         return { text: fullText, usage };
     }
 
@@ -150,5 +183,52 @@ export async function sendChatCompletion(
         totalTokens: data.usage.total_tokens || 0
     } : undefined;
 
+    log.info(`Non-streaming response complete`, {
+        model,
+        durationMs: Date.now() - startTime,
+        responseLength: text.length,
+        usage
+    });
+
     return { text, usage };
+}
+
+/**
+ * Test API connection by making a minimal request
+ */
+export async function testApiConnection(apiKey: string): Promise<{ success: boolean; error?: string; latencyMs?: number }> {
+    const config = vscode.workspace.getConfiguration('grok');
+    const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
+    const timeoutSeconds = Math.min(config.get<number>('apiTimeout') || 300, 30); // Use shorter timeout for connection test
+    
+    log.info('Testing API connection', { baseUrl, timeoutSeconds });
+    const startTime = Date.now();
+    
+    try {
+        const response = await fetch(`${baseUrl}/models`, {
+            headers: {
+                'Authorization': `Bearer ${apiKey}`
+            },
+            signal: AbortSignal.timeout(timeoutSeconds * 1000)
+        });
+        
+        const latencyMs = Date.now() - startTime;
+        
+        if (response.ok) {
+            log.info('API connection test successful', { latencyMs });
+            return { success: true, latencyMs };
+        } else {
+            const error = `HTTP ${response.status}: ${response.statusText}`;
+            log.error('API connection test failed', { error, latencyMs });
+            return { success: false, error, latencyMs };
+        }
+    } catch (err: any) {
+        const latencyMs = Date.now() - startTime;
+        let error = err.message || 'Network error';
+        if (err.name === 'TimeoutError') {
+            error = `Connection timed out after ${timeoutSeconds}s`;
+        }
+        log.error('API connection test exception', { error, latencyMs });
+        return { success: false, error, latencyMs };
+    }
 }
