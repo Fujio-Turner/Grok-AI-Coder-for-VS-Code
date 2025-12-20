@@ -46,6 +46,39 @@ The extension will use TypeScript, Webviews for the UI, and VS Code APIs for fil
      - Use HTML/CSS/JS (or React via bundler like webpack/esbuild) for chat bubbles, input box, message history.
      - Handle message passing: `webview.postMessage` (extension → webview), `webview.onDidReceiveMessage` (webview → extension).
    - Add features: Streaming responses, markdown rendering, code blocks with copy/apply buttons.
+   
+   **6a. Cancel/Stop Functionality**
+   - Add "Stop" button visible during active API requests.
+   - Use `AbortController` to cancel fetch requests mid-stream.
+   - On cancel: save partial response to Couchbase with `status: 'cancelled'`.
+   - User can immediately type new/corrected input after stopping.
+   
+   **6b. Streaming Thoughts Display**
+   - Show "Thinking..." indicator with real-time AI reasoning stream.
+   - Display AI's analysis/planning as tokens arrive (before code changes).
+   - Use italics or distinct styling for "thought" content vs final output.
+   
+   **6c. Visual Plan Execution with Progress**
+   - AI presents numbered bullet-point plan BEFORE executing any changes.
+   - Each step shown as: `• Step description`
+   - User can review plan and click "Stop" to cancel before execution begins.
+   - As each step completes: apply ~~strikethrough~~ styling to that step.
+   - Show checkmark (✓) or green indicator for completed steps.
+   - Current in-progress step highlighted (bold or different color).
+   
+   **6d. Diff View for Code Changes**
+   - For each file modification, display inline diff:
+     - **Red background**: deleted/old lines
+     - **Green background**: added/new lines
+   - Show: `📄 filename.ts (lines 45-67)` header for each file.
+   - Collapsible sections for each file modified.
+   - "Apply" / "Reject" buttons per file or per individual change.
+   
+   **6e. Completion Notification**
+   - Visual "Done!" indicator when all steps complete.
+   - Summary: files changed, lines modified, tokens used.
+   - VS Code notification toast: "Grok completed: 3 files modified".
+   - Optional sound/bell (configurable in settings).
 
 #### 7. Handle Authentication and API Key Storage
    - Use `context.secrets` (SecretStorage API) for secure storage.

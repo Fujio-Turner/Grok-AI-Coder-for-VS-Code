@@ -1,0 +1,229 @@
+{
+  "name": "grok-coder",
+  "displayName": "Grok AI Coder",
+  "description": "VS Code AI assistant powered by xAI Grok with Couchbase persistence",
+  "version": "0.0.1",
+  "publisher": "grok-coder",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "grokChatContainer",
+          "title": "Grok AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "grokChatContainer": [
+        {
+          "id": "grokChatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "grok.setApiKey",
+        "title": "Grok: Set API Key"
+      },
+      {
+        "command": "grok.newChatSession",
+        "title": "Grok: New Chat Session"
+      },
+      {
+        "command": "grok.retryLastRequest",
+        "title": "Grok: Retry Last Request"
+      },
+      {
+        "command": "grok.cancelRequest",
+        "title": "Grok: Cancel Current Request"
+      },
+      {
+        "command": "grok.explainSelection",
+        "title": "Grok: Explain Selection"
+      },
+      {
+        "command": "grok.fixSelection",
+        "title": "Grok: Fix Selection"
+      },
+      {
+        "command": "grok.revertLastEdits",
+        "title": "Grok: Revert Last Edits"
+      },
+      {
+        "command": "grok.showUsage",
+        "title": "Grok: Show Token Usage"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Grok AI Settings",
+      "properties": {
+        "grok.apiBaseUrl": {
+          "type": "string",
+          "default": "https://api.x.ai/v1",
+          "description": "Base URL for the xAI Grok API",
+          "order": 1
+        },
+        "grok.modelFast": {
+          "type": "string",
+          "default": "grok-3-mini",
+          "description": "Fast model for simple/quick tasks (cost-efficient)",
+          "order": 2
+        },
+        "grok.modelReasoning": {
+          "type": "string",
+          "default": "grok-4",
+          "description": "Reasoning model for complex multi-step tasks (flagship)",
+          "order": 3
+        },
+        "grok.modelVision": {
+          "type": "string",
+          "default": "grok-4",
+          "description": "Vision model for image analysis",
+          "order": 4
+        },
+        "grok.defaultModelType": {
+          "type": "string",
+          "default": "fast",
+          "enum": ["fast", "reasoning", "vision"],
+          "enumDescriptions": [
+            "Fast model - quick responses, simple tasks",
+            "Reasoning model - complex analysis, multi-step planning",
+            "Vision model - image understanding and analysis"
+          ],
+          "description": "Which model type to use by default",
+          "order": 5
+        },
+        "grok.couchbaseUrl": {
+          "type": "string",
+          "default": "localhost",
+          "description": "Couchbase server hostname or IP",
+          "order": 10
+        },
+        "grok.couchbasePort": {
+          "type": "number",
+          "default": 8091,
+          "description": "Couchbase management port (8091 for REST API)",
+          "order": 11
+        },
+        "grok.couchbaseQueryPort": {
+          "type": "number",
+          "default": 8093,
+          "description": "Couchbase N1QL query service port",
+          "order": 12
+        },
+        "grok.couchbaseUsername": {
+          "type": "string",
+          "default": "Administrator",
+          "description": "Couchbase username",
+          "order": 13
+        },
+        "grok.couchbasePassword": {
+          "type": "string",
+          "default": "password",
+          "description": "Couchbase password",
+          "order": 14
+        },
+        "grok.couchbaseBucket": {
+          "type": "string",
+          "default": "grokCoder",
+          "description": "Couchbase bucket name for storing chat sessions",
+          "order": 15
+        },
+        "grok.couchbaseScope": {
+          "type": "string",
+          "default": "_default",
+          "description": "Couchbase scope name",
+          "order": 16
+        },
+        "grok.couchbaseCollection": {
+          "type": "string",
+          "default": "_default",
+          "description": "Couchbase collection name",
+          "order": 17
+        },
+        "grok.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging to Output channel",
+          "order": 20
+        },
+        "grok.enableSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play sound when task completes",
+          "order": 21
+        }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "grok.explainSelection",
+          "when": "editorHasSelection",
+          "group": "grok@1"
+        },
+        {
+          "command": "grok.fixSelection",
+          "when": "editorHasSelection",
+          "group": "grok@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "grok.explainSelection",
+        "key": "ctrl+shift+g e",
+        "mac": "cmd+shift+g e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "grok.fixSelection",
+        "key": "ctrl+shift+g f",
+        "mac": "cmd+shift+g f",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "grok.cancelRequest",
+        "key": "escape",
+        "when": "grok.requestInProgress"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "@vscode/test-electron": "^2.3.8",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "highlight.js": "^11.9.0",
+    "marked": "^11.1.0",
+    "uuid": "^9.0.1"
+  }
+}
