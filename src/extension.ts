@@ -3,6 +3,7 @@ import { ChatViewProvider } from './views/ChatViewProvider';
 import { shutdownCouchbase } from './storage/couchbaseClient';
 import { initLogger, info, debug, getConfig } from './utils/logger';
 import { initStatusBar, showUsageSummary } from './usage/tokenTracker';
+import { getChangeTracker } from './edits/codeActions';
 
 export function activate(context: vscode.ExtensionContext) {
     // Initialize logger first
@@ -91,6 +92,41 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('grok.showUsage', () => {
             showUsageSummary();
+        })
+    );
+
+    // Rewind/Forward commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.rewindStep', async () => {
+            const tracker = getChangeTracker();
+            if (tracker.canRewind()) {
+                const current = tracker.getCurrentChange();
+                if (current) {
+                    // The webview handles the actual revert via message
+                    vscode.commands.executeCommand('workbench.view.extension.grokChatContainer');
+                }
+            } else {
+                vscode.window.showInformationMessage('Nothing to rewind');
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.forwardStep', async () => {
+            const tracker = getChangeTracker();
+            if (tracker.canForward()) {
+                vscode.commands.executeCommand('workbench.view.extension.grokChatContainer');
+            } else {
+                vscode.window.showInformationMessage('Nothing to forward');
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.clearChangeHistory', () => {
+            const tracker = getChangeTracker();
+            tracker.clear();
+            vscode.window.showInformationMessage('Change history cleared');
         })
     );
 

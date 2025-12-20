@@ -4,6 +4,35 @@ import * as crypto from 'crypto';
 import { getCouchbaseClient } from './couchbaseClient';
 import { GrokUsage } from '../api/grokClient';
 
+const MAX_PAYLOAD_SIZE_MB = 15; // Conservative limit (Couchbase max is 20MB)
+
+function getMaxPayloadSize(): number {
+    const config = vscode.workspace.getConfiguration('grok');
+    return (config.get<number>('maxPayloadSizeMB', MAX_PAYLOAD_SIZE_MB)) * 1024 * 1024;
+}
+
+function getDocumentSize(doc: any): number {
+    return new TextEncoder().encode(JSON.stringify(doc)).length;
+}
+
+function trimOldPairsIfNeeded(doc: ChatSessionDocument): boolean {
+    const maxSize = getMaxPayloadSize();
+    let currentSize = getDocumentSize(doc);
+    let trimmed = false;
+    
+    while (currentSize > maxSize && doc.pairs.length > 1) {
+        doc.pairs.shift();
+        currentSize = getDocumentSize(doc);
+        trimmed = true;
+    }
+    
+    if (trimmed) {
+        console.log('Trimmed old messages to stay under payload limit. New pair count:', doc.pairs.length);
+    }
+    
+    return trimmed;
+}
+
 export interface ChatRequest {
     text: string;
     timestamp: string;
@@ -33,6 +62,9 @@ export interface ChatSessionDocument {
     createdAt: string;
     updatedAt: string;
     summary?: string;  // AI-generated summary of the chat topic
+    cost: number;      // Total cost in USD
+    tokensIn: number;  // Total input/prompt tokens
+    tokensOut: number; // Total output/completion tokens
     pairs: ChatPair[];
 }
 
@@ -77,6 +109,9 @@ export async function createSession(): Promise<ChatSessionDocument> {
         projectName,
         createdAt: now,
         updatedAt: now,
+        cost: 0,
+        tokensIn: 0,
+        tokensOut: 0,
         pairs: []
     };
 
@@ -132,6 +167,9 @@ export async function appendPair(
     doc.pairs.push(pair);
     doc.updatedAt = now;
     
+    // Check payload size and trim old messages if needed
+    trimOldPairsIfNeeded(doc);
+    
     console.log('appendPair: Saving with', doc.pairs.length, 'pairs');
     const success = await client.replace(sessionId, doc);
     if (!success) {
@@ -160,6 +198,9 @@ export async function updateLastPairResponse(
         doc.pairs[doc.pairs.length - 1].response = response;
     }
     doc.updatedAt = now;
+    
+    // Check payload size and trim old messages if needed
+    trimOldPairsIfNeeded(doc);
     
     const success = await client.replace(sessionId, doc);
     if (!success) {
@@ -195,6 +236,47 @@ export async function updateSessionSummary(sessionId: string, summary: string): 
 }
 
 /**
+ * Update session usage totals (cost, tokensIn, tokensOut)
+ */
+export async function updateSessionUsage(
+    sessionId: string, 
+    promptTokens: number, 
+    completionTokens: number,
+    model: string = 'grok-3-mini'
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Calculate cost based on model
+    const pricing: Record<string, { inputPer1M: number; outputPer1M: number }> = {
+        'grok-3-mini': { inputPer1M: 0.30, outputPer1M: 0.50 },
+        'grok-4': { inputPer1M: 3.00, outputPer1M: 15.00 }
+    };
+    const rates = pricing[model] || pricing['grok-3-mini'];
+    const cost = (promptTokens / 1_000_000) * rates.inputPer1M + 
+                 (completionTokens / 1_000_000) * rates.outputPer1M;
+    
+    doc.tokensIn = (doc.tokensIn || 0) + promptTokens;
+    doc.tokensOut = (doc.tokensOut || 0) + completionTokens;
+    doc.cost = (doc.cost || 0) + cost;
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update session usage');
+    }
+    
+    console.log('Updated usage for session:', sessionId, '- cost:', doc.cost.toFixed(6));
+}
+
+/**
  * List chat sessions for the current project, ordered by most recent first.
  * Returns lightweight session info (no pairs) for the history dropdown.
  */
@@ -204,7 +286,7 @@ export async function listSessions(limit: number = 20): Promise<ChatSessionDocum
     
     const query = `
         SELECT META().id, docType, projectId, projectName, createdAt, updatedAt, summary,
-               ARRAY_LENGTH(pairs) as pairCount
+               cost, tokensIn, tokensOut, ARRAY_LENGTH(pairs) as pairCount
         FROM \`grokCoder\`._default._default
         WHERE docType = "chat" AND projectId = $projectId
         ORDER BY updatedAt DESC

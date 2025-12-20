@@ -63,6 +63,18 @@
         "title": "Grok: Revert Last Edits"
       },
       {
+        "command": "grok.rewindStep",
+        "title": "Grok: Rewind One Step"
+      },
+      {
+        "command": "grok.forwardStep",
+        "title": "Grok: Forward One Step"
+      },
+      {
+        "command": "grok.clearChangeHistory",
+        "title": "Grok: Clear Change History"
+      },
+      {
         "command": "grok.showUsage",
         "title": "Grok: Show Token Usage"
       }
@@ -166,6 +178,24 @@
           "default": false,
           "description": "Play sound when task completes",
           "order": 21
+        },
+        "grok.enterToSend": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true: Enter sends message, Ctrl+Enter for new line. When false (default): Enter for new line, Ctrl+Enter sends message.",
+          "order": 22
+        },
+        "grok.maxPayloadSizeMB": {
+          "type": "number",
+          "default": 15,
+          "description": "Maximum payload size in MB for Couchbase documents (Couchbase limit is 20MB)",
+          "order": 23
+        },
+        "grok.autoApply": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-apply code changes from AI responses (A=Auto). When false (M=Manual), requires clicking Apply.",
+          "order": 24
         }
       }
     },

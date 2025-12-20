@@ -241,6 +241,13 @@ Add to `contributes`:
 ### Step 11: Revert and Change Tracking ✅
 - [x] Snapshot files before edits (in-memory)
 - [x] "Revert All" command restores snapshots (`grok.revertLastEdits`)
+- [x] **Compact Changes Bar** - inline summary: "6 files changed +729 -61 ~34   32s $2.11 ○ 53%"
+- [x] **Expandable Change History** - click compact bar to see full history dropdown
+- [x] **Rewind Slider** - step through change history inline on compact bar
+- [x] **Per-change metadata** - timestamp, duration, cost, tokens used
+- [x] `grok.rewindStep` command - rewind one change
+- [x] `grok.forwardStep` command - forward one change
+- [x] `grok.clearChangeHistory` command - clear all tracked changes
 - [ ] Optional: Git integration
 
 ### Step 12: Token Usage Tracking ✅
@@ -307,3 +314,11 @@ vsce package
 - API calls can be slow; Couchbase persistence allows retry without data loss
 - Always save to Couchbase BEFORE making API call
 - Store `status: 'pending'` to track in-flight requests
+- **Payload size limit**: Documents automatically trim old messages when approaching 15MB (Couchbase max is 20MB)
+- **Enter key behavior**: Configurable via `grok.enterToSend` setting:
+  - `false` (default): Enter = new line, Ctrl+Enter = send
+  - `true`: Enter = send, Ctrl+Enter = new line
+- **Auto/Manual apply**: Configurable via `grok.autoApply` setting:
+  - `true` (default): Auto-apply code changes from AI responses
+  - `false`: Manual apply via clicking Apply button
+- **TODO list**: AI responses start with `📋 TODOS` section that shows progress (0/4) → (1/4) → etc.
