@@ -18,6 +18,7 @@ import {
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
 import { parseResponse, GrokStructuredResponse } from '../prompts/responseParser';
+import { parseWithCleanup } from '../prompts/jsonCleaner';
 import { getModelName, ModelType, debug, info, error as logError, detectModelType } from '../utils/logger';
 import { 
     parseCodeBlocksFromResponse, 
@@ -548,12 +549,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }
             );
 
-            // Parse structured JSON response (with legacy fallback)
-            const structured = parseResponse(grokResponse.text);
+            // Parse structured JSON response (with optional cleanup pass)
+            const enableCleanup = config.get<boolean>('jsonCleanup', true);
+            let structured: GrokStructuredResponse;
+            let usedCleanup = false;
+            
+            if (enableCleanup) {
+                const cleanupResult = await parseWithCleanup(
+                    grokResponse.text,
+                    apiKey,
+                    fastModel,
+                    true
+                );
+                if (cleanupResult.structured) {
+                    structured = cleanupResult.structured;
+                    usedCleanup = cleanupResult.usedCleanup;
+                    if (usedCleanup) {
+                        info('Used model cleanup to fix JSON');
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '\n🔧 JSON cleaned up\n' });
+                    }
+                } else {
+                    // Fall back to legacy parser
+                    structured = parseResponse(grokResponse.text);
+                }
+            } else {
+                structured = parseResponse(grokResponse.text);
+            }
+            
             debug('Parsed structured response:', { 
                 hasTodos: !!structured.todos?.length,
                 hasFileChanges: !!structured.fileChanges?.length,
-                hasCommands: !!structured.commands?.length
+                hasCommands: !!structured.commands?.length,
+                usedCleanup
             });
 
             const successResponse: ChatResponse = {
@@ -606,6 +633,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 pairIndex,
                 response: successResponse,
                 diffPreview,
+                usedCleanup,
                 structured: {
                     todos: structured.todos || [],
                     summary: structured.summary || '',
@@ -1214,7 +1242,7 @@ d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'load
 case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
-if(curDiv){curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML=fmtFinalStructured(m.structured,m.response.usage,m.diffPreview);updStats(m.response.usage);}
+if(curDiv){curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML=fmtFinalStructured(m.structured,m.response.usage,m.diffPreview,m.usedCleanup);updStats(m.response.usage);}
 // Use structured TODOs if available, fallback to legacy parsing
 let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
@@ -1247,7 +1275,7 @@ else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage
 chat.appendChild(a);}
 function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:200px;overflow:hidden;line-height:1.5;margin-top:8px">'+fmtMd(stream.slice(-600))+'</div>');}
 function fmtFinal(t,u,diffPreview){let h=fmtCode(t,diffPreview);const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
-function fmtFinalStructured(s,u,diffPreview){
+function fmtFinalStructured(s,u,diffPreview,usedCleanup){
 if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
 let h='';
 if(s.summary){h+='<p class="summary">'+esc(s.summary)+'</p>';}
@@ -1257,7 +1285,9 @@ if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').re
 if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const stats=previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+esc(fc.content)+'</code></pre></div></div>';});}
 if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<span style="color:var(--vscode-descriptionForeground);margin-left:8px">'+esc(cmd.description)+'</span>':'';h+='<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd.command)+'</span>'+desc+'<button class="btn btn-s" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" style="margin-left:auto">▶ Run</button></div></div>';});}
 if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
-const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
+const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';
+const cleanupInfo=usedCleanup?'<span style="margin-left:8px;font-size:10px;color:var(--vscode-charts-yellow)" title="JSON was fixed by cleanup pass">🔧</span>':'';
+h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+cleanupInfo+uInfo+'</div>';return h;}
 function fmtCode(t,diffPreview){
 let out=t;const fileBlocks=[];const bt=String.fromCharCode(96);
 const pat=new RegExp('[📄🗎]\\\\s*([^\\\\s\\\\n(]+)\\\\s*(?:\\\\(lines?\\\\s*(\\\\d+)(?:-(\\\\d+))?\\\\))?[\\\\s\\\\n]*'+bt+bt+bt+'(\\\\w+)?\\\\n([\\\\s\\\\S]*?)'+bt+bt+bt,'g');

@@ -242,6 +242,12 @@
           "description": "Enable debug logging to Output channel",
           "order": 20
         },
+        "grok.jsonCleanup": {
+          "type": "boolean",
+          "default": true,
+          "description": "When JSON parsing fails, use fast model to attempt cleanup (adds ~500ms but improves reliability)",
+          "order": 21
+        },
         "grok.enableSound": {
           "type": "boolean",
           "default": false,

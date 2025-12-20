@@ -100,6 +100,11 @@ export function repairJson(jsonString: string): string {
     // Must run before empty key fixes so we can properly detect section structure
     repaired = repaired.replace(/"(text|message|path|command|description|content|heading)\s+"([^"]*?)"/gi, '"$1": "$2"');
     
+    // SECOND: Fix missing comma/quote after heading value: "heading": "Value "content": -> "heading": "Value", "content":
+    // AI sometimes omits closing quote AND comma between heading value and content key
+    // Pattern matches: "heading": "Value "content" where value is missing closing quote
+    repaired = repaired.replace(/("heading"\s*:\s*"[^"]*)\s+"content"\s*:/g, '$1", "content":');
+    
     // 0. Fix empty key for heading in sections: {"": "Title", "content" -> {"heading": "Title", "content"
     // Must come FIRST - more specific than text rule (checks for "content" after)
     repaired = repaired.replace(/\{\s*""\s*:\s*"([^"]+)"\s*,\s*"content"/g, '{"heading": "$1", "content"');

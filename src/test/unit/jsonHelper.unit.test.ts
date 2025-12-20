@@ -380,5 +380,15 @@ describe('JSON Helper', () => {
             assert.strictEqual(parsed.sections[0].codeBlocks.length, 1);
             assert.strictEqual(parsed.sections[0].codeBlocks[0].language, 'python');
         });
+
+        it('should fix missing comma after heading value', () => {
+            const broken = '{"heading": "Strengths "content": "Good stuff."}';
+            const repaired = repairJson(broken);
+            const result = isValidJson(repaired);
+            assert.strictEqual(result.isValid, true);
+            const parsed = result.parsed as any;
+            assert.strictEqual(parsed.heading, 'Strengths');
+            assert.strictEqual(parsed.content, 'Good stuff.');
+        });
     });
 });

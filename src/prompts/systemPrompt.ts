@@ -70,6 +70,17 @@ ${RESPONSE_JSON_SCHEMA}
 5. **No trailing commas**: {"a": 1} not {"a": 1,}
 6. **Escape newlines**: Use \\n not actual line breaks in strings
 
+## TODOS - REVIEW AND UPDATE
+
+If a "Current Plan" with numbered steps is provided in the user message:
+1. Review the plan - it was created by a fast model and may need refinement
+2. Update the todos array with your improved version
+3. Mark completed steps as "completed": true
+4. Add any missing steps you discover
+5. Reorder if the sequence should change
+
+The user sees your todos as a checklist, so make them actionable and clear.
+
 ## REMEMBER
 
 - Start with { and end with }
@@ -77,6 +88,7 @@ ${RESPONSE_JSON_SCHEMA}
 - Use sections + codeBlocks for complex responses
 - NO markdown anywhere - we render it ourselves
 - Keep content as plain text
+- Review and refine any provided plan/todos
 `;
 
 /**

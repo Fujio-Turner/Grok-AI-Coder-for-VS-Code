@@ -1,77 +1,113 @@
 /**
- * Agent Orchestrator - Two-pass workflow for intelligent file handling.
+ * Agent Orchestrator - Three-pass workflow for intelligent file/URL handling.
  * 
- * Pass 1: Fast model analyzes request to determine if files are needed
- * Pass 2: If files needed, find/read them and include in main request
+ * Pass 1: Fast model analyzes request and creates a plan (TODOs + actions)
+ * Pass 2: Execute actions (read files, fetch URLs) with progress updates
+ * Pass 3: Main model processes everything and can refine the plan
  */
 
 import * as vscode from 'vscode';
 import { sendChatCompletion, GrokMessage } from '../api/grokClient';
 import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent } from './workspaceFiles';
-import { debug, info } from '../utils/logger';
-
-export interface FileRequest {
-    patterns: string[];
-    reason: string;
-}
-
-export interface AgentAnalysis {
-    needsFiles: boolean;
-    fileRequest?: FileRequest;
-    canAnswerDirectly: boolean;
-}
-
-export interface AgentResult {
-    filesFound: FileContent[];
-    filesSummary: string;
-    augmentedPrompt: string;
-}
+import { fetchUrl, extractUrls } from './httpFetcher';
+import { 
+    AgentPlan, 
+    Action, 
+    FileAction, 
+    UrlAction, 
+    ActionResult, 
+    ExecutionResult,
+    ProgressUpdate,
+    TodoAction
+} from './actionTypes';
+import { debug, info, error as logError } from '../utils/logger';
 
 /**
- * System prompt for the fast model to analyze if files are needed.
+ * System prompt for the fast model to create a plan.
  */
-const ANALYSIS_PROMPT = `You are a code assistant analyzer. Your job is to determine if the user's request requires reading files from their workspace.
+const PLANNING_PROMPT = `You are a code assistant planner. Analyze the user's request and create a plan.
 
-Analyze the user's message and respond with ONLY valid JSON in this exact format:
+Respond with ONLY valid JSON in this exact format:
 {
-    "needsFiles": true/false,
-    "filePatterns": ["pattern1", "pattern2"],
-    "reason": "brief explanation"
+    "summary": "Brief description of what needs to be done",
+    "todos": [
+        {"text": "First step to do", "order": 1},
+        {"text": "Second step to do", "order": 2}
+    ],
+    "actions": [
+        {"type": "file", "pattern": "**/filename*.py", "reason": "Why this file is needed"},
+        {"type": "url", "url": "https://example.com/docs", "reason": "Why this URL is needed"}
+    ]
 }
 
-Rules:
-- Set needsFiles=true if the user mentions specific files, file patterns, or asks to review/analyze code
-- Use glob patterns for filePatterns (e.g., "**/06_read_*.py", "src/**/*.ts")
-- Keep filePatterns empty [] if needsFiles is false
-- Be conservative - only request files that are clearly needed
+Rules for actions:
+- Use "file" type for reading files from the workspace
+- Use glob patterns for file patterns (e.g., "**/auth*.ts", "src/**/*.py")
+- Use "url" type for fetching web pages (documentation, API references)
+- Only include actions that are clearly needed
+- Limit to 5 file patterns and 3 URLs maximum
+
+Rules for todos:
+- Break down the task into clear steps
+- Order them logically (1, 2, 3...)
+- Keep each todo concise (under 50 chars)
+- Include 2-5 todos typically
 
 Examples:
-User: "Review the 06_read_*.py files"
-{"needsFiles":true,"filePatterns":["**/06_read_*.py"],"reason":"User explicitly asked to review files matching this pattern"}
 
-User: "How do I create a REST API?"
-{"needsFiles":false,"filePatterns":[],"reason":"General question, no specific files mentioned"}
+User: "Review the 06_read_*.py files for Couchbase"
+{
+    "summary": "Review Couchbase read files for best practices",
+    "todos": [
+        {"text": "Locate and read 06_read_*.py files", "order": 1},
+        {"text": "Check error handling patterns", "order": 2},
+        {"text": "Review timeout configurations", "order": 3},
+        {"text": "Identify improvements", "order": 4}
+    ],
+    "actions": [
+        {"type": "file", "pattern": "**/06_read_*.py", "reason": "Main files to review"}
+    ]
+}
 
-User: "Check the auth middleware for security issues"
-{"needsFiles":true,"filePatterns":["**/auth*","**/middleware*"],"reason":"User wants to review auth middleware code"}
+User: "How do I use the Couchbase Python SDK for replica reads? Check the docs."
+{
+    "summary": "Explain Couchbase replica reads with SDK docs",
+    "todos": [
+        {"text": "Fetch Couchbase SDK documentation", "order": 1},
+        {"text": "Find replica read examples", "order": 2},
+        {"text": "Explain usage patterns", "order": 3}
+    ],
+    "actions": [
+        {"type": "url", "url": "https://docs.couchbase.com/python-sdk/current/howtos/concurrent-document-mutations.html", "reason": "Official replica read docs"}
+    ]
+}
 
-User: "What's in my config files?"
-{"needsFiles":true,"filePatterns":["**/*.config.*","**/config.*","**/.env*"],"reason":"User asking about configuration files"}
+User: "What's the best way to handle errors in JavaScript?"
+{
+    "summary": "Explain JavaScript error handling best practices",
+    "todos": [
+        {"text": "Explain try-catch patterns", "order": 1},
+        {"text": "Cover async error handling", "order": 2},
+        {"text": "Show best practices", "order": 3}
+    ],
+    "actions": []
+}
 
 Respond with ONLY the JSON, no other text.`;
 
 /**
- * Analyze user request to determine if files are needed.
+ * Pass 1: Create a plan from user request.
  */
-export async function analyzeRequest(
+export async function createPlan(
     userMessage: string,
     apiKey: string,
-    fastModel: string
-): Promise<AgentAnalysis> {
-    debug('Analyzing request for file requirements...');
+    fastModel: string,
+    onProgress?: (update: ProgressUpdate) => void
+): Promise<AgentPlan> {
+    debug('Creating plan for request...');
     
     const messages: GrokMessage[] = [
-        { role: 'system', content: ANALYSIS_PROMPT },
+        { role: 'system', content: PLANNING_PROMPT },
         { role: 'user', content: userMessage }
     ];
 
@@ -85,134 +121,300 @@ export async function analyzeRequest(
         );
 
         const text = response.text.trim();
-        debug('Analysis response:', text);
+        debug('Planning response:', text);
 
-        // Try to parse the JSON response
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
             
-            return {
-                needsFiles: parsed.needsFiles === true,
-                fileRequest: parsed.needsFiles ? {
-                    patterns: parsed.filePatterns || [],
-                    reason: parsed.reason || ''
-                } : undefined,
-                canAnswerDirectly: !parsed.needsFiles
+            const plan: AgentPlan = {
+                summary: parsed.summary || 'Processing request',
+                todos: (parsed.todos || []).map((t: any, i: number) => ({
+                    text: t.text || `Step ${i + 1}`,
+                    order: t.order || i + 1,
+                    status: 'pending' as const
+                })),
+                actions: (parsed.actions || []).filter((a: any) => 
+                    a.type === 'file' || a.type === 'url'
+                ).map((a: any) => ({
+                    type: a.type,
+                    pattern: a.pattern,
+                    url: a.url,
+                    reason: a.reason || ''
+                }))
             };
+
+            onProgress?.({
+                type: 'plan',
+                message: `📋 Plan created: ${plan.todos.length} steps, ${plan.actions.length} actions`,
+                details: {
+                    todoCount: plan.todos.length,
+                    actionCount: plan.actions.length
+                }
+            });
+
+            return plan;
         }
     } catch (error) {
-        debug('Analysis failed, proceeding without files:', error);
+        debug('Planning failed:', error);
     }
 
-    // Default: don't need files
+    // Default empty plan
     return {
-        needsFiles: false,
-        canAnswerDirectly: true
+        summary: 'Processing request',
+        todos: [{ text: 'Analyze and respond', order: 1, status: 'pending' }],
+        actions: []
     };
 }
 
 /**
- * Find and prepare files based on analysis.
+ * Pass 2: Execute all actions with progress updates.
  */
-export async function prepareFiles(
-    fileRequest: FileRequest,
-    onProgress?: (message: string) => void
-): Promise<AgentResult> {
-    const allFiles: FileContent[] = [];
-    
-    for (const pattern of fileRequest.patterns) {
-        onProgress?.(`Searching for ${pattern}...`);
-        const files = await findAndReadFiles(pattern, 5);
-        allFiles.push(...files);
+export async function executeActions(
+    plan: AgentPlan,
+    onProgress?: (update: ProgressUpdate) => void
+): Promise<ExecutionResult> {
+    const results: ActionResult[] = [];
+    const filesContent = new Map<string, string>();
+    const urlsContent = new Map<string, string>();
+
+    for (const action of plan.actions) {
+        if (action.type === 'file') {
+            const fileAction = action as FileAction;
+            
+            onProgress?.({
+                type: 'file-start',
+                message: `📂 Searching for ${fileAction.pattern}...`,
+                details: { path: fileAction.pattern }
+            });
+
+            try {
+                const files = await findAndReadFiles(fileAction.pattern, 5);
+                
+                if (files.length > 0) {
+                    const totalLines = files.reduce((sum, f) => sum + f.lineCount, 0);
+                    const fileNames = files.map(f => f.name).join(', ');
+                    
+                    files.forEach(f => {
+                        filesContent.set(f.path, f.content);
+                    });
+
+                    onProgress?.({
+                        type: 'file-done',
+                        message: `✅ Loaded ${files.length} file(s): ${fileNames} (${totalLines} lines)`,
+                        details: { 
+                            path: fileAction.pattern,
+                            lines: totalLines,
+                            files: files.map(f => f.name)
+                        }
+                    });
+
+                    results.push({
+                        action,
+                        success: true,
+                        content: formatFilesForPrompt(files),
+                        metadata: { lines: totalLines, files: files.map(f => f.path) }
+                    });
+                } else {
+                    onProgress?.({
+                        type: 'error',
+                        message: `⚠️ No files found matching ${fileAction.pattern}`,
+                        details: { path: fileAction.pattern }
+                    });
+
+                    results.push({
+                        action,
+                        success: false,
+                        error: 'No matching files found'
+                    });
+                }
+            } catch (err: any) {
+                onProgress?.({
+                    type: 'error',
+                    message: `❌ Error reading ${fileAction.pattern}: ${err.message}`,
+                    details: { path: fileAction.pattern }
+                });
+
+                results.push({
+                    action,
+                    success: false,
+                    error: err.message
+                });
+            }
+        } else if (action.type === 'url') {
+            const urlAction = action as UrlAction;
+            
+            onProgress?.({
+                type: 'url-start',
+                message: `🌐 Fetching ${urlAction.url}...`,
+                details: { url: urlAction.url }
+            });
+
+            try {
+                const fetchResult = await fetchUrl(urlAction.url);
+                
+                if (fetchResult.success && fetchResult.content) {
+                    urlsContent.set(urlAction.url, fetchResult.content);
+                    
+                    const sizeKB = Math.round((fetchResult.bytes || 0) / 1024);
+                    onProgress?.({
+                        type: 'url-done',
+                        message: `✅ Fetched ${new URL(urlAction.url).hostname} (${sizeKB}KB)`,
+                        details: { url: urlAction.url, bytes: fetchResult.bytes }
+                    });
+
+                    results.push({
+                        action,
+                        success: true,
+                        content: fetchResult.content,
+                        metadata: { bytes: fetchResult.bytes }
+                    });
+                } else {
+                    onProgress?.({
+                        type: 'error',
+                        message: `⚠️ Failed to fetch ${urlAction.url}: ${fetchResult.error}`,
+                        details: { url: urlAction.url }
+                    });
+
+                    results.push({
+                        action,
+                        success: false,
+                        error: fetchResult.error
+                    });
+                }
+            } catch (err: any) {
+                onProgress?.({
+                    type: 'error',
+                    message: `❌ Error fetching ${urlAction.url}: ${err.message}`,
+                    details: { url: urlAction.url }
+                });
+
+                results.push({
+                    action,
+                    success: false,
+                    error: err.message
+                });
+            }
+        }
     }
 
-    // Deduplicate by path
-    const uniqueFiles = allFiles.filter((file, index, self) =>
-        index === self.findIndex(f => f.path === file.path)
-    );
-
-    const summary = getFilesSummary(uniqueFiles);
-    const formattedContent = formatFilesForPrompt(uniqueFiles);
-
-    info(`Prepared ${uniqueFiles.length} files for context`);
-
-    return {
-        filesFound: uniqueFiles,
-        filesSummary: summary,
-        augmentedPrompt: formattedContent
-    };
+    return { plan, results, filesContent, urlsContent };
 }
 
 /**
- * Create augmented user message with file contents.
+ * Build the augmented message with all gathered context.
  */
-export function createAugmentedMessage(
+export function buildAugmentedMessage(
     originalMessage: string,
-    files: FileContent[]
+    plan: AgentPlan,
+    execution: ExecutionResult
 ): string {
-    if (files.length === 0) {
-        return originalMessage + '\n\n(Note: No matching files were found in the workspace.)';
+    let augmented = originalMessage;
+
+    // Add plan context
+    if (plan.todos.length > 0) {
+        augmented += '\n\n---\n**Current Plan (you may refine this):**\n';
+        plan.todos.forEach(t => {
+            augmented += `${t.order}. ${t.text}\n`;
+        });
     }
 
-    const fileContent = formatFilesForPrompt(files);
-    
-    return `${originalMessage}
+    // Add file contents
+    if (execution.filesContent.size > 0) {
+        augmented += '\n\n---\n**Files from workspace:**\n';
+        for (const [path, content] of execution.filesContent) {
+            augmented += `\n### ${path}\n\`\`\`\n${content}\n\`\`\`\n`;
+        }
+    }
 
----
-**Files from workspace:**
+    // Add URL contents
+    if (execution.urlsContent.size > 0) {
+        augmented += '\n\n---\n**Content from URLs:**\n';
+        for (const [url, content] of execution.urlsContent) {
+            // Truncate to reasonable size
+            const truncated = content.length > 10000 
+                ? content.substring(0, 10000) + '\n\n[Content truncated...]'
+                : content;
+            augmented += `\n### ${url}\n${truncated}\n`;
+        }
+    }
 
-${fileContent}
+    augmented += '\n\n---\nPlease analyze the above and respond to the user\'s request. You may update the TODO list if needed.';
 
----
-Please analyze the above files and respond to the user's request.`;
+    return augmented;
 }
 
 /**
- * Full two-pass agent workflow.
+ * Full three-pass agent workflow.
  */
 export async function runAgentWorkflow(
     userMessage: string,
     apiKey: string,
     fastModel: string,
     onProgress?: (message: string) => void
-): Promise<{ augmentedMessage: string; filesLoaded: FileContent[]; skipped: boolean }> {
+): Promise<{ augmentedMessage: string; filesLoaded: FileContent[]; skipped: boolean; plan?: AgentPlan }> {
     
-    // Pass 1: Analyze if files are needed
-    onProgress?.('Analyzing request...');
-    const analysis = await analyzeRequest(userMessage, apiKey, fastModel);
+    // Convert string progress to ProgressUpdate for internal use
+    const progressHandler = (update: ProgressUpdate) => {
+        onProgress?.(update.message);
+    };
+
+    // Pass 1: Create plan
+    onProgress?.('🧠 Planning...');
+    const plan = await createPlan(userMessage, apiKey, fastModel, progressHandler);
     
-    if (!analysis.needsFiles || !analysis.fileRequest) {
-        debug('No files needed, proceeding directly');
+    if (plan.actions.length === 0) {
+        debug('No actions in plan, proceeding directly');
         return {
             augmentedMessage: userMessage,
             filesLoaded: [],
-            skipped: true
+            skipped: true,
+            plan
         };
     }
 
-    info(`Files needed: ${analysis.fileRequest.patterns.join(', ')}`);
-    onProgress?.(`Finding files: ${analysis.fileRequest.patterns.join(', ')}`);
+    info(`Plan created: ${plan.todos.length} todos, ${plan.actions.length} actions`);
 
-    // Pass 2: Find and read files
-    const result = await prepareFiles(analysis.fileRequest, onProgress);
+    // Pass 2: Execute actions
+    const execution = await executeActions(plan, progressHandler);
     
-    if (result.filesFound.length === 0) {
-        onProgress?.('No matching files found');
-        return {
-            augmentedMessage: userMessage + '\n\n(Note: I searched but found no files matching the patterns. Please check the file names or paths.)',
-            filesLoaded: [],
-            skipped: false
-        };
+    // Collect loaded files for return value
+    const filesLoaded: FileContent[] = [];
+    for (const result of execution.results) {
+        if (result.success && result.action.type === 'file' && result.metadata?.files) {
+            for (const filePath of result.metadata.files) {
+                const content = execution.filesContent.get(filePath);
+                if (content) {
+                    filesLoaded.push({
+                        path: filePath,
+                        relativePath: filePath,
+                        name: filePath.split('/').pop() || filePath,
+                        content,
+                        language: filePath.split('.').pop() || 'text',
+                        lineCount: content.split('\n').length
+                    });
+                }
+            }
+        }
     }
 
-    onProgress?.(`Loaded ${result.filesSummary}`);
-
-    const augmented = createAugmentedMessage(userMessage, result.filesFound);
+    // Build augmented message
+    const augmented = buildAugmentedMessage(userMessage, plan, execution);
     
+    const totalFiles = execution.filesContent.size;
+    const totalUrls = execution.urlsContent.size;
+    
+    if (totalFiles > 0 || totalUrls > 0) {
+        onProgress?.(`✅ Ready: ${totalFiles} file(s), ${totalUrls} URL(s) loaded`);
+    }
+
     return {
         augmentedMessage: augmented,
-        filesLoaded: result.filesFound,
-        skipped: false
+        filesLoaded,
+        skipped: false,
+        plan
     };
 }
+
+// Re-export for backward compatibility
+export { FileContent } from './workspaceFiles';
