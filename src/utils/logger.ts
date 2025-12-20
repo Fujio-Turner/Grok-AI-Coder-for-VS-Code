@@ -208,7 +208,9 @@ export function getConfig() {
         defaultModelType: config.get<ModelType>('defaultModelType') || 'fast',
         
         // Couchbase settings
-        couchbaseUrl: config.get<string>('couchbaseUrl') || 'localhost',
+        couchbaseDeployment: config.get<'self-hosted' | 'capella'>('couchbaseDeployment') || 'self-hosted',
+        couchbaseUrl: config.get<string>('couchbaseUrl') || 'http://localhost',
+        capellaDataApiUrl: config.get<string>('capellaDataApiUrl') || '',
         couchbasePort: config.get<number>('couchbasePort') || 8091,
         couchbaseQueryPort: config.get<number>('couchbaseQueryPort') || 8093,
         couchbaseUsername: config.get<string>('couchbaseUsername') || 'Administrator',

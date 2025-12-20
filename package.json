@@ -135,34 +135,51 @@
           "description": "Which model type to use by default",
           "order": 5
         },
+        "grok.couchbaseDeployment": {
+          "type": "string",
+          "default": "self-hosted",
+          "enum": ["self-hosted", "capella"],
+          "enumDescriptions": [
+            "Self-hosted Couchbase Server (uses N1QL query service)",
+            "Couchbase Capella DBaaS (uses Data API)"
+          ],
+          "description": "Couchbase deployment type",
+          "order": 9
+        },
         "grok.couchbaseUrl": {
           "type": "string",
-          "default": "localhost",
-          "description": "Couchbase server hostname or IP",
+          "default": "http://localhost",
+          "description": "Self-hosted: Couchbase server base URL with protocol (e.g., http://localhost or https://couchbase.example.com). Capella: Not used.",
+          "order": 10
+        },
+        "grok.capellaDataApiUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Capella Data API URL (e.g., https://your-cluster-id.data.cloud.couchbase.com). Required for Capella deployment.",
           "order": 10
         },
         "grok.couchbasePort": {
           "type": "number",
           "default": 8091,
-          "description": "Couchbase management port (8091 for REST API)",
+          "description": "Self-hosted: Couchbase management port (8091 for REST API). Capella: Not used.",
           "order": 11
         },
         "grok.couchbaseQueryPort": {
           "type": "number",
           "default": 8093,
-          "description": "Couchbase N1QL query service port",
+          "description": "Self-hosted: Couchbase N1QL query service port. Capella: Not used.",
           "order": 12
         },
         "grok.couchbaseUsername": {
           "type": "string",
           "default": "Administrator",
-          "description": "Couchbase username",
+          "description": "Couchbase username (for both self-hosted and Capella cluster access credentials)",
           "order": 13
         },
         "grok.couchbasePassword": {
           "type": "string",
           "default": "password",
-          "description": "Couchbase password",
+          "description": "Couchbase password (for both self-hosted and Capella cluster access secret)",
           "order": 14
         },
         "grok.couchbaseBucket": {
