@@ -46,7 +46,7 @@ docker run -d --name couchbase -p 8091-8096:8091-8096 -p 11210:11210 couchbase:l
 
 Then visit `http://localhost:8091`, create a bucket named `grokCoder`, and run:
 ```sql
-CREATE PRIMARY INDEX ON `grokCoder`._default._default;
+CREATE INDEX `find_chats_v1` ON `grokCoder`(`projectId`,`updatedAt` DESC) WHERE (`docType` = "chat");
 ```
 
 **Option B: Couchbase Capella (Cloud)**
