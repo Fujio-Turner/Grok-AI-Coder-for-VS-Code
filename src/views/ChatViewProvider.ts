@@ -1122,6 +1122,7 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #chat{flex:1;overflow-y:auto;padding:10px;scroll-behavior:smooth}
 .msg{margin-bottom:10px;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.5;word-wrap:break-word}
 .msg.u{background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-left:20%;border-radius:12px 12px 4px 12px}
+.msg.u code{background:rgba(255,255,255,.2);padding:1px 5px;border-radius:3px;font-family:var(--vscode-editor-font-family);font-size:12px}
 .msg.a{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);margin-right:5%;border-radius:12px 12px 12px 4px}
 .msg.p{opacity:.7}
 .msg.e{background:var(--vscode-inputValidation-errorBackground);border-color:var(--vscode-inputValidation-errorBorder)}
@@ -1203,7 +1204,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 #attach:hover{background:var(--vscode-button-secondaryHoverBackground)}
 #img-preview{display:none;gap:6px;flex-wrap:wrap;padding:4px 0}
 #img-preview.show{display:flex}
-#autocomplete{position:absolute;bottom:100%;left:40px;right:60px;max-height:180px;overflow-y:auto;background:var(--vscode-editorSuggestWidget-background);border:1px solid var(--vscode-editorSuggestWidget-border);border-radius:6px;display:none;z-index:100;box-shadow:0 -2px 8px rgba(0,0,0,.2)}
+#autocomplete{position:absolute;bottom:50px;left:40px;right:60px;max-height:150px;overflow-y:auto;background:var(--vscode-editorSuggestWidget-background);border:1px solid var(--vscode-editorSuggestWidget-border);border-radius:6px;display:none;z-index:100;box-shadow:0 -2px 8px rgba(0,0,0,.2)}
 #autocomplete.show{display:block}
 .ac-item{padding:6px 10px;cursor:pointer;font-size:12px;font-family:var(--vscode-editor-font-family);display:flex;align-items:center;gap:8px}
 .ac-item:hover,.ac-item.sel{background:var(--vscode-list-hoverBackground)}
@@ -1436,7 +1437,7 @@ function scrollToBottom(){setTimeout(()=>{chat.scrollTop=chat.scrollHeight;},50)
 window.addEventListener('message',e=>{const m=e.data;
 switch(m.type){
 case'init':case'sessionChanged':
-curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=m.summary||m.sessionId;
+curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=(m.summary||m.sessionId)+'\\n['+m.sessionId.slice(0,6)+']';
 chat.innerHTML='';totalTokens=0;totalCost=0;if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}hist.classList.remove('show');scrollToBottom();break;
 case'historyList':
 hist.innerHTML='';m.sessions.forEach(s=>{const d=document.createElement('div');d.className='hist-item'+(s.id===m.currentSessionId?' active':'');
@@ -1512,7 +1513,8 @@ break;
 if(parsed.summary||parsed.message||parsed.sections||parsed.fileChanges){return parsed;}
 return null;
 }
-function addPair(p,i,streaming){const u=document.createElement('div');u.className='msg u';u.textContent=p.request.text;chat.appendChild(u);
+function fmtUserMsg(t){return esc(t).replace(/\`([^\`]+)\`/g,'<code>$1</code>');}
+function addPair(p,i,streaming){const u=document.createElement('div');u.className='msg u';u.innerHTML=fmtUserMsg(p.request.text);chat.appendChild(u);
 const a=document.createElement('div');a.className='msg a';a.dataset.i=i;
 if(p.response.status==='pending'&&streaming){a.classList.add('p');a.innerHTML='<div class="c"><div class="think"><div class="spin"></div>Thinking...</div></div>';curDiv=a;}
 else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div class="c">⚠️ Error: '+esc(p.response.errorMessage||'')+'</div>';}
