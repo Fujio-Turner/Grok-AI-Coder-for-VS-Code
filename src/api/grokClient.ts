@@ -213,6 +213,65 @@ export async function sendChatCompletion(
 }
 
 /**
+ * Model info from xAI API
+ */
+export interface GrokModelInfo {
+    id: string;
+    contextLength: number;
+    inputPricePer1M: number;
+    outputPricePer1M: number;
+}
+
+/**
+ * Fetch language model info from xAI API
+ * Returns context length and pricing for each model
+ */
+export async function fetchLanguageModels(apiKey: string): Promise<GrokModelInfo[]> {
+    const config = vscode.workspace.getConfiguration('grok');
+    const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
+    
+    log.info('Fetching language models from API');
+    
+    try {
+        const response = await fetch(`${baseUrl}/language-models`, {
+            headers: {
+                'Authorization': `Bearer ${apiKey}`
+            },
+            signal: AbortSignal.timeout(30000)
+        });
+        
+        if (!response.ok) {
+            log.error('Failed to fetch language models', { status: response.status });
+            return [];
+        }
+        
+        const data = await response.json() as {
+            data?: Array<{
+                id: string;
+                context_length?: number;
+                pricing?: {
+                    input?: { per_million_tokens?: number };
+                    output?: { per_million_tokens?: number };
+                };
+            }>;
+        };
+        
+        const models: GrokModelInfo[] = (data.data || []).map(m => ({
+            id: m.id,
+            contextLength: m.context_length || 131072,
+            inputPricePer1M: m.pricing?.input?.per_million_tokens || 0.30,
+            outputPricePer1M: m.pricing?.output?.per_million_tokens || 0.50
+        }));
+        
+        log.info('Fetched language models', { count: models.length });
+        return models;
+    } catch (err: any) {
+        log.error('Exception fetching language models', { error: err.message });
+        return [];
+    }
+}
+
+/**
  * Test API connection by making a minimal request
  */
 export async function testApiConnection(apiKey: string): Promise<{ success: boolean; error?: string; latencyMs?: number }> {

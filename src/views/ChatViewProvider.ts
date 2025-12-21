@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { v4 as uuidv4 } from 'uuid';
-import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection } from '../api/grokClient';
+import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection, fetchLanguageModels, GrokModelInfo } from '../api/grokClient';
 import { getCouchbaseClient } from '../storage/couchbaseClient';
 import { 
     createSession, 
@@ -43,6 +43,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _currentSessionId?: string;
     private _abortController?: AbortController;
     private _isRequestInProgress = false;
+    private _modelInfoCache: Map<string, GrokModelInfo> = new Map();
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -128,6 +129,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     await this._initializeSession();
                     this._sendInitialChanges();
                     this._testAndSendConnectionStatus();
+                    this._fetchAndCacheModelInfo();
                     break;
                 case 'loadSession':
                     await this.loadSession(message.sessionId);
@@ -181,11 +183,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _sendConfig() {
         const config = vscode.workspace.getConfiguration('grok');
+        const modelMode = config.get<string>('modelMode', 'fast');
+        // Send the actual model name based on mode
+        let activeModel: string;
+        if (modelMode === 'smart') {
+            activeModel = config.get<string>('modelReasoning', 'grok-4');
+        } else if (modelMode === 'base') {
+            activeModel = config.get<string>('modelBase', 'grok-3');
+        } else {
+            activeModel = config.get<string>('modelFast', 'grok-3-mini');
+        }
         this._postMessage({
             type: 'config',
             enterToSend: config.get<boolean>('enterToSend', false),
             autoApply: config.get<boolean>('autoApply', true),
-            modelMode: config.get<string>('modelMode', 'fast')
+            modelMode: modelMode,
+            activeModel: activeModel
         });
     }
 
@@ -200,6 +213,85 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const config = vscode.workspace.getConfiguration('grok');
         config.update('modelMode', mode, vscode.ConfigurationTarget.Global);
         this._sendConfig();
+    }
+
+    private static readonly MODEL_CACHE_KEY = 'grok.modelInfoCache';
+    private static readonly MODEL_CACHE_TIMESTAMP_KEY = 'grok.modelInfoCacheTimestamp';
+    private static readonly CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+    private async _fetchAndCacheModelInfo() {
+        try {
+            const apiKey = await this._context.secrets.get('grokApiKey');
+            if (!apiKey) return;
+
+            // Check if cached data exists and is still valid
+            const cachedTimestamp = this._context.globalState.get<number>(ChatViewProvider.MODEL_CACHE_TIMESTAMP_KEY);
+            const cachedData = this._context.globalState.get<Record<string, GrokModelInfo>>(ChatViewProvider.MODEL_CACHE_KEY);
+            
+            const now = Date.now();
+            const cacheValid = cachedTimestamp && cachedData && (now - cachedTimestamp < ChatViewProvider.CACHE_TTL_MS);
+            
+            if (cacheValid && cachedData) {
+                // Use cached data
+                for (const [id, model] of Object.entries(cachedData)) {
+                    this._modelInfoCache.set(id, model);
+                }
+                info(`Using cached model info (${Object.keys(cachedData).length} models, expires in ${Math.round((ChatViewProvider.CACHE_TTL_MS - (now - cachedTimestamp!)) / 3600000)}h)`);
+                this._sendModelInfo();
+                return;
+            }
+
+            // Fetch fresh data from API
+            info('Fetching fresh model info from API (cache expired or missing)');
+            const models = await fetchLanguageModels(apiKey);
+            
+            if (models.length > 0) {
+                // Update in-memory cache
+                for (const model of models) {
+                    this._modelInfoCache.set(model.id, model);
+                }
+                
+                // Persist to globalState
+                const cacheObj: Record<string, GrokModelInfo> = {};
+                for (const model of models) {
+                    cacheObj[model.id] = model;
+                }
+                await this._context.globalState.update(ChatViewProvider.MODEL_CACHE_KEY, cacheObj);
+                await this._context.globalState.update(ChatViewProvider.MODEL_CACHE_TIMESTAMP_KEY, now);
+                
+                info(`Cached ${models.length} model info entries (expires in 24h)`);
+            }
+            
+            // Send updated model info to webview
+            this._sendModelInfo();
+        } catch (error) {
+            debug('Failed to fetch model info:', error);
+            
+            // Try to use stale cache as fallback
+            const cachedData = this._context.globalState.get<Record<string, GrokModelInfo>>(ChatViewProvider.MODEL_CACHE_KEY);
+            if (cachedData) {
+                for (const [id, model] of Object.entries(cachedData)) {
+                    this._modelInfoCache.set(id, model);
+                }
+                info('Using stale cached model info as fallback');
+                this._sendModelInfo();
+            }
+        }
+    }
+
+    private _sendModelInfo() {
+        const modelInfo: Record<string, { contextLength: number; inputPrice: number; outputPrice: number }> = {};
+        for (const [id, info] of this._modelInfoCache.entries()) {
+            modelInfo[id] = {
+                contextLength: info.contextLength,
+                inputPrice: info.inputPricePer1M,
+                outputPrice: info.outputPricePer1M
+            };
+        }
+        this._postMessage({
+            type: 'modelInfo',
+            models: modelInfo
+        });
     }
 
     private async _testAndSendConnectionStatus() {
@@ -1366,7 +1458,23 @@ const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
 let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=true;
-const CTX_LIMIT=128000;
+// Model info: context limits and pricing (fallback values, updated from API)
+let modelInfo={
+    'grok-4-1-fast-reasoning-latest':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-4-1-fast-non-reasoning-latest':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-4-1-fast-reasoning':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-4-1-fast-non-reasoning':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-4-fast-reasoning':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-4-fast-non-reasoning':{ctx:2000000,inPrice:0.20,outPrice:0.50},
+    'grok-code-fast-1':{ctx:256000,inPrice:0.20,outPrice:1.50},
+    'grok-4-0709':{ctx:256000,inPrice:3.00,outPrice:15.00},
+    'grok-4':{ctx:256000,inPrice:3.00,outPrice:15.00},
+    'grok-3-mini':{ctx:131072,inPrice:0.30,outPrice:0.50},
+    'grok-3':{ctx:131072,inPrice:3.00,outPrice:15.00}
+};
+let currentModel='grok-3-mini';
+function getCtxLimit(){return (modelInfo[currentModel]||{ctx:131072}).ctx;}
+function getModelPricing(){return modelInfo[currentModel]||{inPrice:0.30,outPrice:0.50};}
 const autocomplete=document.getElementById('autocomplete');
 let acFiles=[],acIndex=-1,acWordStart=-1,acWordEnd=-1,acDebounce=null;
 
@@ -1527,7 +1635,7 @@ msg.addEventListener('input',()=>{
     }else{hideAutocomplete();}
 });
 let handoffShownThisSession=false;
-function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;totalCost+=(p/1e6)*0.30+(c/1e6)*0.50;}const pct=Math.min(100,Math.round(totalTokens/CTX_LIMIT*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';updatePctColor(pct);if(pct>=75&&!handoffShownThisSession&&!busy){handoffShownThisSession=true;handoffPopup.classList.add('show');}}
+function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;const pricing=getModelPricing();totalCost+=(p/1e6)*pricing.inPrice+(c/1e6)*pricing.outPrice;}const ctxLimit=getCtxLimit();const pct=Math.min(100,Math.round(totalTokens/ctxLimit*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';updatePctColor(pct);if(pct>=75&&!handoffShownThisSession&&!busy){handoffShownThisSession=true;handoffPopup.classList.add('show');}}
 function doSend(){const t=msg.value.trim();if((t||attachedImages.length)&&!busy){vs.postMessage({type:'sendMessage',text:t,images:attachedImages});msg.value='';msg.style.height='auto';stream='';attachedImages=[];imgPreview.innerHTML='';imgPreview.classList.remove('show');hideAutocomplete();saveInputState();}}
 attachBtn.onclick=()=>fileInput.click();
 fileInput.onchange=async e=>{const files=Array.from(e.target.files||[]);for(const f of files){if(!f.type.startsWith('image/'))continue;const reader=new FileReader();reader.onload=ev=>{const b64=ev.target.result.split(',')[1];attachedImages.push(b64);const thumb=document.createElement('div');thumb.className='img-thumb';thumb.innerHTML='<img src="'+ev.target.result+'"><button class="rm" data-i="'+(attachedImages.length-1)+'">×</button>';thumb.querySelector('.rm').onclick=function(){const i=parseInt(this.dataset.i);attachedImages.splice(i,1);updateImgPreview();};imgPreview.appendChild(thumb);imgPreview.classList.add('show');};reader.readAsDataURL(f);}fileInput.value='';};
@@ -1591,10 +1699,11 @@ case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
 const nextIdx=currentTodos.findIndex(t=>!t.completed);
 if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
 renderTodos();}break;
-case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';updateAutoBtn();updateModelBtn();break;
+case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 case'fileSearchResults':showAutocomplete(m.files||[]);break;
 case'prefillInput':msg.value=m.text;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';saveInputState();break;
+case'modelInfo':if(m.models){for(const[id,info]of Object.entries(m.models)){modelInfo[id]={ctx:info.contextLength||131072,inPrice:info.inputPrice||0.30,outPrice:info.outputPrice||0.50};}}break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
