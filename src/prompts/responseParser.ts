@@ -23,6 +23,8 @@ export interface ParseResult {
     raw?: string;
     error?: string;
     wasRepaired?: boolean;
+    wasTruncated?: boolean;
+    truncatedFileChangesCount?: number;
 }
 
 /**
@@ -73,11 +75,18 @@ export function parseGrokResponse(responseText: string): ParseResult {
         const validated = validateResponse(parseResult.parsed);
         
         if (validated) {
-            debug('Successfully parsed structured response', { wasRepaired: parseResult.wasRepaired });
+            const wasTruncated = !!parseResult.truncatedFileChanges;
+            debug('Successfully parsed structured response', { 
+                wasRepaired: parseResult.wasRepaired,
+                wasTruncated,
+                truncatedFileChangesCount: parseResult.truncatedFileChanges?.length
+            });
             return {
                 success: true,
                 structured: validated,
-                wasRepaired: parseResult.wasRepaired
+                wasRepaired: parseResult.wasRepaired,
+                wasTruncated,
+                truncatedFileChangesCount: parseResult.truncatedFileChanges?.length
             };
         } else {
             debug('JSON parsed but failed schema validation');

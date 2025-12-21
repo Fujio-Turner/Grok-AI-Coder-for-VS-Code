@@ -269,10 +269,55 @@ export function repairJson(jsonString: string): string {
 }
 
 /**
+ * Attempt to recover complete fileChanges entries from a truncated JSON response.
+ * Returns an array of complete fileChange objects that were parsed before truncation.
+ */
+export function recoverTruncatedFileChanges(text: string): { path: string; content: string; language?: string; isDiff?: boolean }[] {
+    const recovered: { path: string; content: string; language?: string; isDiff?: boolean }[] = [];
+    
+    // Find the fileChanges array
+    const fileChangesMatch = text.match(/"fileChanges"\s*:\s*\[/);
+    if (!fileChangesMatch) {
+        return recovered;
+    }
+    
+    const startIdx = fileChangesMatch.index! + fileChangesMatch[0].length;
+    
+    // Extract individual fileChange objects using a more robust pattern
+    // Match complete objects: {"path": "...", "language": "...", "content": "...", "isDiff": ...}
+    const fileChangePattern = /\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"language"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*"isDiff"\s*:\s*(true|false))?\s*\}/g;
+    
+    let match;
+    while ((match = fileChangePattern.exec(text)) !== null) {
+        try {
+            const [, path, language, content, isDiff] = match;
+            // Validate that this is a complete entry (content should end properly)
+            if (path && content !== undefined) {
+                recovered.push({
+                    path,
+                    language: language || 'text',
+                    content: content.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\'),
+                    isDiff: isDiff === 'true'
+                });
+                debug(`Recovered fileChange: ${path}`);
+            }
+        } catch (e) {
+            debug(`Failed to recover fileChange: ${e}`);
+        }
+    }
+    
+    if (recovered.length > 0) {
+        debug(`Recovered ${recovered.length} complete fileChanges from truncated response`);
+    }
+    
+    return recovered;
+}
+
+/**
  * Safely parse JSON with validation, extraction, and repair.
  * Returns parsed object or null if all attempts fail.
  */
-export function safeParseJson(text: string): { parsed: unknown; wasRepaired: boolean } | null {
+export function safeParseJson(text: string): { parsed: unknown; wasRepaired: boolean; truncatedFileChanges?: { path: string; content: string; language?: string; isDiff?: boolean }[] } | null {
     // Step 1: Check if it's an HTTP error
     if (isHttpError(text)) {
         debug('Response appears to be an HTTP error, not JSON');
@@ -310,6 +355,21 @@ export function safeParseJson(text: string): { parsed: unknown; wasRepaired: boo
     if (repairedOriginalResult.isValid) {
         debug('Repaired original text parse succeeded');
         return { parsed: repairedOriginalResult.parsed, wasRepaired: true };
+    }
+    
+    // Step 6: If all else fails, try to recover any complete fileChanges from truncated response
+    const truncatedFileChanges = recoverTruncatedFileChanges(text);
+    if (truncatedFileChanges.length > 0) {
+        debug(`Recovered ${truncatedFileChanges.length} fileChanges from truncated response`);
+        // Return a minimal valid response with just the recovered fileChanges
+        return { 
+            parsed: { 
+                summary: 'Response was truncated - partial file changes recovered',
+                fileChanges: truncatedFileChanges 
+            }, 
+            wasRepaired: true,
+            truncatedFileChanges
+        };
     }
     
     debug('All JSON parse attempts failed');

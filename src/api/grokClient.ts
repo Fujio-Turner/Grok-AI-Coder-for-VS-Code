@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { createScopedLogger } from '../utils/logger';
+import { optimizeMessageContent, getToonSystemPromptAddition } from '../utils/toonConverter';
 
 const log = createScopedLogger('GrokAPI');
 
@@ -53,12 +54,30 @@ export async function sendChatCompletion(
     const config = vscode.workspace.getConfiguration('grok');
     const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
     const timeoutSeconds = config.get<number>('apiTimeout') || 300;
+    const optimizePayload = config.get<string>('optimizePayload') || 'none';
+
+    // Apply TOON optimization if enabled
+    let optimizedMessages = messages;
+    if (optimizePayload === 'toon') {
+        optimizedMessages = messages.map(msg => {
+            if (msg.role === 'system') {
+                // Add TOON understanding to system prompt
+                const systemContent = typeof msg.content === 'string' 
+                    ? msg.content + getToonSystemPromptAddition()
+                    : msg.content;
+                return { ...msg, content: systemContent };
+            }
+            // Optimize user message content
+            return { ...msg, content: optimizeMessageContent(msg.content) };
+        });
+    }
 
     log.info(`Sending request to ${model}`, { 
         messageCount: messages.length, 
         streaming: !!onChunk,
         baseUrl,
-        timeoutSeconds
+        timeoutSeconds,
+        optimizePayload
     });
 
     const startTime = Date.now();
@@ -77,7 +96,7 @@ export async function sendChatCompletion(
         },
         body: JSON.stringify({
             model,
-            messages: messages.map(m => ({ role: m.role, content: m.content })),
+            messages: optimizedMessages.map(m => ({ role: m.role, content: m.content })),
             stream: !!onChunk,
             stream_options: onChunk ? { include_usage: true } : undefined
         }),

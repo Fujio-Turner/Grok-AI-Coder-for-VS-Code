@@ -135,6 +135,8 @@ export async function cleanJsonWithModel(
 export interface ParseWithCleanupResult {
     structured: GrokStructuredResponse | null;
     usedCleanup: boolean;
+    wasTruncated?: boolean;
+    truncatedFileChangesCount?: number;
     cleanupMetrics?: {
         timeMs: number;
         tokensIn: number;
@@ -162,7 +164,13 @@ export async function parseWithCleanup(
     if (regexResult) {
         const validated = validateResponse(regexResult.parsed);
         if (validated) {
-            return { structured: validated, usedCleanup: false };
+            const wasTruncated = !!regexResult.truncatedFileChanges;
+            return { 
+                structured: validated, 
+                usedCleanup: false,
+                wasTruncated,
+                truncatedFileChangesCount: regexResult.truncatedFileChanges?.length
+            };
         }
     }
 

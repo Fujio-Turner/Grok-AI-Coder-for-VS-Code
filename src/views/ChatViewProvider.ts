@@ -600,6 +600,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 if (cleanupResult.structured) {
                     structured = cleanupResult.structured;
                     usedCleanup = cleanupResult.usedCleanup;
+                    
+                    // Warn if response was truncated
+                    if (cleanupResult.wasTruncated) {
+                        const recoveredCount = cleanupResult.truncatedFileChangesCount || 0;
+                        const warningMsg = `⚠️ Response was truncated! Only ${recoveredCount} file change(s) were recovered. Consider breaking the task into smaller steps.`;
+                        vscode.window.showWarningMessage(warningMsg);
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n${warningMsg}\n` });
+                    }
+                    
                     if (usedCleanup) {
                         info('Used model cleanup to fix JSON');
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '\n🔧 JSON cleaned up\n' });
@@ -1424,7 +1433,7 @@ a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,stor
 }
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
-function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:200px;overflow:hidden;line-height:1.5;margin-top:8px">'+fmtMd(stream.slice(-600))+'</div>');}
+function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;height:120px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px">'+fmtMd(stream.slice(-800))+'</div>');}
 function fmtFinal(t,u,diffPreview){let h=fmtCode(t,diffPreview);const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
 function fmtFinalStructured(s,u,diffPreview,usedCleanup){
 if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
@@ -1523,7 +1532,7 @@ document.addEventListener('click',e=>{
         sendNextStep(step);
     }
 });
-function updUI(){stop.classList.toggle('vis',busy);send.disabled=busy;msg.disabled=busy;if(!busy)msg.focus();}
+function updUI(){stop.classList.toggle('vis',busy);send.style.display=busy?'none':'block';msg.disabled=busy;if(!busy)msg.focus();}
 vs.postMessage({type:'ready'});
 vs.postMessage({type:'getConfig'});
 </script></body></html>`;

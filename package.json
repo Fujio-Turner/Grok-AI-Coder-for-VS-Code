@@ -283,6 +283,17 @@
           "default": 300,
           "description": "Timeout in seconds for Grok API requests (5 minutes default for complex responses)",
           "order": 26
+        },
+        "grok.optimizePayload": {
+          "type": "string",
+          "default": "none",
+          "enum": ["none", "toon"],
+          "enumDescriptions": [
+            "None - Send messages as standard JSON (default)",
+            "TOON - Use Token-Oriented Object Notation to reduce token usage by 30-60%"
+          ],
+          "description": "Payload optimization format for API requests",
+          "order": 27
         }
       }
     },
