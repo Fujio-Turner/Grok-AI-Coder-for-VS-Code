@@ -243,9 +243,15 @@
           "order": 20
         },
         "grok.jsonCleanup": {
-          "type": "boolean",
-          "default": true,
-          "description": "When JSON parsing fails, use fast model to attempt cleanup (adds ~500ms but improves reliability)",
+          "type": "string",
+          "enum": ["auto", "off", "on"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Auto: Use AI cleanup only when parsing fails or throws an exception",
+            "Off: Never use AI cleanup, always use logic-based parsing",
+            "On: Always send responses through AI Base model for cleanup"
+          ],
+          "description": "Control when AI is used to clean up/parse JSON/TOON responses",
           "order": 21
         },
         "grok.enableSound": {

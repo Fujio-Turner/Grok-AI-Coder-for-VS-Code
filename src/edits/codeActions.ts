@@ -278,3 +278,93 @@ export function clearSnapshots(): void {
 export function getChangeTracker() {
     return changeTracker;
 }
+
+/**
+ * Apply a unified diff to existing content.
+ * Diff format: lines starting with '+' are added, '-' are removed, ' ' or no prefix are context.
+ * Returns the modified content.
+ */
+export function applyUnifiedDiff(originalContent: string, diffContent: string): string {
+    const originalLines = originalContent.split('\n');
+    const diffLines = diffContent.split('\n');
+    const resultLines: string[] = [];
+    
+    let originalIndex = 0;
+    let inHunk = false;
+    let hunkStartLine = 0;
+    
+    for (const line of diffLines) {
+        // Skip hunk headers like @@ -10,5 +10,7 @@
+        if (line.startsWith('@@')) {
+            // Extract the starting line number from the hunk header
+            const match = line.match(/@@ -(\d+)/);
+            if (match) {
+                hunkStartLine = parseInt(match[1], 10) - 1; // 0-indexed
+                // Copy all lines up to the hunk start
+                while (originalIndex < hunkStartLine && originalIndex < originalLines.length) {
+                    resultLines.push(originalLines[originalIndex]);
+                    originalIndex++;
+                }
+            }
+            inHunk = true;
+            continue;
+        }
+        
+        if (!inHunk) {
+            // Before first hunk, skip any non-diff lines
+            continue;
+        }
+        
+        if (line.startsWith('-')) {
+            // Line removed - skip it in original (consume but don't add)
+            originalIndex++;
+        } else if (line.startsWith('+')) {
+            // Line added - add to result (without the + prefix)
+            resultLines.push(line.substring(1));
+        } else if (line.startsWith(' ')) {
+            // Context line - copy from original
+            resultLines.push(originalLines[originalIndex] || line.substring(1));
+            originalIndex++;
+        } else {
+            // No prefix - treat as context
+            resultLines.push(originalLines[originalIndex] || line);
+            originalIndex++;
+        }
+    }
+    
+    // Copy remaining original lines after the last hunk
+    while (originalIndex < originalLines.length) {
+        resultLines.push(originalLines[originalIndex]);
+        originalIndex++;
+    }
+    
+    return resultLines.join('\n');
+}
+
+/**
+ * Simple diff application: remove lines starting with -, add lines starting with +
+ * Used when no hunk headers are present.
+ */
+export function applySimpleDiff(originalContent: string, diffContent: string): string {
+    const diffLines = diffContent.split('\n');
+    const resultLines: string[] = [];
+    
+    // Check if this is a simple +/- diff without context
+    const hasOnlyAddRemove = diffLines.every(line => 
+        line.startsWith('+') || line.startsWith('-') || line.trim() === ''
+    );
+    
+    if (hasOnlyAddRemove) {
+        // Simple diff: just take the + lines as the new content
+        for (const line of diffLines) {
+            if (line.startsWith('+')) {
+                resultLines.push(line.substring(1));
+            }
+            // Skip - lines (removed content)
+        }
+        return resultLines.join('\n');
+    }
+    
+    // Has context lines - need smarter application
+    return applyUnifiedDiff(originalContent, diffContent);
+}

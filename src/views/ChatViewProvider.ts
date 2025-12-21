@@ -29,7 +29,8 @@ import {
     getChangeTracker,
     revertToChangeSet,
     reapplyFromChangeSet,
-    previewDiffStats
+    previewDiffStats,
+    applySimpleDiff
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
@@ -775,22 +776,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 grokResponse.usage?.completionTokens || 0
             );
 
-            // Parse structured JSON response (with optional cleanup pass)
-            const enableCleanup = config.get<boolean>('jsonCleanup', true);
-            let structured: GrokStructuredResponse;
+            // Parse structured JSON response with configurable AI cleanup
+            // Modes: "auto" (AI on failure), "off" (never AI), "on" (always AI)
+            const cleanupMode = config.get<string>('jsonCleanup', 'auto');
+            let structured: GrokStructuredResponse = { summary: '', message: '' };
             let usedCleanup = false;
             
-            if (enableCleanup) {
-                debug('Starting parseWithCleanup, fastModel:', fastModel);
+            const processCleanupResult = async (forceAI: boolean): Promise<GrokStructuredResponse | null> => {
+                debug(`Starting parseWithCleanup, fastModel: ${fastModel}, forceAI: ${forceAI}`);
                 const cleanupResult = await parseWithCleanup(
                     grokResponse.text,
                     apiKey,
                     fastModel,
-                    true
+                    forceAI
                 );
                 debug('parseWithCleanup result:', { hasStructured: !!cleanupResult.structured, usedCleanup: cleanupResult.usedCleanup });
+                
                 if (cleanupResult.structured) {
-                    structured = cleanupResult.structured;
                     usedCleanup = cleanupResult.usedCleanup;
                     
                     // Warn if response was truncated
@@ -819,12 +821,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             );
                         }
                     }
-                } else {
-                    // Fall back to legacy parser
-                    structured = parseResponse(grokResponse.text);
+                    return cleanupResult.structured;
                 }
-            } else {
+                return null;
+            };
+
+            if (cleanupMode === 'on') {
+                // Always use AI cleanup
+                const result = await processCleanupResult(true);
+                structured = result || parseResponse(grokResponse.text);
+            } else if (cleanupMode === 'off') {
+                // Never use AI cleanup, always use logic-based parsing
                 structured = parseResponse(grokResponse.text);
+            } else {
+                // Auto mode: try logic first, use AI if it fails
+                try {
+                    structured = parseResponse(grokResponse.text);
+                    // Check if parsing actually got useful data
+                    const hasUsefulData = structured.summary || structured.message || 
+                                         (structured.fileChanges && structured.fileChanges.length > 0) ||
+                                         (structured.todos && structured.todos.length > 0);
+                    if (!hasUsefulData) {
+                        debug('Logic parsing returned no useful data, trying AI cleanup');
+                        const result = await processCleanupResult(true);
+                        if (result) {
+                            structured = result;
+                        }
+                    }
+                } catch (parseError) {
+                    debug('Logic parsing failed, trying AI cleanup:', parseError);
+                    const result = await processCleanupResult(true);
+                    structured = result || { summary: '', message: grokResponse.text };
+                }
             }
             
             debug('Parsed structured response:', { 
@@ -872,11 +900,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (structured.fileChanges && structured.fileChanges.length > 0) {
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 if (workspaceFolders) {
-                    edits = structured.fileChanges.map((fc, idx) => ({
-                        id: `edit-${idx}`,
-                        fileUri: vscode.Uri.joinPath(workspaceFolders[0].uri, fc.path),
-                        range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
-                        newText: fc.content
+                    edits = await Promise.all(structured.fileChanges.map(async (fc, idx) => {
+                        const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, fc.path);
+                        let newText = fc.content;
+                        
+                        // If isDiff is true, apply the diff to the existing file content
+                        if (fc.isDiff) {
+                            try {
+                                const doc = await vscode.workspace.openTextDocument(fileUri);
+                                const originalContent = doc.getText();
+                                newText = applySimpleDiff(originalContent, fc.content);
+                                debug(`Applied diff to ${fc.path}: ${fc.content.split('\\n').length} diff lines -> ${newText.split('\\n').length} result lines`);
+                            } catch (err) {
+                                // File doesn't exist, use content as-is (strip +/- prefixes)
+                                newText = fc.content.split('\n')
+                                    .filter(line => !line.startsWith('-'))
+                                    .map(line => line.startsWith('+') ? line.substring(1) : line)
+                                    .join('\n');
+                                debug(`File ${fc.path} not found, extracting + lines from diff`);
+                            }
+                        }
+                        
+                        return {
+                            id: `edit-${idx}`,
+                            fileUri,
+                            range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                            newText
+                        };
                     }));
                 }
             } else {
@@ -1020,7 +1070,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (structured?.fileChanges && structured.fileChanges.length > 0) {
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 if (workspaceFolders) {
-                    edits = structured.fileChanges
+                    const validFileChanges = structured.fileChanges
                         .filter((fc: { path: string; content: string }) => {
                             // Validate path is not empty
                             if (!fc.path || fc.path.trim() === '') {
@@ -1028,19 +1078,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 return false;
                             }
                             return true;
-                        })
-                        .map((fc: { path: string; content: string; lineRange?: { start: number; end: number } }, idx: number) => {
-                            // Ensure path has proper extension if it's a known file type
-                            let filePath = fc.path.trim();
-                            debug(`Processing fileChange: path="${filePath}", content length=${fc.content?.length}`);
-                            
-                            return {
-                                id: `edit-${idx}`,
-                                fileUri: vscode.Uri.joinPath(workspaceFolders[0].uri, filePath),
-                                range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
-                                newText: fc.content
-                            };
                         });
+                    
+                    edits = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean }, idx: number) => {
+                        const filePath = fc.path.trim();
+                        const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
+                        let newText = fc.content;
+                        
+                        // If isDiff is true, apply the diff to the existing file content
+                        if (fc.isDiff) {
+                            try {
+                                const doc = await vscode.workspace.openTextDocument(fileUri);
+                                const originalContent = doc.getText();
+                                newText = applySimpleDiff(originalContent, fc.content);
+                                debug(`Applied diff to ${filePath}`);
+                            } catch (err) {
+                                // File doesn't exist, extract + lines from diff
+                                newText = fc.content.split('\n')
+                                    .filter(line => !line.startsWith('-'))
+                                    .map(line => line.startsWith('+') ? line.substring(1) : line)
+                                    .join('\n');
+                                debug(`File ${filePath} not found, extracting + lines from diff`);
+                            }
+                        }
+                        
+                        debug(`Processing fileChange: path="${filePath}", content length=${newText?.length}`);
+                        
+                        return {
+                            id: `edit-${idx}`,
+                            fileUri,
+                            range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                            newText
+                        };
+                    }));
                     debug('Using structured fileChanges:', edits.length);
                 }
             }
