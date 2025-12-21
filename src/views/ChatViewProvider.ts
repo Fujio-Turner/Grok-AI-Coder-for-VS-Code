@@ -1071,8 +1071,8 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #todo-title{font-weight:600}
 #todo-count{color:var(--vscode-descriptionForeground)}
 #todo-count.active{color:var(--vscode-charts-green);font-weight:600}
-#todo-list{display:none;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);font-size:11px;margin:0 6px 4px 6px;border:1px solid var(--vscode-panel-border);border-top:none;border-radius:0 0 4px 4px}
-#todo-list.show{display:block}
+#todo-list{display:block;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);font-size:11px;margin:0 6px 4px 6px;border:1px solid var(--vscode-panel-border);border-top:none;border-radius:0 0 4px 4px}
+#todo-list.hide{display:none}
 .todo-item{padding:3px 0;display:flex;align-items:center;gap:6px}
 .todo-item.done{text-decoration:line-through;color:var(--vscode-descriptionForeground)}
 .todo-item .check{color:var(--vscode-testing-iconPassed)}
@@ -1104,8 +1104,8 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .msg.e{background:var(--vscode-inputValidation-errorBackground);border-color:var(--vscode-inputValidation-errorBorder)}
 .msg .c{line-height:1.6}
 .msg .c p{margin:8px 0}
-.msg .c ul,.msg .c ol{margin:8px 0 8px 20px}
-.msg .c li{margin:4px 0}
+.msg .c ul,.msg .c ol{margin:8px 0 8px 20px;padding-left:0}
+.msg .c li{margin:6px 0;line-height:1.5}
 .msg .c h1,.msg .c h2,.msg .c h3{margin:12px 0 8px 0;color:var(--vscode-textLink-foreground)}
 .msg .c h1{font-size:16px}.msg .c h2{font-size:14px}.msg .c h3{font-size:13px}
 .think{display:flex;align-items:center;gap:8px;color:var(--vscode-descriptionForeground);font-size:12px;padding:6px 0}
@@ -1204,7 +1204,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="inp">
 <!-- TODO Panel - above stats bar -->
-<div id="todo-bar"><span id="todo-toggle">▶</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
+<div id="todo-bar"><span id="todo-toggle" class="open">▼</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
 <div id="todo-list"></div>
 
 <div id="stats">
@@ -1223,7 +1223,7 @@ const autoBtn=document.getElementById('auto-btn');
 const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
 let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
-let currentTodos=[],todosCompleted=0,todoExpanded=false;
+let currentTodos=[],todosCompleted=0,todoExpanded=true;
 const CTX_LIMIT=128000;
 
 // Status indicator
@@ -1259,7 +1259,7 @@ function updateModelBtn(){
 }
 
 // TODO bar toggle
-todoBar.onclick=()=>{todoExpanded=!todoExpanded;todoToggle.classList.toggle('open',todoExpanded);todoList.classList.toggle('show',todoExpanded);};
+todoBar.onclick=()=>{todoExpanded=!todoExpanded;todoToggle.classList.toggle('open',todoExpanded);todoList.classList.toggle('hide',!todoExpanded);};
 
 // Stats bar click -> show changes panel
 statsEl.onclick=()=>changesPanel.classList.toggle('show');
@@ -1447,7 +1447,7 @@ if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption)
 if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);}
 if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split('\\n').map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line)+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line)+'</span>';}return esc(line);}).join('\\n'):esc(fc.content);h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
 if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<span style="color:var(--vscode-descriptionForeground);margin-left:8px">'+esc(cmd.description)+'</span>':'';h+='<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd.command)+'</span>'+desc+'<button class="btn btn-s" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" style="margin-left:auto">▶ Run</button></div></div>';});}
-if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
+if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
 const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';
 const cleanupInfo=usedCleanup?'<span style="margin-left:8px;font-size:10px;color:var(--vscode-charts-yellow)" title="JSON was fixed by cleanup pass">🔧</span>':'';
 h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+cleanupInfo+uInfo+'</div>';return h;}
