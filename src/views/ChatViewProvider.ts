@@ -33,6 +33,7 @@ import {
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
 import { runAgentWorkflow } from '../agent/agentOrchestrator';
+import { findFiles } from '../agent/workspaceFiles';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -160,6 +161,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'testConnections':
                     this._testAndSendConnectionStatus();
                     break;
+                case 'searchFiles':
+                    this._searchWorkspaceFiles(message.query);
+                    break;
             }
         });
     }
@@ -218,6 +222,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 type: 'connectionStatus',
                 couchbase: false,
                 api: false
+            });
+        }
+    }
+
+    private async _searchWorkspaceFiles(query: string) {
+        try {
+            const pattern = `**/*${query}*`;
+            const files = await findFiles(pattern, 15);
+            this._postMessage({
+                type: 'fileSearchResults',
+                files: files
+            });
+        } catch (error) {
+            debug('File search error:', error);
+            this._postMessage({
+                type: 'fileSearchResults',
+                files: []
             });
         }
     }
@@ -591,12 +612,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             let usedCleanup = false;
             
             if (enableCleanup) {
+                debug('Starting parseWithCleanup, fastModel:', fastModel);
                 const cleanupResult = await parseWithCleanup(
                     grokResponse.text,
                     apiKey,
                     fastModel,
                     true
                 );
+                debug('parseWithCleanup result:', { hasStructured: !!cleanupResult.structured, usedCleanup: cleanupResult.usedCleanup });
                 if (cleanupResult.structured) {
                     structured = cleanupResult.structured;
                     usedCleanup = cleanupResult.usedCleanup;
@@ -1071,7 +1094,7 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #todo-title{font-weight:600}
 #todo-count{color:var(--vscode-descriptionForeground)}
 #todo-count.active{color:var(--vscode-charts-green);font-weight:600}
-#todo-list{display:block;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);font-size:11px;margin:0 6px 4px 6px;border:1px solid var(--vscode-panel-border);border-top:none;border-radius:0 0 4px 4px}
+#todo-list{display:block;padding:6px 10px 10px 24px;background:var(--vscode-editor-background);font-size:11px;margin:0 6px 4px 6px;border:1px solid var(--vscode-panel-border);border-top:none;border-radius:0 0 4px 4px;max-height:120px;overflow-y:auto}
 #todo-list.hide{display:none}
 .todo-item{padding:3px 0;display:flex;align-items:center;gap:6px}
 .todo-item.done{text-decoration:line-through;color:var(--vscode-descriptionForeground)}
@@ -1102,11 +1125,11 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .msg.a{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);margin-right:5%;border-radius:12px 12px 12px 4px}
 .msg.p{opacity:.7}
 .msg.e{background:var(--vscode-inputValidation-errorBackground);border-color:var(--vscode-inputValidation-errorBorder)}
-.msg .c{line-height:1.6}
-.msg .c p{margin:8px 0}
-.msg .c ul,.msg .c ol{margin:8px 0 8px 20px;padding-left:0}
-.msg .c li{margin:6px 0;line-height:1.5}
-.msg .c h1,.msg .c h2,.msg .c h3{margin:12px 0 8px 0;color:var(--vscode-textLink-foreground)}
+.msg .c{line-height:1.4}
+.msg .c p{margin:4px 0}
+.msg .c ul,.msg .c ol{margin:4px 0 4px 16px;padding-left:0}
+.msg .c li{margin:2px 0;line-height:1.4}
+.msg .c h1,.msg .c h2,.msg .c h3{margin:8px 0 4px 0;color:var(--vscode-textLink-foreground)}
 .msg .c h1{font-size:16px}.msg .c h2{font-size:14px}.msg .c h3{font-size:13px}
 .think{display:flex;align-items:center;gap:8px;color:var(--vscode-descriptionForeground);font-size:12px;padding:6px 0}
 .spin{width:14px;height:14px;border:2px solid var(--vscode-descriptionForeground);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite}
@@ -1180,16 +1203,26 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 #attach:hover{background:var(--vscode-button-secondaryHoverBackground)}
 #img-preview{display:none;gap:6px;flex-wrap:wrap;padding:4px 0}
 #img-preview.show{display:flex}
+#autocomplete{position:absolute;bottom:100%;left:40px;right:60px;max-height:180px;overflow-y:auto;background:var(--vscode-editorSuggestWidget-background);border:1px solid var(--vscode-editorSuggestWidget-border);border-radius:6px;display:none;z-index:100;box-shadow:0 -2px 8px rgba(0,0,0,.2)}
+#autocomplete.show{display:block}
+.ac-item{padding:6px 10px;cursor:pointer;font-size:12px;font-family:var(--vscode-editor-font-family);display:flex;align-items:center;gap:8px}
+.ac-item:hover,.ac-item.sel{background:var(--vscode-list-hoverBackground)}
+.ac-item .ac-icon{opacity:.6}
+.ac-item .ac-path{color:var(--vscode-descriptionForeground);font-size:11px;margin-left:auto}
 .img-thumb{position:relative;width:52px;height:52px;border-radius:6px;overflow:hidden;border:1px solid var(--vscode-panel-border)}
 .img-thumb img{width:100%;height:100%;object-fit:cover}
 .img-thumb .rm{position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:#c44;color:#fff;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;border:none}
 
 .apply-all{margin:10px 0;padding:8px 12px;background:var(--vscode-testing-iconPassed);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:6px;width:100%}
 .apply-all:hover{opacity:.9}
-.term-out{margin:10px 0;background:#1e1e1e;border:1px solid var(--vscode-panel-border);border-radius:6px;overflow:hidden}
-.term-hdr{background:#333;padding:6px 10px;font-size:11px;color:#aaa;display:flex;justify-content:space-between;align-items:center}
-.term-body{padding:10px;font-family:var(--vscode-editor-font-family);font-size:11px;color:#d4d4d4;white-space:pre-wrap;max-height:200px;overflow-y:auto}
-.term-cmd{color:#569cd6}
+.term-out{margin:10px 0;background:var(--vscode-textCodeBlock-background);border:1px solid var(--vscode-panel-border);border-left:3px solid var(--vscode-testing-iconPassed);border-radius:6px;overflow:hidden}
+.term-hdr{padding:8px 10px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.term-content{flex:1;min-width:0}
+.term-cmd{color:var(--vscode-foreground);font-weight:500;font-family:var(--vscode-editor-font-family);font-size:12px;word-break:break-word}
+.term-desc{color:var(--vscode-descriptionForeground);font-size:11px;margin-top:4px;font-family:var(--vscode-font-family)}
+.term-body{padding:10px;font-family:var(--vscode-editor-font-family);font-size:11px;color:var(--vscode-foreground);white-space:pre-wrap;max-height:200px;overflow-y:auto}
+.term-run{background:var(--vscode-testing-iconPassed);color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.term-run:hover{opacity:.9}
 </style></head><body>
 <div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
@@ -1202,7 +1235,8 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
     <div id="changes-list"></div>
 </div>
 
-<div id="inp">
+<div id="inp" style="position:relative">
+<div id="autocomplete"></div>
 <!-- TODO Panel - above stats bar -->
 <div id="todo-bar"><span id="todo-toggle" class="open">▼</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
 <div id="todo-list"></div>
@@ -1225,6 +1259,8 @@ let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,to
 let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=true;
 const CTX_LIMIT=128000;
+const autocomplete=document.getElementById('autocomplete');
+let acFiles=[],acIndex=-1,acWordStart=-1,acWordEnd=-1,acDebounce=null;
 
 // Status indicator
 const statusDot=document.getElementById('status-dot');
@@ -1320,21 +1356,77 @@ function renderChanges(){
     });
 }
 
-msg.addEventListener('input',()=>{msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px'});
+// Restore saved input text from state
+const savedState=vs.getState();
+if(savedState&&savedState.inputText){msg.value=savedState.inputText;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';}
+
+// Save input text on change (for persistence across view switches)
+function saveInputState(){vs.setState({...vs.getState(),inputText:msg.value});}
+
+// Autocomplete functions - triggers on backtick + 3 chars (e.g. \`04_c)
+function getBacktickWord(){
+    const text=msg.value,pos=msg.selectionStart;
+    let start=pos-1;
+    while(start>=0&&text[start]!=='\\\`'&&!/\\s/.test(text[start]))start--;
+    if(start<0||text[start]!=='\\\`')return null;
+    const word=text.slice(start+1,pos);
+    return{word,start,end:pos};
+}
+function showAutocomplete(files){
+    acFiles=files;acIndex=-1;
+    if(files.length===0){autocomplete.classList.remove('show');return;}
+    autocomplete.innerHTML=files.map((f,i)=>'<div class="ac-item" data-i="'+i+'"><span class="ac-icon">📄</span><span class="ac-path">'+esc(f.relativePath)+'</span></div>').join('');
+    autocomplete.classList.add('show');
+}
+function hideAutocomplete(){autocomplete.classList.remove('show');acFiles=[];acIndex=-1;}
+function selectAutocomplete(idx){
+    if(idx<0||idx>=acFiles.length)return;
+    const file=acFiles[idx];
+    const text=msg.value;
+    const newText=text.slice(0,acWordStart)+'\\\`'+file.relativePath+'\\\`'+text.slice(acWordEnd);
+    msg.value=newText;
+    const newPos=acWordStart+file.relativePath.length+2;
+    msg.setSelectionRange(newPos,newPos);
+    hideAutocomplete();
+    saveInputState();
+}
+autocomplete.onclick=e=>{const item=e.target.closest('.ac-item');if(item)selectAutocomplete(parseInt(item.dataset.i));};
+
+msg.addEventListener('input',()=>{
+    msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';
+    saveInputState();
+    // Autocomplete trigger: backtick + 3+ chars (e.g. \`04_c)
+    const match=getBacktickWord();
+    if(match&&match.word.length>=3){
+        acWordStart=match.start;acWordEnd=match.end;
+        clearTimeout(acDebounce);
+        acDebounce=setTimeout(()=>{vs.postMessage({type:'searchFiles',query:match.word});},150);
+    }else{hideAutocomplete();}
+});
 function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;totalCost+=(p/1e6)*0.30+(c/1e6)*0.50;}const pct=Math.min(100,Math.round(totalTokens/CTX_LIMIT*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';}
-function doSend(){const t=msg.value.trim();if((t||attachedImages.length)&&!busy){vs.postMessage({type:'sendMessage',text:t,images:attachedImages});msg.value='';msg.style.height='auto';stream='';attachedImages=[];imgPreview.innerHTML='';imgPreview.classList.remove('show');}}
+function doSend(){const t=msg.value.trim();if((t||attachedImages.length)&&!busy){vs.postMessage({type:'sendMessage',text:t,images:attachedImages});msg.value='';msg.style.height='auto';stream='';attachedImages=[];imgPreview.innerHTML='';imgPreview.classList.remove('show');hideAutocomplete();saveInputState();}}
 attachBtn.onclick=()=>fileInput.click();
 fileInput.onchange=async e=>{const files=Array.from(e.target.files||[]);for(const f of files){if(!f.type.startsWith('image/'))continue;const reader=new FileReader();reader.onload=ev=>{const b64=ev.target.result.split(',')[1];attachedImages.push(b64);const thumb=document.createElement('div');thumb.className='img-thumb';thumb.innerHTML='<img src="'+ev.target.result+'"><button class="rm" data-i="'+(attachedImages.length-1)+'">×</button>';thumb.querySelector('.rm').onclick=function(){const i=parseInt(this.dataset.i);attachedImages.splice(i,1);updateImgPreview();};imgPreview.appendChild(thumb);imgPreview.classList.add('show');};reader.readAsDataURL(f);}fileInput.value='';};
 function updateImgPreview(){imgPreview.innerHTML='';attachedImages.forEach((b64,i)=>{const thumb=document.createElement('div');thumb.className='img-thumb';thumb.innerHTML='<img src="data:image/png;base64,'+b64+'"><button class="rm" data-i="'+i+'">×</button>';thumb.querySelector('.rm').onclick=function(){attachedImages.splice(i,1);updateImgPreview();};imgPreview.appendChild(thumb);});imgPreview.classList.toggle('show',attachedImages.length>0);}
 send.onclick=doSend;
-// Enter key behavior: configurable via enterToSend setting
+// Enter key behavior: configurable via enterToSend setting + autocomplete navigation
 msg.onkeydown=e=>{
+    // Autocomplete navigation
+    if(autocomplete.classList.contains('show')){
+        if(e.key==='ArrowDown'){e.preventDefault();acIndex=Math.min(acIndex+1,acFiles.length-1);updateAcSelection();return;}
+        if(e.key==='ArrowUp'){e.preventDefault();acIndex=Math.max(acIndex-1,0);updateAcSelection();return;}
+        if(e.key==='Enter'||e.key==='Tab'){if(acIndex>=0){e.preventDefault();selectAutocomplete(acIndex);return;}}
+        if(e.key==='Escape'){hideAutocomplete();return;}
+    }
     if(enterToSend){
         if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey){e.preventDefault();doSend();}
     }else{
         if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();doSend();}
     }
 };
+function updateAcSelection(){
+    autocomplete.querySelectorAll('.ac-item').forEach((el,i)=>{el.classList.toggle('sel',i===acIndex);if(i===acIndex)el.scrollIntoView({block:'nearest'});});
+}
 stop.onclick=()=>vs.postMessage({type:'cancelRequest'});
 document.getElementById('new').onclick=()=>{hist.classList.remove('show');totalTokens=0;totalCost=0;currentTodos=[];todosCompleted=0;renderTodos();updStats(null);vs.postMessage({type:'newSession'});};
 document.getElementById('cfg').onclick=()=>vs.postMessage({type:'openSettings'});
@@ -1377,6 +1469,7 @@ if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
 renderTodos();}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
+case'fileSearchResults':showAutocomplete(m.files||[]);break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
@@ -1445,8 +1538,8 @@ if(s.summary){h+='<p class="summary">'+esc(s.summary)+'</p>';}
 if(s.sections&&s.sections.length>0){s.sections.forEach(sec=>{h+='<div class="section"><h3>'+esc(sec.heading)+'</h3>';const content=(sec.content||'').replace(/\\\\n/g,'\\n');h+=fmtMd(content);if(sec.codeBlocks&&sec.codeBlocks.length>0){sec.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}h+='</div>';});}
 if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}
 if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);}
-if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split('\\n').map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line)+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line)+'</span>';}return esc(line);}).join('\\n'):esc(fc.content);h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
-if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<span style="color:var(--vscode-descriptionForeground);margin-left:8px">'+esc(cmd.description)+'</span>':'';h+='<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd.command)+'</span>'+desc+'<button class="btn btn-s" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" style="margin-left:auto">▶ Run</button></div></div>';});}
+if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split(/\\r?\\n/).map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}if(line.startsWith(' ')){return '<span>'+esc(line.substring(1))+'</span>';}return '<span>'+esc(line)+'</span>';}).join('\\n'):esc(fc.content);h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
+if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+esc(cmd.command)+'</div>'+desc+'</div><button class="term-run" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" >▶ Run</button></div></div>';});}
 if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
 const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';
 const cleanupInfo=usedCleanup?'<span style="margin-left:8px;font-size:10px;color:var(--vscode-charts-yellow)" title="JSON was fixed by cleanup pass">🔧</span>':'';
@@ -1484,7 +1577,7 @@ t=t.replace(new RegExp(bt+'([^'+bt+'\\\\n]+)'+bt,'g'),function(m,code){
 t=t.replace(/🖥️\\s*%%INLINE(\\d+)%%/g,function(m,idx){
     const code=inlineCodes[parseInt(idx)-1]||'';
     const cmd=code.replace(/<\\/?code>/g,'');
-    return '<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+cmd+'</span><button class="btn btn-s" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div>';
+    return '<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+cmd+'</div></div><button class="term-run" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div>';
 });
 // Markdown tables - greedy match for rows to capture full line
 t=t.replace(/^\\|(.+)\\|\\s*\\n\\|[-:|\\s]+\\|\\s*\\n((?:\\|.+\\|\\s*\\n?)+)/gm,function(m,header,body){

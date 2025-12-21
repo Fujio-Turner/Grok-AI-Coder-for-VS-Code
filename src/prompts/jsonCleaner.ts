@@ -308,7 +308,9 @@ export async function parseWithCleanup(
         
         // If cleanup enabled, use model to convert TOON to JSON
         if (enableCleanup && apiKey && fastModel) {
+            debug('Local TOON parsing failed, attempting model cleanup...');
             const cleanupResult = await cleanToonWithModel(responseText, apiKey, fastModel);
+            debug('Model cleanup result:', { success: cleanupResult.success, usedCleanup: cleanupResult.usedCleanup, error: cleanupResult.error });
             if (cleanupResult.success && cleanupResult.cleaned) {
                 return { 
                     structured: cleanupResult.cleaned, 
@@ -319,7 +321,11 @@ export async function parseWithCleanup(
                         tokensOut: cleanupResult.tokensOut || 0
                     } : undefined
                 };
+            } else {
+                logError('TOON model cleanup failed:', cleanupResult.error || 'Unknown error');
             }
+        } else {
+            debug('Cleanup not attempted:', { enableCleanup, hasApiKey: !!apiKey, hasFastModel: !!fastModel });
         }
     }
 
