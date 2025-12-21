@@ -10,6 +10,7 @@ import * as vscode from 'vscode';
 import { sendChatCompletion, GrokMessage } from '../api/grokClient';
 import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent } from './workspaceFiles';
 import { fetchUrl, extractUrls } from './httpFetcher';
+import { followImports, formatImportContext } from './importResolver';
 import { 
     AgentPlan, 
     Action, 
@@ -240,6 +241,47 @@ export async function executeActions(
                             files: files.map(f => f.name)
                         }
                     });
+
+                    // Follow imports for each loaded file (max depth 3)
+                    for (const file of files) {
+                        try {
+                            onProgress?.({
+                                type: 'file-start',
+                                message: `🔗 Following imports in ${file.name}...`,
+                                details: { path: file.path }
+                            });
+                            
+                            const importResult = await followImports(
+                                file.path, 
+                                file.content,
+                                (msg) => onProgress?.({ type: 'file-start', message: msg, details: {} })
+                            );
+                            
+                            // Add imported files to context
+                            for (const [importPath, importFile] of importResult.files) {
+                                if (!filesContent.has(importPath)) {
+                                    filesContent.set(importPath, importFile.content);
+                                }
+                            }
+                            
+                            // Add external docs to URLs
+                            for (const [url, content] of importResult.external) {
+                                if (!urlsContent.has(url)) {
+                                    urlsContent.set(url, content);
+                                }
+                            }
+                            
+                            if (importResult.files.size > 0 || importResult.external.size > 0) {
+                                onProgress?.({
+                                    type: 'file-done',
+                                    message: `🔗 Found ${importResult.files.size} imported files, ${importResult.external.size} external docs (depth ${importResult.depth})`,
+                                    details: { files: Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p) }
+                                });
+                            }
+                        } catch (importErr: any) {
+                            debug('Import following error:', importErr);
+                        }
+                    }
 
                     results.push({
                         action,
