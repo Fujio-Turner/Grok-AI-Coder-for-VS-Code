@@ -69,7 +69,7 @@ export const RESPONSE_JSON_SCHEMA = `{
     { "text": "Step description", "completed": false }
   ],
   "fileChanges": [
-    { "path": "src/file.py", "language": "python", "content": "file content", "isDiff": true }
+    { "path": "src/file.py", "language": "python", "content": "-old line\\n+new line", "isDiff": true, "lineRange": { "start": 10, "end": 15 } }
   ],
   "commands": [
     { "command": "npm test", "description": "Run tests" }
@@ -145,12 +145,46 @@ export function validateResponse(parsed: unknown): GrokStructuredResponse | null
         if (!Array.isArray(obj.fileChanges)) {
             return null;
         }
-        response.fileChanges = obj.fileChanges.filter((f): f is FileChange =>
-            typeof f === 'object' && f !== null &&
-            typeof (f as FileChange).path === 'string' &&
-            typeof (f as FileChange).language === 'string' &&
-            typeof (f as FileChange).content === 'string'
-        );
+        response.fileChanges = obj.fileChanges
+            .filter((f): f is FileChange =>
+                typeof f === 'object' && f !== null &&
+                typeof (f as FileChange).path === 'string' &&
+                (f as FileChange).path.trim().length > 0 && // Path must not be empty
+                typeof (f as FileChange).content === 'string'
+            )
+            .map(f => {
+                // Ensure path has extension - if missing and language hints at it, add it
+                let path = f.path.trim();
+                let lang = (f.language || '').trim().toLowerCase();
+                const hasExtension = /\.[a-zA-Z0-9]+$/.test(path);
+                
+                // If language is empty but content suggests Python, infer it
+                if (!lang && f.content) {
+                    const contentLower = f.content.substring(0, 500).toLowerCase();
+                    if (contentLower.includes('def ') || contentLower.includes('import ') || 
+                        contentLower.includes('from ') || contentLower.includes('"""')) {
+                        lang = 'python';
+                    } else if (contentLower.includes('function ') || contentLower.includes('const ') ||
+                               contentLower.includes('let ') || contentLower.includes('=>')) {
+                        lang = 'javascript';
+                    }
+                }
+                
+                if (!hasExtension && lang) {
+                    const extMap: Record<string, string> = {
+                        'python': '.py', 'py': '.py',
+                        'javascript': '.js', 'js': '.js',
+                        'typescript': '.ts', 'ts': '.ts',
+                        'json': '.json', 'markdown': '.md', 'yaml': '.yml',
+                        'html': '.html', 'css': '.css', 'sql': '.sql'
+                    };
+                    const ext = extMap[lang];
+                    if (ext) {
+                        path = path + ext;
+                    }
+                }
+                return { ...f, path, language: lang || 'text' };
+            });
     }
 
     // Validate optional commands

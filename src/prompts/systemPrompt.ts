@@ -58,8 +58,23 @@ ${RESPONSE_JSON_SCHEMA}
   "nextSteps": ["Apply the syntax fix", "Test with the cluster"]
 }
 
-### File change:
-{"summary": "Updated the helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "def add(a, b):\\n    return a + b", "isDiff": false}]}
+### File change (new file - full content, isDiff: false):
+{"summary": "Created new helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "def add(a, b):\\n    return a + b", "isDiff": false}]}
+
+### File change (modifying existing file - use diff format, isDiff: true):
+{"summary": "Fixed the helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "def add(a, b):\\n-    return a + b\\n+    result = a + b\\n+    return result", "isDiff": true, "lineRange": {"start": 5, "end": 7}}]}
+
+## DIFF FORMAT RULES
+
+When MODIFYING existing files, use diff format to show changes:
+1. Set "isDiff": true
+2. Lines starting with + are ADDED (shown in green)
+3. Lines starting with - are REMOVED (shown in red)
+4. Lines without prefix are context (unchanged)
+5. Include 1-2 lines of context before/after changes
+6. Use "lineRange" to specify which lines are affected
+
+When CREATING new files, use full content with "isDiff": false
 
 ## CRITICAL JSON SYNTAX RULES
 

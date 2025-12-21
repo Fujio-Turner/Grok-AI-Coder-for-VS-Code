@@ -76,6 +76,16 @@ export async function applyEdits(
         return { success: false, error: 'Failed to apply edits' };
     }
 
+    // Save all modified files to disk
+    for (const edit of edits) {
+        try {
+            const doc = await vscode.workspace.openTextDocument(edit.fileUri);
+            await doc.save();
+        } catch (saveError) {
+            console.error('Failed to save file:', edit.fileUri.fsPath, saveError);
+        }
+    }
+
     const changeSet = changeTracker.addChangeSet(
         sessionId || 'unknown',
         fileChanges,
@@ -184,6 +194,9 @@ export async function reapplyFromChangeSet(targetChangeSetId: string): Promise<b
                     }
                     
                     await vscode.workspace.applyEdit(edit);
+                    // Save the file to disk
+                    const doc = await vscode.workspace.openTextDocument(uri);
+                    await doc.save();
                 } catch (error) {
                     console.error('Failed to reapply change:', fileChange.filePath, error);
                 }

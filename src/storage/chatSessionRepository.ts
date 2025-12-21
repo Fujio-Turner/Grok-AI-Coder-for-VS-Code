@@ -41,18 +41,24 @@ export interface ChatRequest {
     model?: string; // Model used for this request
 }
 
+export interface DiffPreviewItem {
+    file: string;
+    stats: { added: number; removed: number; modified: number };
+}
+
 export interface ChatResponse {
     text?: string;
     timestamp?: string;
     status: 'pending' | 'success' | 'error' | 'cancelled';
     errorMessage?: string;
     usage?: GrokUsage;
+    diffPreview?: DiffPreviewItem[];
     structured?: {
         summary?: string;
         message?: string;
         sections?: Array<{ heading: string; content: string; codeBlocks?: Array<{ language?: string; code: string; caption?: string }> }>;
         todos?: Array<{ text: string; completed: boolean }>;
-        fileChanges?: Array<{ path: string; content: string; lineRange?: { start: number; end: number } }>;
+        fileChanges?: Array<{ path: string; content: string; language?: string; isDiff?: boolean; lineRange?: { start: number; end: number } }>;
         commands?: Array<{ command: string; description?: string }>;
         codeBlocks?: Array<{ language?: string; code: string; caption?: string }>;
         nextSteps?: string[];

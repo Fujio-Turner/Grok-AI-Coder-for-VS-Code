@@ -28,6 +28,8 @@ import { debug, info, error as logError } from '../utils/logger';
  */
 const PLANNING_PROMPT = `You are a code assistant planner. Analyze the user's request and create a plan.
 
+IMPORTANT: If the user mentions a URL (especially raw.githubusercontent.com links), you MUST include it as a "url" action to fetch its content. The system will download the actual file content for you.
+
 Respond with ONLY valid JSON in this exact format:
 {
     "summary": "Brief description of what needs to be done",
@@ -44,7 +46,8 @@ Respond with ONLY valid JSON in this exact format:
 Rules for actions:
 - Use "file" type for reading files from the workspace
 - Use glob patterns for file patterns (e.g., "**/auth*.ts", "src/**/*.py")
-- Use "url" type for fetching web pages (documentation, API references)
+- Use "url" type for fetching web pages, documentation, or raw file content from GitHub
+- ALWAYS include URLs mentioned by the user as url actions (raw.githubusercontent.com, gist.github.com, docs sites)
 - Only include actions that are clearly needed
 - Limit to 5 file patterns and 3 URLs maximum
 
@@ -55,6 +58,20 @@ Rules for todos:
 - Include 2-5 todos typically
 
 Examples:
+
+User: "The file advanced_prep.py is empty, restore it from https://raw.githubusercontent.com/user/repo/main/advanced_prep.py"
+{
+    "summary": "Restore empty file from GitHub raw content",
+    "todos": [
+        {"text": "Fetch file content from GitHub URL", "order": 1},
+        {"text": "Write content to advanced_prep.py", "order": 2},
+        {"text": "Verify file restoration", "order": 3}
+    ],
+    "actions": [
+        {"type": "url", "url": "https://raw.githubusercontent.com/user/repo/main/advanced_prep.py", "reason": "Source content to restore"},
+        {"type": "file", "pattern": "**/advanced_prep*.py", "reason": "Target file to restore"}
+    ]
+}
 
 User: "Review the 06_read_*.py files for Couchbase"
 {
@@ -160,10 +177,35 @@ export async function createPlan(
                     reason: a.reason || ''
                 }))
             };
+            
+            // FALLBACK: If model didn't include URLs but user message contains URLs, add them
+            const urlsInMessage = extractUrls(userMessage);
+            const existingUrls = plan.actions.filter(a => a.type === 'url').map((a: any) => a.url);
+            
+            for (const url of urlsInMessage) {
+                if (!existingUrls.includes(url)) {
+                    info(`Adding missed URL from user message: ${url}`);
+                    plan.actions.push({
+                        type: 'url',
+                        url,
+                        reason: 'URL mentioned in user request'
+                    } as UrlAction);
+                }
+            }
+
+            // Log URL actions for debugging
+            const urlActions = plan.actions.filter(a => a.type === 'url');
+            const fileActions = plan.actions.filter(a => a.type === 'file');
+            
+            info(`Plan created: ${plan.todos.length} todos, ${fileActions.length} file actions, ${urlActions.length} URL actions`);
+            if (urlActions.length > 0) {
+                urlActions.forEach((a: any) => debug(`URL action: ${a.url}`));
+            }
 
             onProgress?.({
                 type: 'plan',
-                message: `📋 Plan created: ${plan.todos.length} steps, ${plan.actions.length} actions`,
+                message: `📋 Plan created: ${plan.todos.length} steps, ${plan.actions.length} actions` + 
+                    (urlActions.length > 0 ? ` (${urlActions.length} URLs)` : ''),
                 details: {
                     todoCount: plan.todos.length,
                     actionCount: plan.actions.length
@@ -318,6 +360,8 @@ export async function executeActions(
         } else if (action.type === 'url') {
             const urlAction = action as UrlAction;
             
+            info(`Executing URL action: ${urlAction.url}`);
+            
             onProgress?.({
                 type: 'url-start',
                 message: `🌐 Fetching ${urlAction.url}...`,
@@ -326,6 +370,7 @@ export async function executeActions(
 
             try {
                 const fetchResult = await fetchUrl(urlAction.url);
+                info(`URL fetch result: success=${fetchResult.success}, bytes=${fetchResult.bytes}`);
                 
                 if (fetchResult.success && fetchResult.content) {
                     urlsContent.set(urlAction.url, fetchResult.content);
@@ -406,17 +451,33 @@ export function buildAugmentedMessage(
 
     // Add URL contents
     if (execution.urlsContent.size > 0) {
-        augmented += '\n\n---\n**Content from URLs:**\n';
+        augmented += '\n\n---\n**Content fetched from URLs (USE THIS EXACT CONTENT):**\n';
         for (const [url, content] of execution.urlsContent) {
+            // Extract filename from URL for raw GitHub files
+            let suggestedFilename = '';
+            try {
+                const urlPath = new URL(url).pathname;
+                const filename = urlPath.split('/').pop() || '';
+                if (filename && (filename.endsWith('.py') || filename.endsWith('.js') || 
+                    filename.endsWith('.ts') || filename.endsWith('.json') || filename.endsWith('.md'))) {
+                    suggestedFilename = filename;
+                }
+            } catch {}
+            
             // Truncate to reasonable size
             const truncated = content.length > 10000 
                 ? content.substring(0, 10000) + '\n\n[Content truncated...]'
                 : content;
-            augmented += `\n### ${url}\n${truncated}\n`;
+            
+            if (suggestedFilename) {
+                augmented += `\n### ${url}\n**SAVE AS: ${suggestedFilename}**\n\`\`\`\n${truncated}\n\`\`\`\n`;
+            } else {
+                augmented += `\n### ${url}\n\`\`\`\n${truncated}\n\`\`\`\n`;
+            }
         }
     }
 
-    augmented += '\n\n---\nPlease analyze the above and respond to the user\'s request. You may update the TODO list if needed.';
+    augmented += '\n\n---\n**IMPORTANT:** When creating fileChanges from URL content, use the EXACT content fetched above (do not modify or regenerate). Include the full file extension (e.g., .py, .js) in the path.';
 
     return augmented;
 }
@@ -424,6 +485,7 @@ export function buildAugmentedMessage(
 export interface AgentWorkflowResult {
     augmentedMessage: string;
     filesLoaded: FileContent[];
+    urlsLoaded: number;
     skipped: boolean;
     plan?: AgentPlan;
     stepMetrics: {
@@ -457,6 +519,7 @@ export async function runAgentWorkflow(
         return {
             augmentedMessage: userMessage,
             filesLoaded: [],
+            urlsLoaded: 0,
             skipped: true,
             plan,
             stepMetrics: {
@@ -505,6 +568,7 @@ export async function runAgentWorkflow(
     return {
         augmentedMessage: augmented,
         filesLoaded,
+        urlsLoaded: totalUrls,
         skipped: false,
         plan,
         stepMetrics: {

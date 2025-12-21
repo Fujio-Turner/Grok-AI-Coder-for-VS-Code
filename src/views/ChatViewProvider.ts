@@ -532,16 +532,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         }
                     }
                     
-                    if (agentResult.filesLoaded.length > 0) {
+                    const hasFiles = agentResult.filesLoaded.length > 0;
+                    const hasUrls = agentResult.urlsLoaded > 0;
+                    
+                    if (hasFiles || hasUrls) {
+                        const parts: string[] = [];
+                        if (hasFiles) parts.push(`${agentResult.filesLoaded.length} file(s)`);
+                        if (hasUrls) parts.push(`${agentResult.urlsLoaded} URL(s)`);
+                        
                         this._postMessage({ 
                             type: 'updateResponseChunk', 
                             pairIndex, 
-                            deltaText: `✅ Loaded ${agentResult.filesLoaded.length} file(s)\n\n` 
+                            deltaText: `✅ Loaded ${parts.join(', ')}\n\n` 
                         });
                         finalMessageText = agentResult.augmentedMessage;
-                        info(`Agent loaded ${agentResult.filesLoaded.length} files`);
+                        info(`Agent loaded ${parts.join(', ')}`);
                     } else if (!agentResult.skipped) {
-                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files found\n\n' });
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files or URLs found\n\n' });
                     }
                 } catch (agentError) {
                     debug('Agent workflow error (continuing without files):', agentError);
@@ -678,6 +685,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 diffPreview = await previewDiffStats(edits);
             }
 
+            // Update stored response with diffPreview for history restoration
+            if (diffPreview.length > 0) {
+                successResponse.diffPreview = diffPreview;
+                await updateLastPairResponse(this._currentSessionId, successResponse);
+            }
+
             this._postMessage({
                 type: 'requestComplete',
                 pairIndex,
@@ -796,15 +809,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             debug('Parsing response text length:', lastSuccessPair.response.text.length);
             debug('Response text sample:', lastSuccessPair.response.text.substring(0, 200));
             
-            const edits = parseCodeBlocksFromResponse(lastSuccessPair.response.text);
+            // Try structured fileChanges first, then fallback to legacy parsing
+            let edits: ProposedEdit[] = [];
+            const structured = lastSuccessPair.response.structured;
+            
+            if (structured?.fileChanges && structured.fileChanges.length > 0) {
+                const workspaceFolders = vscode.workspace.workspaceFolders;
+                if (workspaceFolders) {
+                    edits = structured.fileChanges
+                        .filter((fc: { path: string; content: string }) => {
+                            // Validate path is not empty
+                            if (!fc.path || fc.path.trim() === '') {
+                                logError('Skipping fileChange with empty path', { content: fc.content?.substring(0, 100) });
+                                return false;
+                            }
+                            return true;
+                        })
+                        .map((fc: { path: string; content: string; lineRange?: { start: number; end: number } }, idx: number) => {
+                            // Ensure path has proper extension if it's a known file type
+                            let filePath = fc.path.trim();
+                            debug(`Processing fileChange: path="${filePath}", content length=${fc.content?.length}`);
+                            
+                            return {
+                                id: `edit-${idx}`,
+                                fileUri: vscode.Uri.joinPath(workspaceFolders[0].uri, filePath),
+                                range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                                newText: fc.content
+                            };
+                        });
+                    debug('Using structured fileChanges:', edits.length);
+                }
+            }
+            
+            // Fallback to legacy emoji parsing
+            if (edits.length === 0) {
+                edits = parseCodeBlocksFromResponse(lastSuccessPair.response.text);
+                debug('Using legacy parsing, found:', edits.length);
+            }
             
             if (edits.length === 0) {
                 const hasEmoji = lastSuccessPair.response.text.includes('📄');
                 const hasCodeBlock = lastSuccessPair.response.text.includes('```');
-                logError('No edits found', { hasEmoji, hasCodeBlock });
+                const hasStructured = !!(structured?.fileChanges?.length);
+                logError('No edits found', { hasEmoji, hasCodeBlock, hasStructured });
                 vscode.window.showWarningMessage(
-                    `No code blocks with 📄 filename pattern found. ` +
-                    `Ask Grok to format changes as: 📄 filename.py followed by a code block.`
+                    `No code changes found to apply. ` +
+                    `Ensure the response contains fileChanges or 📄 filename patterns.`
                 );
                 return;
             }
@@ -1298,8 +1348,10 @@ let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
 else{todos=parseTodos(m.response.text||'');}
 if(todos.length>0){currentTodos=todos;renderTodos();}
-// Auto-apply if enabled and has file changes
-if(autoApply&&m.diffPreview&&m.diffPreview.length>0){vs.postMessage({type:'applyEdits',editId:'all'});}
+// Auto-apply if enabled and has file changes (check both diffPreview and structured.fileChanges)
+const hasFileChanges=(m.diffPreview&&m.diffPreview.length>0)||(m.structured&&m.structured.fileChanges&&m.structured.fileChanges.length>0);
+console.log('[Grok] Auto-apply check: autoApply='+autoApply+', diffPreview='+JSON.stringify(m.diffPreview)+', fileChanges='+(m.structured?.fileChanges?.length||0));
+if(autoApply&&hasFileChanges){console.log('[Grok] Triggering auto-apply');vs.postMessage({type:'applyEdits',editId:'all'});}
 busy=0;curDiv=null;stream='';updUI();scrollToBottom();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');curDiv.querySelector('.c').innerHTML+='<div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML='<div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div><button class="btn btn-s" style="margin-top:6px" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button>';}busy=0;curDiv=null;stream='';updUI();break;
@@ -1363,10 +1415,11 @@ else if(p.response.status==='cancelled'){a.innerHTML='<div class="c">'+fmtFinal(
 else if(p.response.status==='success'){
 // Use stored structured data if available (new format), else try to parse text (legacy)
 var structured=p.response.structured||tryParseStructured(p.response.text);
+var storedDiffPreview=p.response.diffPreview||null;
 if(structured&&(structured.summary||structured.message||structured.sections||structured.fileChanges)){
-a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,null,false)+'</div>';
+a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,storedDiffPreview,false)+'</div>';
 }else{
-a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';
+a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,storedDiffPreview)+'</div>';
 }
 }
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
@@ -1380,7 +1433,7 @@ if(s.summary){h+='<p class="summary">'+esc(s.summary)+'</p>';}
 if(s.sections&&s.sections.length>0){s.sections.forEach(sec=>{h+='<div class="section"><h3>'+esc(sec.heading)+'</h3>';const content=(sec.content||'').replace(/\\\\n/g,'\\n');h+=fmtMd(content);if(sec.codeBlocks&&sec.codeBlocks.length>0){sec.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}h+='</div>';});}
 if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}
 if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);}
-if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const stats=previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+esc(fc.content)+'</code></pre></div></div>';});}
+if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split('\\n').map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line)+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line)+'</span>';}return esc(line);}).join('\\n'):esc(fc.content);h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
 if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<span style="color:var(--vscode-descriptionForeground);margin-left:8px">'+esc(cmd.description)+'</span>':'';h+='<div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd.command)+'</span>'+desc+'<button class="btn btn-s" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" style="margin-left:auto">▶ Run</button></div></div>';});}
 if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
 const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';

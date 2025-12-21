@@ -135,6 +135,13 @@ export function repairJson(jsonString: string): string {
     // 1. Fix "text" concatenated with value (missing colon): "textValue" -> "text": "Value"
     repaired = repaired.replace(/"text([A-Z][^"]*?)"/g, '"text": "$1"');
     
+    // 1d. Fix missing opening quote after colon for path/file values: "path":advanced_prep.py" -> "path": "advanced_prep.py"
+    // This is a common LLM error where the opening quote is omitted
+    // Match unquoted value that ends with a quote OR continues to comma/brace
+    repaired = repaired.replace(/"(path|language)"\s*:\s*([a-zA-Z0-9_][a-zA-Z0-9_.\-/]*)"/g, '"$1": "$2"');
+    // Also handle when followed by comma or closing brace (value never got closing quote)
+    repaired = repaired.replace(/"(path|language)"\s*:\s*([a-zA-Z0-9_][a-zA-Z0-9_.\-/]*)\s*([,}])/g, '"$1": "$2"$3');
+    
     // 1b. Fix "completed" concatenated with previous value: "valuecompleted":false -> "value", "completed": false
     // Pattern: word immediately followed by 'completed":'
     repaired = repaired.replace(/([a-z])completed"\s*:\s*(true|false)/gi, '$1", "completed": $2');
