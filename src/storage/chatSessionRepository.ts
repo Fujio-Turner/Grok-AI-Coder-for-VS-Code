@@ -47,6 +47,16 @@ export interface ChatResponse {
     status: 'pending' | 'success' | 'error' | 'cancelled';
     errorMessage?: string;
     usage?: GrokUsage;
+    structured?: {
+        summary?: string;
+        message?: string;
+        sections?: Array<{ heading: string; content: string; codeBlocks?: Array<{ language?: string; code: string; caption?: string }> }>;
+        todos?: Array<{ text: string; completed: boolean }>;
+        fileChanges?: Array<{ path: string; content: string; lineRange?: { start: number; end: number } }>;
+        commands?: Array<{ command: string; description?: string }>;
+        codeBlocks?: Array<{ language?: string; code: string; caption?: string }>;
+        nextSteps?: string[];
+    };
 }
 
 export interface ChatPair {

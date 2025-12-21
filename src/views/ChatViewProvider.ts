@@ -627,7 +627,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 text: grokResponse.text,
                 timestamp: new Date().toISOString(),
                 status: 'success',
-                usage: grokResponse.usage
+                usage: grokResponse.usage,
+                structured: {
+                    summary: structured.summary,
+                    message: structured.message,
+                    sections: structured.sections,
+                    todos: structured.todos,
+                    fileChanges: structured.fileChanges,
+                    commands: structured.commands,
+                    codeBlocks: structured.codeBlocks,
+                    nextSteps: structured.nextSteps
+                }
             };
 
             await updateLastPairResponse(this._currentSessionId, successResponse);
@@ -1306,29 +1316,43 @@ case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.a
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
+function repairAndParseJson(text){
+if(!text)return null;
+var str=text.trim();
+if(str.charAt(0)!=='{')return null;
+var first=str.indexOf('{');
+var last=str.lastIndexOf('}');
+if(first<0||last<0||last<=first)return null;
+str=str.substring(first,last+1);
+// Try parsing as-is first
+try{return JSON.parse(str);}catch(e0){}
+// Fix: replace \\" that is NOT at string boundaries with escaped form
+// The problem: AI writes \" inside JSON strings, but JSON needs \\"
+// Solution: Replace single backslash-quote with double-escaped
+str=str.replace(/([^\\\\])\\\\"/g,'$1\\\\\\\\"');
+try{return JSON.parse(str);}catch(e1){}
+// Remove control chars
+str=str.replace(/[\\x00-\\x1f]/g,' ');
+try{return JSON.parse(str);}catch(e2){}
+// Fix trailing commas
+str=str.replace(/,\\s*}/g,'}').replace(/,\\s*]/g,']');
+try{return JSON.parse(str);}catch(e3){}
+return null;
+}
 function tryParseStructured(text){
 if(!text)return null;
-var trimmed=text.trim();
-if(trimmed.charAt(0)!=='{')return null;
-try{
-var firstBrace=text.indexOf('{');
-var lastBrace=text.lastIndexOf('}');
-if(firstBrace<0||lastBrace<0||lastBrace<=firstBrace)return null;
-var jsonStr=text.substring(firstBrace,lastBrace+1);
-var parsed=JSON.parse(jsonStr);
+var parsed=repairAndParseJson(text);
 if(!parsed||typeof parsed!=='object')return null;
 // Fix malformed key: AI sometimes outputs "" instead of "sections"
-if(parsed.hasOwnProperty('')){
-var emptyVal=parsed[''];
-if(emptyVal&&Array.isArray(emptyVal)&&emptyVal.length>0){
-parsed.sections=emptyVal;
+var keys=Object.keys(parsed);
+for(var i=0;i<keys.length;i++){
+if(keys[i]===''&&Array.isArray(parsed[''])){
+parsed.sections=parsed[''];
 delete parsed[''];
+break;
 }
 }
 if(parsed.summary||parsed.message||parsed.sections||parsed.fileChanges){return parsed;}
-}catch(err){
-return null;
-}
 return null;
 }
 function addPair(p,i,streaming){const u=document.createElement('div');u.className='msg u';u.textContent=p.request.text;chat.appendChild(u);
@@ -1337,9 +1361,13 @@ if(p.response.status==='pending'&&streaming){a.classList.add('p');a.innerHTML='<
 else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div class="c">⚠️ Error: '+esc(p.response.errorMessage||'')+'</div>';}
 else if(p.response.status==='cancelled'){a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',null,null)+'<div style="color:#c44;margin-top:6px">⏹ Cancelled</div></div>';}
 else if(p.response.status==='success'){
-const structured=tryParseStructured(p.response.text);
-if(structured){a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,null,false)+'</div>';}
-else{a.innerHTML='<div class="c"><div style="color:orange;font-size:10px">Parse failed</div>'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
+// Use stored structured data if available (new format), else try to parse text (legacy)
+var structured=p.response.structured||tryParseStructured(p.response.text);
+if(structured&&(structured.summary||structured.message||structured.sections||structured.fileChanges)){
+a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,null,false)+'</div>';
+}else{
+a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';
+}
 }
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
