@@ -1306,11 +1306,41 @@ case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.a
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
+function tryParseStructured(text){
+if(!text)return null;
+var trimmed=text.trim();
+if(trimmed.charAt(0)!=='{')return null;
+try{
+var firstBrace=text.indexOf('{');
+var lastBrace=text.lastIndexOf('}');
+if(firstBrace<0||lastBrace<0||lastBrace<=firstBrace)return null;
+var jsonStr=text.substring(firstBrace,lastBrace+1);
+var parsed=JSON.parse(jsonStr);
+if(!parsed||typeof parsed!=='object')return null;
+// Fix malformed key: AI sometimes outputs "" instead of "sections"
+if(parsed.hasOwnProperty('')){
+var emptyVal=parsed[''];
+if(emptyVal&&Array.isArray(emptyVal)&&emptyVal.length>0){
+parsed.sections=emptyVal;
+delete parsed[''];
+}
+}
+if(parsed.summary||parsed.message||parsed.sections||parsed.fileChanges){return parsed;}
+}catch(err){
+return null;
+}
+return null;
+}
 function addPair(p,i,streaming){const u=document.createElement('div');u.className='msg u';u.textContent=p.request.text;chat.appendChild(u);
 const a=document.createElement('div');a.className='msg a';a.dataset.i=i;
 if(p.response.status==='pending'&&streaming){a.classList.add('p');a.innerHTML='<div class="c"><div class="think"><div class="spin"></div>Thinking...</div></div>';curDiv=a;}
 else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div class="c">⚠️ Error: '+esc(p.response.errorMessage||'')+'</div>';}
 else if(p.response.status==='cancelled'){a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',null,null)+'<div style="color:#c44;margin-top:6px">⏹ Cancelled</div></div>';}
+else if(p.response.status==='success'){
+const structured=tryParseStructured(p.response.text);
+if(structured){a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,null,false)+'</div>';}
+else{a.innerHTML='<div class="c"><div style="color:orange;font-size:10px">Parse failed</div>'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
+}
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
 function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:200px;overflow:hidden;line-height:1.5;margin-top:8px">'+fmtMd(stream.slice(-600))+'</div>');}

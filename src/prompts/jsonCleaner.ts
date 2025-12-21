@@ -20,7 +20,7 @@ Common issues to fix:
 3. Missing quotes around string values: "key": value -> "key": "value"
 4. Unclosed strings, objects, or arrays
 5. Trailing commas before } or ]
-6. Empty keys "" that should be "heading", "content", "text", or "message"
+6. Empty keys "" that should be "heading", "content", "text", "message", or "sections"
 
 CRITICAL RULES:
 - Return ONLY valid JSON, nothing else

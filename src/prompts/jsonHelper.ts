@@ -105,7 +105,11 @@ export function repairJson(jsonString: string): string {
     // Pattern matches: "heading": "Value "content" where value is missing closing quote
     repaired = repaired.replace(/("heading"\s*:\s*"[^"]*)\s+"content"\s*:/g, '$1", "content":');
     
-    // 0. Fix empty key for heading in sections: {"": "Title", "content" -> {"heading": "Title", "content"
+    // 0. Fix empty key for sections array: "summary": "...", "": [{"heading" -> "summary": "...", "sections": [{"heading"
+    // AI sometimes outputs "" instead of "sections" for the sections array key
+    repaired = repaired.replace(/,\s*""\s*:\s*\[\s*\{\s*"heading"/g, ', "sections": [{"heading"');
+    
+    // 0-alt. Fix empty key for heading in sections: {"": "Title", "content" -> {"heading": "Title", "content"
     // Must come FIRST - more specific than text rule (checks for "content" after)
     repaired = repaired.replace(/\{\s*""\s*:\s*"([^"]+)"\s*,\s*"content"/g, '{"heading": "$1", "content"');
     
