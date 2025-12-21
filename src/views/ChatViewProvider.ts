@@ -9,6 +9,7 @@ import {
     updateLastPairResponse,
     updateSessionSummary,
     updateSessionUsage,
+    updateSessionHandoff,
     listSessions,
     ChatPair,
     ChatRequest,
@@ -164,6 +165,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'searchFiles':
                     this._searchWorkspaceFiles(message.query);
                     break;
+                case 'handoff':
+                    this._handleHandoff(message.sessionId, message.todos);
+                    break;
             }
         });
     }
@@ -240,6 +244,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 type: 'fileSearchResults',
                 files: []
             });
+        }
+    }
+
+    private async _handleHandoff(sessionId: string, todos: Array<{text: string, completed: boolean}>) {
+        try {
+            const oldSession = await getSession(sessionId);
+            if (!oldSession) {
+                vscode.window.showErrorMessage('Session not found');
+                return;
+            }
+
+            // Generate handoff summary
+            const todoSummary = todos.length > 0 
+                ? todos.map(t => `${t.completed ? '✓' : '○'} ${t.text}`).join('\n')
+                : 'No TODOs tracked';
+            
+            const completedCount = todos.filter(t => t.completed).length;
+            const pendingCount = todos.length - completedCount;
+            
+            const handoffText = [
+                `## Handoff from Session ${sessionId.slice(0, 6)}`,
+                '',
+                `**Summary:** ${oldSession.summary || 'No summary available'}`,
+                '',
+                `**Progress:** ${completedCount}/${todos.length} tasks completed`,
+                pendingCount > 0 ? `**Remaining:** ${pendingCount} task(s) pending` : '',
+                '',
+                '**TODOs:**',
+                todoSummary,
+                '',
+                `**Context:** ${oldSession.pairs.length} message(s) exchanged, ${oldSession.tokensIn + oldSession.tokensOut} tokens used`
+            ].filter(Boolean).join('\n');
+
+            // Create new session with parent reference
+            const newSession = await createSession(sessionId);
+            
+            // Update old session with handoff info
+            await updateSessionHandoff(sessionId, handoffText, newSession.id);
+            
+            // Switch to new session
+            this._currentSessionId = newSession.id;
+            setCurrentSession(newSession.id);
+
+            // Send init message with handoff context
+            this._postMessage({
+                type: 'sessionChanged',
+                sessionId: newSession.id,
+                summary: `Handoff from @${sessionId.slice(0, 6)}`,
+                history: [],
+                parentSessionId: sessionId
+            });
+
+            // Pre-fill the input with handoff context so user can see and edit it
+            const pendingTodos = todos.filter(t => !t.completed).map(t => `- ${t.text}`).join('\n');
+            const prefillText = [
+                `[Handoff from session @${sessionId.slice(0, 6)}]`,
+                '',
+                `Previous work: ${oldSession.summary || 'No summary'}`,
+                pendingTodos ? `\nPending tasks:\n${pendingTodos}` : '',
+                '',
+                'Please continue where we left off.'
+            ].filter(Boolean).join('\n');
+            
+            this._postMessage({
+                type: 'prefillInput',
+                text: prefillText
+            });
+
+            vscode.window.showInformationMessage(`Handed off to new session. Parent: ${sessionId.slice(0, 6)}`);
+            
+        } catch (error: any) {
+            logError('Handoff failed:', error);
+            vscode.window.showErrorMessage(`Handoff failed: ${error.message}`);
         }
     }
 
@@ -1015,14 +1092,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // Use hardcoded system prompt with workspace info (project-agnostic)
         const workspaceInfo = getWorkspaceInfo();
-        const systemPrompt = buildSystemPrompt(workspaceInfo);
+        let systemPrompt = buildSystemPrompt(workspaceInfo);
 
-        messages.push({ role: 'system', content: systemPrompt });
-
+        // Check if this is a handoff session and inject parent context
         if (this._currentSessionId) {
             try {
                 const session = await getSession(this._currentSessionId);
                 if (session) {
+                    // If this session has a parent (handoff) and this is the first message, fetch the handoff context
+                    // Note: pairs.length === 1 because appendPair is called before _buildMessages
+                    if (session.parentSessionId && session.pairs.length === 1) {
+                        const parentSession = await getSession(session.parentSessionId);
+                        if (parentSession?.handoffText) {
+                            info('Injecting handoff context from parent session:', session.parentSessionId.slice(0, 6));
+                            systemPrompt += `\n\n## Handoff Context\nThis session is a continuation from a previous session. Here is the context:\n\n${parentSession.handoffText}`;
+                        }
+                    }
+                    
+                    // System message must come FIRST before history
+                    messages.push({ role: 'system', content: systemPrompt });
+                    
+                    // Then add conversation history
                     const recentPairs = session.pairs.slice(-10);
                     for (const pair of recentPairs) {
                         messages.push({ role: 'user', content: pair.request.text });
@@ -1034,6 +1124,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             } catch (error) {
                 console.error('Failed to load history:', error);
             }
+        }
+
+        // If no session or session load failed, add system message now
+        if (messages.length === 0 || messages[0].role !== 'system') {
+            messages.unshift({ role: 'system', content: systemPrompt });
         }
 
         if (images && images.length > 0) {
@@ -1194,7 +1289,19 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 #stats-left .changes-info{display:flex;gap:6px}
 #stats-right{display:flex;align-items:center;gap:8px}
 #stats .cost{color:var(--vscode-charts-green);font-weight:600}
-#stats .pct{display:flex;align-items:center;gap:4px}
+#stats .pct{display:flex;align-items:center;gap:4px;position:relative;cursor:pointer}
+#stats .pct.green{color:#4ec9b0}
+#stats .pct.orange{color:#cca700}
+#stats .pct.red{color:#f85149}
+#handoff-popup{position:absolute;bottom:100%;right:0;background:var(--vscode-editorWidget-background);border:1px solid var(--vscode-editorWidget-border);border-radius:6px;padding:10px;min-width:200px;display:none;z-index:101;box-shadow:0 -2px 8px rgba(0,0,0,.3)}
+#handoff-popup.show{display:block}
+#handoff-popup p{margin:0 0 8px 0;font-size:11px;color:var(--vscode-editor-foreground)}
+#handoff-popup ul{color:var(--vscode-editor-foreground)}
+#handoff-popup li{color:var(--vscode-editor-foreground)}
+#handoff-popup .handoff-btns{display:flex;gap:6px;justify-content:flex-end}
+#handoff-popup button{padding:4px 10px;border:none;border-radius:4px;font-size:11px;cursor:pointer}
+#handoff-popup .handoff-yes{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+#handoff-popup .handoff-no{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 #inp-row{display:flex;gap:6px;align-items:flex-end}
 #msg{flex:1;padding:8px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground);border-radius:6px;resize:none;min-height:36px;max-height:120px;font-family:inherit;font-size:13px;line-height:1.4}
 #send{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-size:13px;font-weight:500}
@@ -1244,7 +1351,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="stats">
     <div id="stats-left"><span id="stats-changes">0 files</span><span class="changes-info"><span class="stat-add">+0</span><span class="stat-rem">-0</span><span class="stat-mod">~0</span></span></div>
-    <div id="stats-right"><span class="cost" id="stats-cost">$0.00</span><span class="pct">○ <span id="stats-pct">0%</span></span></div>
+    <div id="stats-right"><span class="cost" id="stats-cost">$0.00</span><span class="pct" id="pct-wrap">○ <span id="stats-pct">0%</span><div id="handoff-popup"><p><strong>🔄 Session Handoff</strong></p><p>Creates a new session with context from this one:</p><ul style="margin:4px 0 8px 16px;padding:0;font-size:10px"><li>Summary of work done</li><li>TODO progress (completed/pending)</li><li>Reference to continue where you left off</li></ul><p style="font-size:10px;color:var(--vscode-descriptionForeground)">Use when nearing token limit or to start fresh with context.</p><div class="handoff-btns"><button class="handoff-no">Cancel</button><button class="handoff-yes">🔄 Hand Off</button></div></div></span></div>
 </div>
 <div id="img-preview"></div>
 <div id="inp-row"><button id="attach" title="Attach image">📎</button><textarea id="msg" placeholder="Ask Grok..." rows="1"></textarea><button id="send">Send</button><button id="stop">Stop</button></div>
@@ -1262,6 +1369,21 @@ let currentTodos=[],todosCompleted=0,todoExpanded=true;
 const CTX_LIMIT=128000;
 const autocomplete=document.getElementById('autocomplete');
 let acFiles=[],acIndex=-1,acWordStart=-1,acWordEnd=-1,acDebounce=null;
+
+// Handoff popup
+const pctWrap=document.getElementById('pct-wrap');
+const handoffPopup=document.getElementById('handoff-popup');
+pctWrap.onclick=e=>{e.stopPropagation();handoffPopup.classList.toggle('show');};
+handoffPopup.querySelector('.handoff-no').onclick=e=>{e.stopPropagation();handoffPopup.classList.remove('show');};
+handoffPopup.querySelector('.handoff-yes').onclick=e=>{e.stopPropagation();handoffPopup.classList.remove('show');vs.postMessage({type:'handoff',sessionId:curSessId,todos:currentTodos});};
+document.addEventListener('click',e=>{if(!pctWrap.contains(e.target))handoffPopup.classList.remove('show');});
+
+function updatePctColor(pct){
+    pctWrap.classList.remove('green','orange','red');
+    if(pct>=86){pctWrap.classList.add('red');}
+    else if(pct>=76){pctWrap.classList.add('orange');}
+    else{pctWrap.classList.add('green');}
+}
 
 // Status indicator
 const statusDot=document.getElementById('status-dot');
@@ -1404,7 +1526,8 @@ msg.addEventListener('input',()=>{
         acDebounce=setTimeout(()=>{vs.postMessage({type:'searchFiles',query:match.word});},150);
     }else{hideAutocomplete();}
 });
-function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;totalCost+=(p/1e6)*0.30+(c/1e6)*0.50;}const pct=Math.min(100,Math.round(totalTokens/CTX_LIMIT*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';}
+let handoffShownThisSession=false;
+function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;totalCost+=(p/1e6)*0.30+(c/1e6)*0.50;}const pct=Math.min(100,Math.round(totalTokens/CTX_LIMIT*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';updatePctColor(pct);if(pct>=75&&!handoffShownThisSession&&!busy){handoffShownThisSession=true;handoffPopup.classList.add('show');}}
 function doSend(){const t=msg.value.trim();if((t||attachedImages.length)&&!busy){vs.postMessage({type:'sendMessage',text:t,images:attachedImages});msg.value='';msg.style.height='auto';stream='';attachedImages=[];imgPreview.innerHTML='';imgPreview.classList.remove('show');hideAutocomplete();saveInputState();}}
 attachBtn.onclick=()=>fileInput.click();
 fileInput.onchange=async e=>{const files=Array.from(e.target.files||[]);for(const f of files){if(!f.type.startsWith('image/'))continue;const reader=new FileReader();reader.onload=ev=>{const b64=ev.target.result.split(',')[1];attachedImages.push(b64);const thumb=document.createElement('div');thumb.className='img-thumb';thumb.innerHTML='<img src="'+ev.target.result+'"><button class="rm" data-i="'+(attachedImages.length-1)+'">×</button>';thumb.querySelector('.rm').onclick=function(){const i=parseInt(this.dataset.i);attachedImages.splice(i,1);updateImgPreview();};imgPreview.appendChild(thumb);imgPreview.classList.add('show');};reader.readAsDataURL(f);}fileInput.value='';};
@@ -1438,7 +1561,7 @@ window.addEventListener('message',e=>{const m=e.data;
 switch(m.type){
 case'init':case'sessionChanged':
 curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=(m.summary||m.sessionId)+'\\n['+m.sessionId.slice(0,6)+']';
-chat.innerHTML='';totalTokens=0;totalCost=0;if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}hist.classList.remove('show');scrollToBottom();break;
+chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}hist.classList.remove('show');scrollToBottom();break;
 case'historyList':
 hist.innerHTML='';m.sessions.forEach(s=>{const d=document.createElement('div');d.className='hist-item'+(s.id===m.currentSessionId?' active':'');
 const sum=document.createElement('div');sum.className='hist-sum';sum.textContent=s.summary||'New chat';sum.title=s.summary||'';
@@ -1471,6 +1594,7 @@ renderTodos();}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 case'fileSearchResults':showAutocomplete(m.files||[]);break;
+case'prefillInput':msg.value=m.text;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';saveInputState();break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}

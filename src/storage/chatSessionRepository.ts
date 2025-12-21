@@ -93,6 +93,9 @@ export interface ChatSessionDocument {
     tokensOut: number; // Total output/completion tokens
     pairs: ChatPair[];
     stepTracker: StepTrackerEntry[];  // Cumulative stats per step type
+    handoffText?: string;  // Summary for handoff to new session
+    handoffToSessionId?: string;  // ID of the session this was handed off to
+    parentSessionId?: string;  // ID of parent session (for handoff sessions)
 }
 
 /**
@@ -122,7 +125,7 @@ export function getProjectName(): string {
     return workspaceFolders[0].name;
 }
 
-export async function createSession(): Promise<ChatSessionDocument> {
+export async function createSession(parentSessionId?: string): Promise<ChatSessionDocument> {
     const client = getCouchbaseClient();
     const id = uuidv4();
     const now = new Date().toISOString();
@@ -140,7 +143,8 @@ export async function createSession(): Promise<ChatSessionDocument> {
         tokensIn: 0,
         tokensOut: 0,
         pairs: [],
-        stepTracker: []
+        stepTracker: [],
+        parentSessionId
     };
 
     const success = await client.insert(id, doc);
@@ -148,7 +152,7 @@ export async function createSession(): Promise<ChatSessionDocument> {
         throw new Error('Failed to create session in Couchbase');
     }
     
-    console.log('Created new session:', id, 'for project:', projectName, '(', projectId, ')');
+    console.log('Created new session:', id, 'for project:', projectName, parentSessionId ? `(handoff from ${parentSessionId})` : '');
     return doc;
 }
 
@@ -394,4 +398,25 @@ export async function listAllSessions(limit: number = 50): Promise<ChatSessionDo
     
     const results = await client.query<ChatSessionDocument>(query, { limit });
     return results;
+}
+
+/**
+ * Update session with handoff information
+ */
+export async function updateSessionHandoff(
+    sessionId: string, 
+    handoffText: string, 
+    handoffToSessionId: string
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const session = await getSession(sessionId);
+    if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+    }
+    
+    session.handoffText = handoffText;
+    session.handoffToSessionId = handoffToSessionId;
+    session.updatedAt = new Date().toISOString();
+    
+    await client.replace(sessionId, session);
 }
