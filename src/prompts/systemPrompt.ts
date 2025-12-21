@@ -1,11 +1,21 @@
 /**
  * Hardcoded system prompt for Grok AI.
- * This is project-agnostic and instructs the AI to return structured JSON.
+ * This is project-agnostic and instructs the AI to return structured JSON (or TOON when optimized).
  */
 
+import * as vscode from 'vscode';
 import { RESPONSE_JSON_SCHEMA } from './responseSchema';
+import { getToonOutputPrompt, getToonSystemPromptAddition } from '../utils/toonConverter';
 
-export const SYSTEM_PROMPT = `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
+/**
+ * Get the current payload optimization setting
+ */
+function getOptimizePayload(): string {
+    const config = vscode.workspace.getConfiguration('grok');
+    return config.get<string>('optimizePayload') || 'none';
+}
+
+export const SYSTEM_PROMPT_BASE = `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
 
 ## OUTPUT FORMAT - STRICT JSON REQUIRED
 
@@ -107,10 +117,40 @@ The user sees your todos as a checklist, so make them actionable and clear.
 `;
 
 /**
+ * Get the appropriate system prompt based on optimization settings
+ */
+export function getSystemPrompt(): string {
+    const optimizePayload = getOptimizePayload();
+    
+    if (optimizePayload === 'toon') {
+        // Replace JSON output instructions with TOON output instructions
+        return `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
+${getToonOutputPrompt()}
+${getToonSystemPromptAddition()}
+## TODOS - REVIEW AND UPDATE
+
+If a "Current Plan" with numbered steps is provided in the user message:
+1. Review the plan - it was created by a fast model and may need refinement
+2. Update the todos array with your improved version
+3. Mark completed steps as "completed": true
+4. Add any missing steps you discover
+5. Reorder if the sequence should change
+
+The user sees your todos as a checklist, so make them actionable and clear.
+`;
+    }
+    
+    return SYSTEM_PROMPT_BASE;
+}
+
+// Legacy export for backward compatibility
+export const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE;
+
+/**
  * Builds the complete system message with optional workspace context.
  */
 export function buildSystemPrompt(workspaceInfo?: WorkspaceInfo): string {
-    let prompt = SYSTEM_PROMPT;
+    let prompt = getSystemPrompt();
 
     if (workspaceInfo) {
         prompt += `\n\nWORKSPACE CONTEXT:

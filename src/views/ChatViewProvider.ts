@@ -610,8 +610,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }
                     
                     if (usedCleanup) {
-                        info('Used model cleanup to fix JSON');
-                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '\n🔧 JSON cleaned up\n' });
+                        const isToon = grokResponse.text.trim().startsWith('```toon') || 
+                                       (grokResponse.text.includes('summary:') && !grokResponse.text.includes('"summary"'));
+                        const cleanupType = isToon ? 'TOON→JSON' : 'JSON';
+                        info(`Used model cleanup to fix ${cleanupType}`);
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n🔧 ${cleanupType} cleaned up\n` });
                         
                         // Record cleanup step metrics if model was used
                         if (cleanupResult.cleanupMetrics) {

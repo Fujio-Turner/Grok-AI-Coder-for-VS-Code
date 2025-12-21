@@ -14,6 +14,7 @@ import {
 } from './responseSchema';
 import { safeParseJson, isHttpError, looksLikeJson } from './jsonHelper';
 import { debug } from '../utils/logger';
+import { looksLikeToon, fromToon, extractToonContent } from '../utils/toonConverter';
 
 export { GrokStructuredResponse } from './responseSchema';
 
@@ -28,8 +29,8 @@ export interface ParseResult {
 }
 
 /**
- * Attempts to parse the AI response as structured JSON.
- * Falls back to legacy parsing if JSON parsing fails.
+ * Attempts to parse the AI response as structured JSON or TOON.
+ * Falls back to legacy parsing if parsing fails.
  */
 export function parseGrokResponse(responseText: string): ParseResult {
     const trimmed = responseText.trim();
@@ -42,6 +43,36 @@ export function parseGrokResponse(responseText: string): ParseResult {
             raw: responseText,
             error: 'HTTP error response'
         };
+    }
+    
+    // Check if response is in TOON format first
+    if (looksLikeToon(trimmed)) {
+        debug('Response appears to be TOON format, attempting to parse');
+        try {
+            // Extract TOON content from markdown fences if present
+            const toonContent = extractToonContent(trimmed);
+            debug('Extracted TOON content', { 
+                originalLength: trimmed.length, 
+                extractedLength: toonContent.length,
+                startsWithSummary: toonContent.startsWith('summary:')
+            });
+            
+            const parsed = fromToon(toonContent);
+            const validated = validateResponse(parsed);
+            
+            if (validated) {
+                debug('Successfully parsed TOON response');
+                return {
+                    success: true,
+                    structured: validated,
+                    wasRepaired: false
+                };
+            } else {
+                debug('TOON parsed but failed schema validation, trying JSON fallback');
+            }
+        } catch (err) {
+            debug('TOON parsing failed, trying JSON fallback', { error: String(err) });
+        }
     }
     
     // Check if response contains JSON anywhere (not just at start)
@@ -64,7 +95,7 @@ export function parseGrokResponse(responseText: string): ParseResult {
         return {
             success: false,
             raw: responseText,
-            error: 'Response is not JSON'
+            error: 'Response is not JSON or TOON'
         };
     }
     
