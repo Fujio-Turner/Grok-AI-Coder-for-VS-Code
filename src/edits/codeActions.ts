@@ -80,19 +80,20 @@ export async function validateFileChange(
         : 0;
     
     // Detect suspicious patterns that indicate truncation/corruption
-    const endsAbruptly = newContent.endsWith('...') || 
-        !!newContent.match(/[a-zA-Z_]$/) ||  // Ends mid-word
-        !!newContent.match(/["'`]:\s*["'`]?$/) || // Ends mid-JSON
-        !!newContent.match(/\{\s*$/) ||  // Ends with open brace
-        !!newContent.match(/\[\s*$/); // Ends with open bracket
+    // Be careful not to flag valid code files - only flag clear truncation signs
+    const trimmedContent = newContent.trimEnd();
+    const endsAbruptly = 
+        trimmedContent.endsWith('...') ||  // Explicit truncation marker
+        !!trimmedContent.match(/["'`]:\s*["'`]?$/) || // Ends mid-JSON value
+        !!trimmedContent.match(/\{\s*$/) ||  // Ends with unclosed brace (no content after)
+        !!trimmedContent.match(/\[\s*$/) ||  // Ends with unclosed bracket (no content after)
+        !!trimmedContent.match(/,\s*$/);     // Ends with trailing comma (incomplete)
     
     const looksLikeTruncation: boolean = !isDiff && (
-        // New content is much smaller than existing (>70% reduction)
-        (sizeDifferencePercent > 70 && existingFileSize > 500) ||
-        // New content ends abruptly (common truncation signs)
-        endsAbruptly ||
-        // Very short replacement for large file
-        (newContentSize < 200 && existingFileSize > 1000)
+        // Only flag as truncation if BOTH size is drastically reduced AND ends abruptly
+        (sizeDifferencePercent > 70 && existingFileSize > 500 && endsAbruptly) ||
+        // Very short replacement for large file with suspicious ending
+        (newContentSize < 200 && existingFileSize > 1000 && endsAbruptly)
     );
     
     // Check if the new content is just the start of the existing file (truncation)
