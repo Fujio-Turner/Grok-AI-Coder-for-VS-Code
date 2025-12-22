@@ -33,7 +33,8 @@ import {
     reapplyFromChangeSet,
     previewDiffStats,
     applySimpleDiff,
-    validateFileChange
+    validateFileChange,
+    resolveFilePathToUri
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
@@ -923,87 +924,99 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const suspiciousChanges: string[] = [];
             
             if (structured.fileChanges && structured.fileChanges.length > 0) {
-                const workspaceFolders = vscode.workspace.workspaceFolders;
-                if (workspaceFolders) {
-                    const editPromises = structured.fileChanges.map(async (fc, idx) => {
-                        const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, fc.path);
-                        let newText = fc.content;
+                const editPromises = structured.fileChanges.map(async (fc, idx) => {
+                    const fileUri = resolveFilePathToUri(fc.path);
+                    if (!fileUri) {
+                        logError(`Unable to resolve file path: ${fc.path}`);
+                        vscode.window.showErrorMessage(`Cannot apply change: Unable to resolve path "${fc.path}". It may be outside the workspace or invalid.`);
+                        return null;
+                    }
+                    
+                    // Warn if file is outside workspace
+                    const workspaceFolders = vscode.workspace.workspaceFolders;
+                    const isOutsideWorkspace = workspaceFolders 
+                        ? !fileUri.fsPath.startsWith(workspaceFolders[0].uri.fsPath) 
+                        : true;
+                    if (isOutsideWorkspace) {
+                        debug(`File is outside workspace: ${fc.path}`);
+                    }
+                    
+                    let newText = fc.content;
+                    
+                    // If isDiff is true, apply the diff to the existing file content
+                    if (fc.isDiff) {
+                        try {
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            const originalContent = doc.getText();
+                            newText = applySimpleDiff(originalContent, fc.content);
+                            debug(`Applied diff to ${fc.path}: ${fc.content.split('\\n').length} diff lines -> ${newText.split('\\n').length} result lines`);
+                        } catch (err) {
+                            // File doesn't exist, use content as-is (strip +/- prefixes)
+                            newText = fc.content.split('\n')
+                                .filter(line => !line.startsWith('-'))
+                                .map(line => line.startsWith('+') ? line.substring(1) : line)
+                                .join('\n');
+                            debug(`File ${fc.path} not found, extracting + lines from diff`);
+                        }
+                    } else {
+                        // SAFETY CHECK: Validate non-diff file changes to prevent corruption
+                        const validation = await validateFileChange(fileUri, newText, fc.isDiff || false);
                         
-                        // If isDiff is true, apply the diff to the existing file content
-                        if (fc.isDiff) {
-                            try {
-                                const doc = await vscode.workspace.openTextDocument(fileUri);
-                                const originalContent = doc.getText();
-                                newText = applySimpleDiff(originalContent, fc.content);
-                                debug(`Applied diff to ${fc.path}: ${fc.content.split('\\n').length} diff lines -> ${newText.split('\\n').length} result lines`);
-                            } catch (err) {
-                                // File doesn't exist, use content as-is (strip +/- prefixes)
-                                newText = fc.content.split('\n')
-                                    .filter(line => !line.startsWith('-'))
-                                    .map(line => line.startsWith('+') ? line.substring(1) : line)
-                                    .join('\n');
-                                debug(`File ${fc.path} not found, extracting + lines from diff`);
-                            }
-                        } else {
-                            // SAFETY CHECK: Validate non-diff file changes to prevent corruption
-                            const validation = await validateFileChange(fileUri, newText, fc.isDiff || false);
-                            
-                            if (!validation.isValid) {
-                                // Block this change - it looks like truncated content
-                                blockedChanges.push(`${fc.path}: ${validation.warning}`);
-                                logError(`BLOCKED file change: ${validation.warning}`);
-                                return null; // Skip this edit
-                            }
-                            
-                            if (validation.isSuspicious && validation.warning) {
-                                suspiciousChanges.push(`${fc.path}: ${validation.warning}`);
-                                debug(`Suspicious file change detected: ${validation.warning}`);
-                            }
+                        if (!validation.isValid) {
+                            // Block this change - it looks like truncated content
+                            blockedChanges.push(`${fc.path}: ${validation.warning}`);
+                            logError(`BLOCKED file change: ${validation.warning}`);
+                            return null; // Skip this edit
                         }
                         
-                        return {
-                            id: `edit-${idx}`,
-                            fileUri,
-                            range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
-                            newText
-                        };
+                        if (validation.isSuspicious && validation.warning) {
+                            suspiciousChanges.push(`${fc.path}: ${validation.warning}`);
+                            debug(`Suspicious file change detected: ${validation.warning}`);
+                        }
+                    }
+                    
+                    return {
+                        id: `edit-${idx}`,
+                        fileUri,
+                        range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                        newText
+                    };
+                });
+                
+                // Filter out blocked edits (null values)
+                const results = await Promise.all(editPromises);
+                edits = results.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as ProposedEdit[];
+                
+                // Notify user about blocked/suspicious changes
+                if (blockedChanges.length > 0) {
+                    // Check if we can offer to restore from GitHub
+                    const gitRemoteUrl = await this._getGitRemoteUrl();
+                    const canRestoreFromGitHub = gitRemoteUrl && gitRemoteUrl.includes('github.com');
+                    
+                    const buttons = canRestoreFromGitHub 
+                        ? ['Show Details', 'Restore from GitHub'] 
+                        : ['Show Details'];
+                    
+                    vscode.window.showErrorMessage(
+                        `Blocked ${blockedChanges.length} file change(s) that appeared truncated. ` +
+                        `The AI may have an outdated view of the file.`,
+                        ...buttons
+                    ).then(async selection => {
+                        if (selection === 'Show Details') {
+                            logError('Blocked file changes:\n' + blockedChanges.join('\n'));
+                            logError('TIP: The AI\'s context may contain truncated file content. ' +
+                                'Try asking: "Read the current content of <filename> and then make the change"');
+                        } else if (selection === 'Restore from GitHub' && gitRemoteUrl) {
+                            // Offer to restore specific files from GitHub
+                            await this._offerGitHubRestore(blockedChanges, gitRemoteUrl);
+                        }
                     });
-                    
-                    // Filter out blocked edits (null values)
-                    const results = await Promise.all(editPromises);
-                    edits = results.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as ProposedEdit[];
-                    
-                    // Notify user about blocked/suspicious changes
-                    if (blockedChanges.length > 0) {
-                        // Check if we can offer to restore from GitHub
-                        const gitRemoteUrl = await this._getGitRemoteUrl();
-                        const canRestoreFromGitHub = gitRemoteUrl && gitRemoteUrl.includes('github.com');
-                        
-                        const buttons = canRestoreFromGitHub 
-                            ? ['Show Details', 'Restore from GitHub'] 
-                            : ['Show Details'];
-                        
-                        vscode.window.showErrorMessage(
-                            `Blocked ${blockedChanges.length} file change(s) that appeared truncated. ` +
-                            `The AI may have an outdated view of the file.`,
-                            ...buttons
-                        ).then(async selection => {
-                            if (selection === 'Show Details') {
-                                logError('Blocked file changes:\n' + blockedChanges.join('\n'));
-                                logError('TIP: The AI\'s context may contain truncated file content. ' +
-                                    'Try asking: "Read the current content of <filename> and then make the change"');
-                            } else if (selection === 'Restore from GitHub' && gitRemoteUrl) {
-                                // Offer to restore specific files from GitHub
-                                await this._offerGitHubRestore(blockedChanges, gitRemoteUrl);
-                            }
-                        });
-                    }
-                    
-                    if (suspiciousChanges.length > 0) {
-                        vscode.window.showWarningMessage(
-                            `${suspiciousChanges.length} file change(s) may be incomplete. Review carefully before applying.`
-                        );
-                    }
+                }
+                
+                if (suspiciousChanges.length > 0) {
+                    vscode.window.showWarningMessage(
+                        `${suspiciousChanges.length} file change(s) may be incomplete. Review carefully before applying.`
+                    );
                 }
             } else {
                 // Fallback to legacy parsing if no structured fileChanges
@@ -1144,51 +1157,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const structured = lastSuccessPair.response.structured;
             
             if (structured?.fileChanges && structured.fileChanges.length > 0) {
-                const workspaceFolders = vscode.workspace.workspaceFolders;
-                if (workspaceFolders) {
-                    const validFileChanges = structured.fileChanges
-                        .filter((fc: { path: string; content: string }) => {
-                            // Validate path is not empty
-                            if (!fc.path || fc.path.trim() === '') {
-                                logError('Skipping fileChange with empty path', { content: fc.content?.substring(0, 100) });
-                                return false;
-                            }
-                            return true;
-                        });
-                    
-                    edits = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean }, idx: number) => {
-                        const filePath = fc.path.trim();
-                        const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
-                        let newText = fc.content;
-                        
-                        // If isDiff is true, apply the diff to the existing file content
-                        if (fc.isDiff) {
-                            try {
-                                const doc = await vscode.workspace.openTextDocument(fileUri);
-                                const originalContent = doc.getText();
-                                newText = applySimpleDiff(originalContent, fc.content);
-                                debug(`Applied diff to ${filePath}`);
-                            } catch (err) {
-                                // File doesn't exist, extract + lines from diff
-                                newText = fc.content.split('\n')
-                                    .filter(line => !line.startsWith('-'))
-                                    .map(line => line.startsWith('+') ? line.substring(1) : line)
-                                    .join('\n');
-                                debug(`File ${filePath} not found, extracting + lines from diff`);
-                            }
+                const validFileChanges = structured.fileChanges
+                    .filter((fc: { path: string; content: string }) => {
+                        // Validate path is not empty
+                        if (!fc.path || fc.path.trim() === '') {
+                            logError('Skipping fileChange with empty path', { content: fc.content?.substring(0, 100) });
+                            return false;
                         }
-                        
-                        debug(`Processing fileChange: path="${filePath}", content length=${newText?.length}`);
-                        
-                        return {
-                            id: `edit-${idx}`,
-                            fileUri,
-                            range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
-                            newText
-                        };
-                    }));
-                    debug('Using structured fileChanges:', edits.length);
-                }
+                        return true;
+                    });
+                
+                const editResults = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean }, idx: number) => {
+                    const filePath = fc.path.trim();
+                    const fileUri = resolveFilePathToUri(filePath);
+                    if (!fileUri) {
+                        logError(`Unable to resolve file path: ${filePath}`);
+                        vscode.window.showErrorMessage(`Cannot apply change: Unable to resolve path "${filePath}". It may be outside the workspace or invalid.`);
+                        return null;
+                    }
+                    
+                    // Warn if file is outside workspace
+                    const workspaceFolders = vscode.workspace.workspaceFolders;
+                    const isOutsideWorkspace = workspaceFolders 
+                        ? !fileUri.fsPath.startsWith(workspaceFolders[0].uri.fsPath) 
+                        : true;
+                    if (isOutsideWorkspace) {
+                        debug(`File is outside workspace: ${filePath}`);
+                    }
+                    
+                    let newText = fc.content;
+                    
+                    // If isDiff is true, apply the diff to the existing file content
+                    if (fc.isDiff) {
+                        try {
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            const originalContent = doc.getText();
+                            newText = applySimpleDiff(originalContent, fc.content);
+                            debug(`Applied diff to ${filePath}`);
+                        } catch (err) {
+                            // File doesn't exist, extract + lines from diff
+                            newText = fc.content.split('\n')
+                                .filter(line => !line.startsWith('-'))
+                                .map(line => line.startsWith('+') ? line.substring(1) : line)
+                                .join('\n');
+                            debug(`File ${filePath} not found, extracting + lines from diff`);
+                        }
+                    }
+                    
+                    debug(`Processing fileChange: path="${filePath}", content length=${newText?.length}`);
+                    
+                    return {
+                        id: `edit-${idx}`,
+                        fileUri,
+                        range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
+                        newText
+                    };
+                }));
+                edits = editResults.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as ProposedEdit[];
+                debug('Using structured fileChanges:', edits.length);
             }
             
             // Fallback to legacy emoji parsing
