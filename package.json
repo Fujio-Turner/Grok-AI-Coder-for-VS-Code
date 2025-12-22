@@ -2,7 +2,9 @@
   "name": "grok-ai-coder",
   "displayName": "Grok AI Coder",
   "description": "AI-powered coding assistant with xAI's Grok models, persistent chat history, and full change tracking with rollback",
+
   "version": "1.0.3",
+
   "publisher": "fujio-turner",
   "author": {
     "name": "Fujio Turner"

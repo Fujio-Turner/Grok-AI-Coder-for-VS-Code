@@ -1,5 +1,47 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { changeTracker, FileChange, ChangeSet, DiffStats } from './changeTracker';
+
+/**
+ * Resolves a file path (absolute, relative, or file:// URI) to a vscode.Uri.
+ * Handles:
+ * - file:// URIs: parsed directly
+ * - Absolute paths: converted via vscode.Uri.file
+ * - Relative paths: joined with workspace root
+ * 
+ * @param rawPath The path from AI response (could be absolute, relative, or URI)
+ * @returns vscode.Uri or undefined if resolution fails
+ */
+export function resolveFilePathToUri(rawPath: string): vscode.Uri | undefined {
+    if (!rawPath || !rawPath.trim()) {
+        return undefined;
+    }
+
+    const p = rawPath.trim();
+
+    // 1) If it's already a URI (e.g., file:///...), parse it directly
+    if (p.startsWith('file:')) {
+        try {
+            return vscode.Uri.parse(p);
+        } catch {
+            // fall through to try other strategies
+        }
+    }
+
+    // 2) Absolute filesystem path? Use vscode.Uri.file
+    if (path.isAbsolute(p)) {
+        return vscode.Uri.file(p);
+    }
+
+    // 3) Relative path: resolve against the first workspace folder
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders && workspaceFolders.length > 0) {
+        return vscode.Uri.joinPath(workspaceFolders[0].uri, p);
+    }
+
+    // 4) No workspace, non-absolute: can't resolve safely
+    return undefined;
+}
 
 export interface ProposedEdit {
     id: string;
@@ -318,12 +360,6 @@ export async function reapplyFromChangeSet(targetChangeSetId: string): Promise<b
 export function parseCodeBlocksFromResponse(responseText: string): ProposedEdit[] {
     const edits: ProposedEdit[] = [];
     
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
-        console.log('parseCodeBlocksFromResponse: No workspace folder');
-        return edits;
-    }
-    
     const filePattern = /[\u{1F4C4}\u{1F5CE}]\s*([^\s\n(]+)\s*(?:\(lines?\s*(\d+)(?:-(\d+))?\))?[\s\n]*```(\w+)?\n([\s\S]*?)```/gu;
     
     let match;
@@ -334,7 +370,21 @@ export function parseCodeBlocksFromResponse(responseText: string): ProposedEdit[
         
         console.log('parseCodeBlocksFromResponse: Found file:', filePath);
 
-        const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
+        const fileUri = resolveFilePathToUri(filePath);
+        if (!fileUri) {
+            console.log('parseCodeBlocksFromResponse: Unable to resolve file path:', filePath);
+            vscode.window.showErrorMessage(`Cannot apply change: Unable to resolve path "${filePath}". It may be outside the workspace or invalid.`);
+            continue;
+        }
+        
+        // Log if file is outside workspace
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const isOutsideWorkspace = workspaceFolders 
+            ? !fileUri.fsPath.startsWith(workspaceFolders[0].uri.fsPath) 
+            : true;
+        if (isOutsideWorkspace) {
+            console.log('parseCodeBlocksFromResponse: File is outside workspace:', filePath);
+        }
         
         let range: vscode.Range | undefined;
         if (startLine) {
