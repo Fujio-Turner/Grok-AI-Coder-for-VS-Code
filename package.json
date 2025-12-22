@@ -162,7 +162,11 @@
         "grok.modelMode": {
           "type": "string",
           "default": "fast",
-          "enum": ["fast", "smart", "base"],
+          "enum": [
+            "fast",
+            "smart",
+            "base"
+          ],
           "enumDescriptions": [
             "Fast (F) - Quick responses, cost-efficient",
             "Smart (S) - Reasoning model for complex tasks",
@@ -174,7 +178,10 @@
         "grok.couchbaseDeployment": {
           "type": "string",
           "default": "self-hosted",
-          "enum": ["self-hosted", "capella"],
+          "enum": [
+            "self-hosted",
+            "capella"
+          ],
           "enumDescriptions": [
             "Self-hosted Couchbase Server (uses N1QL query service)",
             "Couchbase Capella DBaaS (uses Data API)"
@@ -244,7 +251,11 @@
         },
         "grok.jsonCleanup": {
           "type": "string",
-          "enum": ["auto", "off", "on"],
+          "enum": [
+            "auto",
+            "off",
+            "on"
+          ],
           "default": "auto",
           "enumDescriptions": [
             "Auto: Use AI cleanup only when parsing fails or throws an exception",
@@ -293,7 +304,10 @@
         "grok.optimizePayload": {
           "type": "string",
           "default": "none",
-          "enum": ["none", "toon"],
+          "enum": [
+            "none",
+            "toon"
+          ],
           "enumDescriptions": [
             "None - Send messages as standard JSON (default)",
             "TOON - Use Token-Oriented Object Notation to reduce token usage by 30-60%"
@@ -338,10 +352,12 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "lint": "eslint src --ext ts",
     "test": "npm run compile && mocha 'out/test/unit/**/*.test.js' --timeout 10000",
     "test:vscode": "node ./out/test/runTest.js"
@@ -354,6 +370,7 @@
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
     "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.27.2",
     "eslint": "^8.54.0",
     "glob": "^10.3.10",
     "mocha": "^10.2.0",
