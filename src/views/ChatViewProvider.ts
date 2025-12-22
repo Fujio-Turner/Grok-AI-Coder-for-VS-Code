@@ -32,12 +32,14 @@ import {
     revertToChangeSet,
     reapplyFromChangeSet,
     previewDiffStats,
-    applySimpleDiff
+    applySimpleDiff,
+    validateFileChange
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
 import { runAgentWorkflow } from '../agent/agentOrchestrator';
 import { findFiles } from '../agent/workspaceFiles';
+import { fetchUrl } from '../agent/httpFetcher';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -917,10 +919,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             // Convert structured fileChanges to edits for apply functionality
             let edits: ProposedEdit[] = [];
+            const blockedChanges: string[] = [];
+            const suspiciousChanges: string[] = [];
+            
             if (structured.fileChanges && structured.fileChanges.length > 0) {
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 if (workspaceFolders) {
-                    edits = await Promise.all(structured.fileChanges.map(async (fc, idx) => {
+                    const editPromises = structured.fileChanges.map(async (fc, idx) => {
                         const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, fc.path);
                         let newText = fc.content;
                         
@@ -939,6 +944,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                     .join('\n');
                                 debug(`File ${fc.path} not found, extracting + lines from diff`);
                             }
+                        } else {
+                            // SAFETY CHECK: Validate non-diff file changes to prevent corruption
+                            const validation = await validateFileChange(fileUri, newText, fc.isDiff || false);
+                            
+                            if (!validation.isValid) {
+                                // Block this change - it looks like truncated content
+                                blockedChanges.push(`${fc.path}: ${validation.warning}`);
+                                logError(`BLOCKED file change: ${validation.warning}`);
+                                return null; // Skip this edit
+                            }
+                            
+                            if (validation.isSuspicious && validation.warning) {
+                                suspiciousChanges.push(`${fc.path}: ${validation.warning}`);
+                                debug(`Suspicious file change detected: ${validation.warning}`);
+                            }
                         }
                         
                         return {
@@ -947,7 +967,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
                             newText
                         };
-                    }));
+                    });
+                    
+                    // Filter out blocked edits (null values)
+                    const results = await Promise.all(editPromises);
+                    edits = results.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as ProposedEdit[];
+                    
+                    // Notify user about blocked/suspicious changes
+                    if (blockedChanges.length > 0) {
+                        // Check if we can offer to restore from GitHub
+                        const gitRemoteUrl = await this._getGitRemoteUrl();
+                        const canRestoreFromGitHub = gitRemoteUrl && gitRemoteUrl.includes('github.com');
+                        
+                        const buttons = canRestoreFromGitHub 
+                            ? ['Show Details', 'Restore from GitHub'] 
+                            : ['Show Details'];
+                        
+                        vscode.window.showErrorMessage(
+                            `Blocked ${blockedChanges.length} file change(s) that appeared truncated. ` +
+                            `The AI may have an outdated view of the file.`,
+                            ...buttons
+                        ).then(async selection => {
+                            if (selection === 'Show Details') {
+                                logError('Blocked file changes:\n' + blockedChanges.join('\n'));
+                                logError('TIP: The AI\'s context may contain truncated file content. ' +
+                                    'Try asking: "Read the current content of <filename> and then make the change"');
+                            } else if (selection === 'Restore from GitHub' && gitRemoteUrl) {
+                                // Offer to restore specific files from GitHub
+                                await this._offerGitHubRestore(blockedChanges, gitRemoteUrl);
+                            }
+                        });
+                    }
+                    
+                    if (suspiciousChanges.length > 0) {
+                        vscode.window.showWarningMessage(
+                            `${suspiciousChanges.length} file change(s) may be incomplete. Review carefully before applying.`
+                        );
+                    }
                 }
             } else {
                 // Fallback to legacy parsing if no structured fileChanges
@@ -2069,5 +2125,81 @@ function updUI(){stop.classList.toggle('vis',busy);send.style.display=busy?'none
 vs.postMessage({type:'ready'});
 vs.postMessage({type:'getConfig'});
 </script></body></html>`;
+    }
+
+    /**
+     * Get the GitHub remote URL from git config
+     */
+    private async _getGitRemoteUrl(): Promise<string | null> {
+        try {
+            const gitExtension = vscode.extensions.getExtension('vscode.git');
+            if (!gitExtension) return null;
+
+            const git = gitExtension.exports.getAPI(1);
+            const repo = git.repositories[0];
+            if (!repo) return null;
+
+            const remotes = repo.state.remotes;
+            const origin = remotes.find((r: any) => r.name === 'origin');
+            if (!origin) return null;
+
+            // Convert git URL to https URL
+            let url = origin.fetchUrl || origin.pushUrl || '';
+            if (url.startsWith('git@github.com:')) {
+                url = url.replace('git@github.com:', 'https://github.com/').replace(/\.git$/, '');
+            } else if (url.endsWith('.git')) {
+                url = url.replace(/\.git$/, '');
+            }
+
+            return url;
+        } catch (err) {
+            debug('Failed to get git remote URL:', err);
+            return null;
+        }
+    }
+
+    /**
+     * Offer to restore files from GitHub when AI provides truncated content
+     */
+    private async _offerGitHubRestore(blockedChanges: string[], gitRemoteUrl: string): Promise<void> {
+        // Extract file paths from blocked changes (format: "path/to/file: warning message")
+        const filePaths = blockedChanges.map(bc => bc.split(':')[0].trim());
+        
+        const selection = await vscode.window.showQuickPick(
+            filePaths.map(fp => ({ label: fp, description: 'Restore from GitHub main branch' })),
+            { 
+                placeHolder: 'Select file(s) to restore from GitHub',
+                canPickMany: true 
+            }
+        );
+
+        if (!selection || selection.length === 0) return;
+
+        for (const item of selection) {
+            const filePath = item.label;
+            // Construct raw GitHub URL
+            const rawUrl = `https://raw.githubusercontent.com/${gitRemoteUrl.replace('https://github.com/', '')}/main/${filePath}`;
+            
+            info(`Fetching ${filePath} from GitHub: ${rawUrl}`);
+            
+            const result = await fetchUrl(rawUrl);
+            
+            if (result.success && result.content) {
+                const workspaceFolders = vscode.workspace.workspaceFolders;
+                if (workspaceFolders) {
+                    const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
+                    
+                    // Write the fetched content
+                    const encoder = new TextEncoder();
+                    await vscode.workspace.fs.writeFile(fileUri, encoder.encode(result.content));
+                    
+                    vscode.window.showInformationMessage(`Restored ${filePath} from GitHub (${result.bytes} bytes)`);
+                    info(`Restored ${filePath}: ${result.bytes} bytes from ${rawUrl}`);
+                }
+            } else {
+                vscode.window.showErrorMessage(`Failed to fetch ${filePath}: ${result.error}`);
+                logError(`GitHub fetch failed for ${filePath}: ${result.error}`);
+            }
+        }
     }
 }

@@ -86,6 +86,23 @@ When MODIFYING existing files, use diff format to show changes:
 
 When CREATING new files, use full content with "isDiff": false
 
+## ⚠️ CRITICAL: FILE CONTENT RULES - PREVENT CORRUPTION
+
+**NEVER replace an entire file with a partial snippet.** This corrupts files!
+
+WRONG (causes corruption):
+- Using "isDiff": false with only a few lines when the original file has hundreds of lines
+- Truncating content mid-line or mid-word
+- Providing incomplete content that ends abruptly
+
+CORRECT approaches:
+1. **For modifications**: ALWAYS use "isDiff": true with targeted line changes
+2. **For new files only**: Use "isDiff": false with the COMPLETE file content
+3. **If content is too long**: Break into smaller targeted diffs, not truncated full replacements
+4. **Never assume** you can replace a file - always use diff format for existing files
+
+The system will BLOCK file changes that appear truncated (e.g., 500 char replacement for a 5000 char file).
+
 ## CRITICAL JSON SYNTAX RULES
 
 1. **Colons after keys**: "key": value

@@ -23,6 +23,111 @@ export interface ApplyResult {
 const editSnapshots: Map<string, FileSnapshot[]> = new Map();
 const changeSetToEditGroup: Map<string, string> = new Map();
 
+/**
+ * Safety validation result for file changes
+ */
+export interface FileChangeValidation {
+    isValid: boolean;
+    warning?: string;
+    isSuspicious: boolean;
+    details: {
+        existingFileSize: number;
+        newContentSize: number;
+        sizeDifferencePercent: number;
+        looksLikeTruncation: boolean;
+    };
+}
+
+/**
+ * Validates a file change before applying to prevent accidental file corruption.
+ * Detects when AI provides truncated content that would wipe out an existing file.
+ * 
+ * @param fileUri The file being modified
+ * @param newContent The new content to apply
+ * @param isDiff Whether this is a diff (partial change) or full replacement
+ * @returns Validation result with warnings if suspicious
+ */
+export async function validateFileChange(
+    fileUri: vscode.Uri, 
+    newContent: string, 
+    isDiff: boolean = false
+): Promise<FileChangeValidation> {
+    let existingContent = '';
+    let existingFileSize = 0;
+    
+    try {
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        existingContent = doc.getText();
+        existingFileSize = existingContent.length;
+    } catch {
+        // File doesn't exist - no validation needed for new files
+        return {
+            isValid: true,
+            isSuspicious: false,
+            details: {
+                existingFileSize: 0,
+                newContentSize: newContent.length,
+                sizeDifferencePercent: 0,
+                looksLikeTruncation: false
+            }
+        };
+    }
+
+    const newContentSize = newContent.length;
+    const sizeDifference = existingFileSize - newContentSize;
+    const sizeDifferencePercent = existingFileSize > 0 
+        ? (sizeDifference / existingFileSize) * 100 
+        : 0;
+    
+    // Detect suspicious patterns that indicate truncation/corruption
+    const endsAbruptly = newContent.endsWith('...') || 
+        !!newContent.match(/[a-zA-Z_]$/) ||  // Ends mid-word
+        !!newContent.match(/["'`]:\s*["'`]?$/) || // Ends mid-JSON
+        !!newContent.match(/\{\s*$/) ||  // Ends with open brace
+        !!newContent.match(/\[\s*$/); // Ends with open bracket
+    
+    const looksLikeTruncation: boolean = !isDiff && (
+        // New content is much smaller than existing (>70% reduction)
+        (sizeDifferencePercent > 70 && existingFileSize > 500) ||
+        // New content ends abruptly (common truncation signs)
+        endsAbruptly ||
+        // Very short replacement for large file
+        (newContentSize < 200 && existingFileSize > 1000)
+    );
+    
+    // Check if the new content is just the start of the existing file (truncation)
+    const isStartOfExisting: boolean = existingFileSize > 500 && 
+        newContentSize < existingFileSize * 0.3 &&
+        existingContent.startsWith(newContent.trim());
+    
+    const isSuspicious: boolean = looksLikeTruncation || isStartOfExisting;
+    
+    let warning: string | undefined;
+    if (isSuspicious) {
+        if (isStartOfExisting) {
+            warning = `BLOCKED: New content appears to be truncated (only first ${newContentSize} of ${existingFileSize} chars). ` +
+                      `This would corrupt the file. Use isDiff:true for partial edits.`;
+        } else if (sizeDifferencePercent > 70) {
+            warning = `WARNING: Replacing ${existingFileSize} chars with ${newContentSize} chars (${sizeDifferencePercent.toFixed(0)}% reduction). ` +
+                      `This may indicate truncation. Verify this is intentional.`;
+        } else {
+            warning = `WARNING: Content appears truncated or incomplete. Review before applying.`;
+        }
+    }
+    
+    return {
+        isValid: !isStartOfExisting, // Block obvious truncations, warn on others
+        warning,
+        isSuspicious,
+        details: {
+            existingFileSize,
+            newContentSize,
+            sizeDifferencePercent,
+            looksLikeTruncation
+        }
+    };
+}
+
 export async function applyEdits(
     edits: ProposedEdit[], 
     editGroupId: string,
