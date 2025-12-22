@@ -10,11 +10,13 @@ import {
     updateSessionSummary,
     updateSessionUsage,
     updateSessionHandoff,
+    updateSessionTodos,
     listSessions,
     ChatPair,
     ChatRequest,
     ChatResponse,
-    ChatSessionDocument
+    ChatSessionDocument,
+    TodoItem
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -170,6 +172,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'handoff':
                     this._handleHandoff(message.sessionId, message.todos);
+                    break;
+                case 'saveTodos':
+                    this._saveTodos(message.todos);
                     break;
             }
         });
@@ -413,6 +418,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async _saveTodos(todos: Array<{text: string, completed: boolean}>) {
+        if (!this._currentSessionId) {
+            return;
+        }
+        try {
+            const todoItems: TodoItem[] = todos.map(t => ({ text: t.text, completed: t.completed }));
+            await updateSessionTodos(this._currentSessionId, todoItems);
+            debug('Saved todos to session:', this._currentSessionId);
+        } catch (error: any) {
+            logError('Failed to save todos:', error);
+        }
+    }
+
     private async _rewindToChangeSet(changeSetId: string) {
         try {
             const success = await revertToChangeSet(changeSetId);
@@ -506,7 +524,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     type: 'sessionChanged',
                     sessionId: session.id,
                     summary: session.summary,
-                    history: session.pairs
+                    history: session.pairs,
+                    todos: session.todos || []
                 });
                 info('Loaded session:', sessionId);
             }
@@ -557,7 +576,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     this._postMessage({
                         type: 'init',
                         sessionId: session.id,
-                        history: session.pairs
+                        history: session.pairs,
+                        todos: session.todos || []
                     });
                     return;
                 }
@@ -1422,9 +1442,8 @@ pre code{background:none;padding:0}
 .next-steps{margin-top:12px;padding:10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-textLink-foreground)}
 .next-steps-hdr{font-size:11px;font-weight:600;color:var(--vscode-textLink-foreground);margin-bottom:8px}
 .next-steps-btns{display:flex;flex-wrap:wrap;gap:6px}
-.next-step-btn{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:1px solid var(--vscode-panel-border);border-radius:12px;font-size:11px;cursor:pointer;transition:all .15s}
-.next-step-btn:hover{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border-color:var(--vscode-button-background)}
-.next-step-btn::before{content:'→';font-size:10px;opacity:.7}
+.next-step-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:12px;font-size:11px;cursor:pointer;transition:all .15s}
+.next-step-btn:hover{opacity:.85}
 /* Checklists */
 .checklist{list-style:none;display:flex;align-items:flex-start;gap:6px;margin:4px 0}
 .checklist .check-box{color:var(--vscode-descriptionForeground);font-size:14px}
@@ -1493,6 +1512,36 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 .term-body{padding:10px;font-family:var(--vscode-editor-font-family);font-size:11px;color:var(--vscode-foreground);white-space:pre-wrap;max-height:200px;overflow-y:auto}
 .term-run{background:var(--vscode-testing-iconPassed);color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
 .term-run:hover{opacity:.9}
+.term-copy{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.term-copy:hover{opacity:.9}
+.term-copy.copied{background:var(--vscode-testing-iconPassed);color:#fff}
+.actions-summary{margin:12px 0 4px 0;padding:10px 12px;background:var(--vscode-textBlockQuote-background);border:1px solid var(--vscode-panel-border);border-radius:6px}
+.actions-summary.status-done{border-left:3px solid var(--vscode-testing-iconPassed)}
+.actions-summary.status-pending{border-left:3px solid var(--vscode-testing-iconPassed);background:rgba(76,175,80,0.08)}
+.actions-summary.status-input{border-left:3px solid var(--vscode-charts-blue);background:rgba(33,150,243,0.08)}
+.actions-summary-header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:8px}
+.status-badge{font-size:12px;font-weight:600;padding:2px 8px;border-radius:4px}
+.status-done .status-badge{background:var(--vscode-testing-iconPassed);color:#fff}
+.status-pending .status-badge{background:var(--vscode-testing-iconPassed);color:#fff}
+.status-input .status-badge{background:var(--vscode-charts-blue);color:#fff}
+.brief-summary{font-size:11px;color:var(--vscode-foreground);flex:1;min-width:150px}
+.actions-summary-items{display:flex;flex-wrap:wrap;gap:8px}
+.action-item{display:flex;align-items:center;gap:4px;font-size:11px;padding:4px 8px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);border-radius:4px}
+.action-item.pending{background:var(--vscode-testing-iconPassed);color:#fff;font-weight:600}
+.action-item.done{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+.action-item.input-needed{background:var(--vscode-charts-blue);color:#fff;font-weight:600}
+.action-count{font-weight:700}
+.nav-link-container{margin:4px 0 8px 0}
+.nav-link{font-size:11px;color:var(--vscode-textLink-foreground);text-decoration:none;cursor:pointer}
+.nav-link:hover{text-decoration:underline}
+.response-summary{margin:12px 0;padding:10px 12px;background:var(--vscode-textBlockQuote-background);border:1px solid var(--vscode-panel-border);border-left:3px solid var(--vscode-charts-blue);border-radius:6px}
+.response-summary-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.response-summary-title{font-size:12px;font-weight:600;color:var(--vscode-foreground)}
+.response-summary-text{font-size:11px;color:var(--vscode-foreground);line-height:1.4}
+.summary-list{margin:0;padding:0 0 0 16px;font-size:11px;line-height:1.6}
+.summary-list li{margin:2px 0}
+.summary-list .file-item{color:var(--vscode-textLink-foreground);padding-left:8px;list-style:none}
+.summary-list .cmd-item{color:var(--vscode-descriptionForeground);font-family:var(--vscode-editor-font-family);padding-left:8px;list-style:none}
 </style></head><body>
 <div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
@@ -1619,6 +1668,11 @@ function renderTodos(){
     todoCount.classList.toggle('active',!allDone);
     todoCount.textContent=allDone?'✓ Complete':'('+completedCount+'/'+currentTodos.length+')';
     todoList.innerHTML=currentTodos.map((t,i)=>'<div class="todo-item'+(t.completed?' done':'')+'"><span class="check">'+(t.completed?'✓':'○')+'</span>'+esc(t.text)+'</div>').join('');
+    // Save todos to session
+    saveTodosToSession();
+}
+function saveTodosToSession(){
+    if(currentTodos.length>0){vs.postMessage({type:'saveTodos',todos:currentTodos});}
 }
 
 function parseTodosFromStructured(structured){
@@ -1739,7 +1793,10 @@ window.addEventListener('message',e=>{const m=e.data;
 switch(m.type){
 case'init':case'sessionChanged':
 curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=(m.summary||m.sessionId)+'\\n['+m.sessionId.slice(0,6)+']';
-chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}hist.classList.remove('show');scrollToBottom();break;
+chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}
+// Restore TODOs from session
+if(m.todos&&m.todos.length>0){currentTodos=m.todos;renderTodos();}else{currentTodos=[];renderTodos();}
+hist.classList.remove('show');scrollToBottom();break;
 case'historyList':
 hist.innerHTML='';m.sessions.forEach(s=>{const d=document.createElement('div');d.className='hist-item'+(s.id===m.currentSessionId?' active':'');
 const sum=document.createElement('div');sum.className='hist-sum';sum.textContent=s.summary||'New chat';sum.title=s.summary||'';
@@ -1762,13 +1819,13 @@ busy=0;curDiv=null;stream='';updUI();scrollToBottom();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');curDiv.querySelector('.c').innerHTML+='<div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML='<div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div><button class="btn btn-s" style="margin-top:6px" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button>';}busy=0;curDiv=null;stream='';updUI();break;
 case'usageUpdate':updStats(m.usage);break;
-case'commandOutput':showCmdOutput(m.command,m.output,m.isError);break;
+case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSummary('commands',1);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
 // Mark next uncompleted todo as done
 const nextIdx=currentTodos.findIndex(t=>!t.completed);
 if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
-renderTodos();}break;
+renderTodos();updateActionSummary('applies',m.count||1);}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
 case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
 case'fileSearchResults':showAutocomplete(m.files||[]);break;
@@ -1835,17 +1892,76 @@ a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,stor
 else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
 function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;height:120px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px">'+fmtMd(stream.slice(-800))+'</div>');}
-function fmtFinal(t,u,diffPreview){let h=fmtCode(t,diffPreview);const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
+function fmtFinal(t,u,diffPreview){const result=fmtCode(t,diffPreview);let h=result.html;
+// Actions summary for legacy format - enhanced
+const filesApplied=autoApply&&result.fileCount>0;
+const cmdsPending=result.cmdCount>0;
+const needsAction=(!filesApplied&&result.fileCount>0)||cmdsPending;
+let statusEmoji='✅';let statusText='All done';let statusClass='status-done';
+if(needsAction){statusEmoji='⚠️';statusText='Action needed';statusClass='status-pending';}
+h+='<div class="actions-summary '+statusClass+'"><div class="actions-summary-header"><span class="status-badge">'+statusEmoji+' '+statusText+'</span></div><div class="actions-summary-items">';
+if(result.fileCount>0){
+const fileApplied=autoApply;
+const fileClass=fileApplied?'done':'pending';
+const fileText=fileApplied?'✓ '+result.fileCount+' file'+(result.fileCount>1?'s':'')+' applied':'<span class="action-count">'+result.fileCount+'</span> file'+(result.fileCount>1?'s':'')+' to apply';
+h+='<div class="action-item '+fileClass+'" data-action="applies">'+fileText+'</div>';}
+if(result.cmdCount>0){h+='<div class="action-item pending" data-action="commands"><span class="action-count">'+result.cmdCount+'</span> cmd'+(result.cmdCount>1?'s':'')+' to run</div>';}
+if(!result.fileCount&&!result.cmdCount){h+='<div class="action-item done">No actions needed</div>';}
+h+='</div></div>';
+const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+uInfo+'</div>';return h;}
 function fmtFinalStructured(s,u,diffPreview,usedCleanup){
 if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
-let h='';
+const msgId='msg-'+Date.now();
+let h='<div id="'+msgId+'-top"></div>';
+// Add "Go to Actions" link at top if there are actions
+const hasActions=(s.fileChanges&&s.fileChanges.length>0)||(s.commands&&s.commands.length>0);
+if(hasActions){h+='<div class="nav-link-container"><a href="#" class="nav-link" onclick="this.closest(\\'.msg\\').querySelector(\\'.actions-summary\\').scrollIntoView({behavior:\\'smooth\\'});return false;">Go to Actions ↓</a></div>';}
 if(s.summary){h+='<p class="summary">'+esc(s.summary)+'</p>';}
 if(s.sections&&s.sections.length>0){s.sections.forEach(sec=>{h+='<div class="section"><h3>'+esc(sec.heading)+'</h3>';const content=(sec.content||'').replace(/\\\\n/g,'\\n');h+=fmtMd(content);if(sec.codeBlocks&&sec.codeBlocks.length>0){sec.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}h+='</div>';});}
 if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}
 if((!s.sections||s.sections.length===0)&&s.message){const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);}
-if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split(/\\r?\\n/).map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}if(line.startsWith(' ')){return '<span>'+esc(line.substring(1))+'</span>';}return '<span>'+esc(line)+'</span>';}).join('\\n'):esc(fc.content);h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
+if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1&&!autoApply){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}else if(s.fileChanges.length>1&&autoApply){h+='<div class="apply-all" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);cursor:default">✓ Applied All '+s.fileChanges.length+' Files</div>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split(/\\r?\\n/).map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}if(line.startsWith(' ')){return '<span>'+esc(line.substring(1))+'</span>';}return '<span>'+esc(line)+'</span>';}).join('\\n'):esc(fc.content);const applyBtn=autoApply?'<span class="btn" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)">Applied ✓</span>':'<button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button>';h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div>'+applyBtn+'</div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
 if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+esc(cmd.command)+'</div>'+desc+'</div><button class="term-run" onclick="runCmd(\\''+esc(cmd.command).replace(/'/g,"\\\\'")+'\\')" >▶ Run</button></div></div>';});}
 if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
+// Summary section - structured bullet points showing what was done
+const fileCount=s.fileChanges?s.fileChanges.length:0;
+const cmdCount=s.commands?s.commands.length:0;
+if(fileCount>0||cmdCount>0){
+h+='<div class="response-summary"><div class="response-summary-header"><span class="response-summary-title">📝 What was done</span><a href="#" class="nav-link" onclick="this.closest(\\'.msg\\').scrollIntoView({behavior:\\'smooth\\'});return false;">See details ↑</a></div>';
+h+='<ul class="summary-list">';
+if(fileCount>0){
+const appliedText=autoApply?'Applied':'Ready to apply';
+h+='<li><strong>'+appliedText+' '+fileCount+' file'+(fileCount>1?'s':'')+':</strong></li>';
+s.fileChanges.forEach(fc=>{const fname=fc.path.split('/').pop()||fc.path;h+='<li class="file-item">📄 '+esc(fname)+'</li>';});}
+if(cmdCount>0){h+='<li><strong>'+cmdCount+' command'+(cmdCount>1?'s':'')+' to verify:</strong></li>';
+s.commands.slice(0,3).forEach(cmd=>{h+='<li class="cmd-item">$ '+esc(cmd.command.substring(0,50))+(cmd.command.length>50?'...':'')+'</li>';});
+if(cmdCount>3){h+='<li class="cmd-item">...and '+(cmdCount-3)+' more</li>';}}
+h+='</ul></div>';}
+// Actions summary
+h+='<div id="'+msgId+'-actions"></div>';
+// Detect if AI is asking a question
+const msgText=(s.message||s.summary||'').toLowerCase();
+const isQuestion=msgText.includes('would you like')||msgText.includes('do you want')||msgText.includes('should i')||msgText.includes('can you provide')||msgText.includes('please let me know')||msgText.includes('let me know');
+// Determine status based on pending actions
+const filesApplied=autoApply&&fileCount>0;
+const filesPending=!autoApply&&fileCount>0;
+const cmdsPending=cmdCount>0;
+// Build specific status message
+let statusEmoji='✅';let statusText='All done';let statusClass='status-done';
+if(isQuestion){statusEmoji='❓';statusText='Your input needed';statusClass='status-input';}
+else if(filesPending&&cmdsPending){statusEmoji='⚠️';statusText=fileCount+' file'+(fileCount>1?'s':'')+' + '+cmdCount+' cmd'+(cmdCount>1?'s':'')+' to run';statusClass='status-pending';}
+else if(filesPending){statusEmoji='⚠️';statusText=fileCount+' file'+(fileCount>1?'s':'')+' to apply';statusClass='status-pending';}
+else if(cmdsPending){statusEmoji='⚠️';statusText=cmdCount+' command'+(cmdCount>1?'s':'')+' to run';statusClass='status-pending';}
+// Show actions summary
+h+='<div class="actions-summary '+statusClass+'"><div class="actions-summary-header"><span class="status-badge">'+statusEmoji+' '+statusText+'</span></div><div class="actions-summary-items">';
+if(fileCount>0){
+const fileClass=filesApplied?'done':'pending';
+const fileText=filesApplied?'✓ '+fileCount+' file'+(fileCount>1?'s':'')+' applied':'<span class="action-count">'+fileCount+'</span> file'+(fileCount>1?'s':'')+' to apply';
+h+='<div class="action-item '+fileClass+'" data-action="applies">'+fileText+'</div>';}
+if(cmdCount>0){h+='<div class="action-item pending" data-action="commands"><span class="action-count">'+cmdCount+'</span> cmd'+(cmdCount>1?'s':'')+' to run</div>';}
+if(isQuestion){h+='<div class="action-item input-needed">❓ Reply needed</div>';}
+if(!fileCount&&!cmdCount&&!isQuestion){h+='<div class="action-item done">✓ Nothing to do</div>';}
+h+='</div></div>';
 const uInfo=u?'<span style="margin-left:auto;font-size:10px;color:var(--vscode-descriptionForeground)">'+u.totalTokens.toLocaleString()+' tokens</span>':'';
 const cleanupInfo=usedCleanup?'<span style="margin-left:8px;font-size:10px;color:var(--vscode-charts-yellow)" title="JSON was fixed by cleanup pass">🔧</span>':'';
 h+='<div class="done"><span style="color:var(--vscode-testing-iconPassed);font-size:12px">✓</span><span class="done-txt">Done</span>'+cleanupInfo+uInfo+'</div>';return h;}
@@ -1859,7 +1975,11 @@ fileBlocks.forEach(b=>{
 const stats=previewMap[b.file]||{added:0,removed:0,modified:0};
 const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');
 const diffHtml='<div class="diff"><div class="diff-h"><span>📄 '+esc(b.file)+'</span><div class="diff-stats">'+statsHtml+'</div><button class="btn btn-ok" onclick="applyFile(\\''+esc(b.file)+'\\')">Apply</button></div><div class="diff-c"><pre><code>'+esc(b.code)+'</code></pre></div></div>';out=out.replace(b.full,diffHtml);});
-return fmtMd(out);}
+// Count terminal commands in original text
+const cmdBt=String.fromCharCode(96);
+const cmdMatches=t.match(new RegExp('🖥️\\\\s*'+cmdBt+'[^'+cmdBt+']+'+cmdBt,'g'));
+const cmdCount=cmdMatches?cmdMatches.length:0;
+return {html:fmtMd(out),fileCount:fileBlocks.length,cmdCount:cmdCount};}
 function fmtMd(t){const bt=String.fromCharCode(96);
 // Store code blocks to protect from other transformations
 const codeBlocks=[];
@@ -1882,7 +2002,7 @@ t=t.replace(new RegExp(bt+'([^'+bt+'\\\\n]+)'+bt,'g'),function(m,code){
 t=t.replace(/🖥️\\s*%%INLINE(\\d+)%%/g,function(m,idx){
     const code=inlineCodes[parseInt(idx)-1]||'';
     const cmd=code.replace(/<\\/?code>/g,'');
-    return '<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+cmd+'</div></div><button class="term-run" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div>';
+    return '<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+cmd+'</div></div><button class="term-copy" onclick="copyCmd(this,\\''+cmd.replace(/'/g,"\\\\'")+'\\')">📋 Copy</button><button class="term-run" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div>';
 });
 // Markdown tables - greedy match for rows to capture full line
 t=t.replace(/^\\|(.+)\\|\\s*\\n\\|[-:|\\s]+\\|\\s*\\n((?:\\|.+\\|\\s*\\n?)+)/gm,function(m,header,body){
@@ -1925,6 +2045,18 @@ function escCode(t){const d=document.createElement('div');d.textContent=(t||'').
 function applyFile(f){vs.postMessage({type:'applyEdits',editId:f});}
 function applyAll(){vs.postMessage({type:'applyEdits',editId:'all'});}
 function runCmd(c){vs.postMessage({type:'runCommand',command:c});}
+function copyCmd(btn,c){navigator.clipboard.writeText(c).then(()=>{btn.textContent='✓ Copied';btn.classList.add('copied');setTimeout(()=>{btn.textContent='📋 Copy';btn.classList.remove('copied');},2000);});}
+function scrollToEl(id){const el=document.getElementById(id);if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}}
+function updateActionSummary(actionType,count){
+// Find all action summaries and update the relevant counts
+const items=document.querySelectorAll('.action-item[data-action="'+actionType+'"]');
+items.forEach(item=>{
+const countEl=item.querySelector('.action-count');
+if(countEl){
+let current=parseInt(countEl.textContent)||0;
+current=Math.max(0,current-count);
+if(current===0){item.classList.remove('pending');item.classList.add('done');item.innerHTML='✓ '+actionType.charAt(0).toUpperCase()+actionType.slice(1)+' complete';}
+else{countEl.textContent=current;}}});}
 function sendNextStep(step){msg.value=step;doSend();}
 document.addEventListener('click',e=>{
     const btn=e.target.closest('.next-step-btn');

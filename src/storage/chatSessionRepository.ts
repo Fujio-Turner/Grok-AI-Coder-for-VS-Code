@@ -80,6 +80,11 @@ export interface StepTrackerEntry {
     callCount: number;     // Number of times this step was invoked
 }
 
+export interface TodoItem {
+    text: string;
+    completed: boolean;
+}
+
 export interface ChatSessionDocument {
     id: string;
     docType: 'chat';
@@ -93,6 +98,7 @@ export interface ChatSessionDocument {
     tokensOut: number; // Total output/completion tokens
     pairs: ChatPair[];
     stepTracker: StepTrackerEntry[];  // Cumulative stats per step type
+    todos?: TodoItem[];  // TODOs extracted from AI responses
     handoffText?: string;  // Summary for handoff to new session
     handoffToSessionId?: string;  // ID of the session this was handed off to
     parentSessionId?: string;  // ID of parent session (for handoff sessions)
@@ -265,6 +271,28 @@ export async function updateSessionSummary(sessionId: string, summary: string): 
     }
     
     console.log('Updated summary for session:', sessionId);
+}
+
+/**
+ * Update session TODOs
+ */
+export async function updateSessionTodos(sessionId: string, todos: TodoItem[]): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    doc.todos = todos;
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update session todos');
+    }
 }
 
 /**
