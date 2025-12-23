@@ -10,6 +10,15 @@ import { safeParseJson, isHttpError } from './jsonHelper';
 import { validateResponse, GrokStructuredResponse } from './responseSchema';
 import { debug, info, error as logError } from '../utils/logger';
 import { extractToonContent, fromToon, looksLikeToon } from '../utils/toonConverter';
+import * as vscode from 'vscode';
+
+/**
+ * Get the current response format setting
+ */
+function getResponseFormat(): string {
+    const config = vscode.workspace.getConfiguration('grok');
+    return config.get<string>('responseFormat') || 'json';
+}
 
 const JSON_CLEANUP_PROMPT = `You are a JSON repair assistant. Your ONLY job is to fix malformed JSON and return valid JSON.
 
@@ -22,12 +31,17 @@ Common issues to fix:
 4. Unclosed strings, objects, or arrays
 5. Trailing commas before } or ]
 6. Empty keys "" that should be "heading", "content", "text", "message", or "sections"
+7. Double opening braces {{ -> {
+8. Missing array brackets for sections: "sections":heading": -> "sections": [{"heading":
+9. Missing [{ after array keys: "sections": "heading": -> "sections": [{"heading":
+10. Sections/todos/fileChanges MUST be arrays: "sections": [{"heading":...}]
 
 CRITICAL RULES:
 - Return ONLY valid JSON, nothing else
 - Start with { and end with }
 - Preserve all the data - don't remove content
-- If the structure has sections with heading/content, keep that structure
+- If the structure has sections with heading/content, keep that structure as an ARRAY of objects
+- sections, todos, fileChanges, commands, nextSteps, codeBlocks are ALL arrays
 - Ensure all arrays and objects are properly closed
 
 Return ONLY the fixed JSON, no explanation.`;
@@ -286,8 +300,9 @@ export async function parseWithCleanup(
         return { structured: null, usedCleanup: false };
     }
 
-    // Check if this is a TOON response first
-    if (looksLikeToon(responseText)) {
+    // Check if this is a TOON response first (only if responseFormat is 'toon')
+    const responseFormat = getResponseFormat();
+    if (responseFormat === 'toon' && looksLikeToon(responseText)) {
         debug('Detected TOON format, attempting TOON parsing...');
         
         // Try local TOON parsing first

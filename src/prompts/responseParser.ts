@@ -15,6 +15,15 @@ import {
 import { safeParseJson, isHttpError, looksLikeJson } from './jsonHelper';
 import { debug } from '../utils/logger';
 import { looksLikeToon, fromToon, extractToonContent } from '../utils/toonConverter';
+import * as vscode from 'vscode';
+
+/**
+ * Get the current response format setting
+ */
+function getResponseFormat(): string {
+    const config = vscode.workspace.getConfiguration('grok');
+    return config.get<string>('responseFormat') || 'json';
+}
 
 export { GrokStructuredResponse } from './responseSchema';
 
@@ -45,8 +54,9 @@ export function parseGrokResponse(responseText: string): ParseResult {
         };
     }
     
-    // Check if response is in TOON format first
-    if (looksLikeToon(trimmed)) {
+    // Check if response is in TOON format first (only if responseFormat is 'toon')
+    const responseFormat = getResponseFormat();
+    if (responseFormat === 'toon' && looksLikeToon(trimmed)) {
         debug('Response appears to be TOON format, attempting to parse');
         try {
             // Extract TOON content from markdown fences if present

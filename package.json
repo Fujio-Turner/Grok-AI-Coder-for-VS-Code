@@ -3,7 +3,7 @@
   "displayName": "Grok AI Coder",
   "description": "AI-powered coding assistant with xAI's Grok models, persistent chat history, and full change tracking with rollback",
 
-  "version": "1.0.7",
+  "version": "1.0.9",
 
   "publisher": "fujio-turner",
   "author": {
@@ -303,19 +303,33 @@
           "description": "Timeout in seconds for Grok API requests (5 minutes default for complex responses)",
           "order": 26
         },
-        "grok.optimizePayload": {
+        "grok.requestFormat": {
           "type": "string",
-          "default": "none",
+          "default": "json",
           "enum": [
-            "none",
+            "json",
             "toon"
           ],
           "enumDescriptions": [
-            "None - Send messages as standard JSON (default)",
+            "JSON - Send messages as standard JSON (default)",
             "TOON - Use Token-Oriented Object Notation to reduce token usage by 30-60%"
           ],
-          "description": "Payload optimization format for API requests",
+          "description": "Format for API request payloads",
           "order": 27
+        },
+        "grok.responseFormat": {
+          "type": "string",
+          "default": "json",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "enumDescriptions": [
+            "JSON - AI responds with structured JSON (reliable parsing)",
+            "TOON - AI responds with TOON format (fewer tokens, less reliable)"
+          ],
+          "description": "Format for AI responses",
+          "order": 28
         }
       }
     },

@@ -8,11 +8,11 @@ import { RESPONSE_JSON_SCHEMA } from './responseSchema';
 import { getToonOutputPrompt, getToonSystemPromptAddition } from '../utils/toonConverter';
 
 /**
- * Get the current payload optimization setting
+ * Get the current response format setting
  */
-function getOptimizePayload(): string {
+function getResponseFormat(): string {
     const config = vscode.workspace.getConfiguration('grok');
-    return config.get<string>('optimizePayload') || 'none';
+    return config.get<string>('responseFormat') || 'json';
 }
 
 export const SYSTEM_PROMPT_BASE = `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
@@ -162,6 +162,36 @@ If a "Current Plan" with numbered steps is provided in the user message:
 
 The user sees your todos as a checklist, so make them actionable and clear.
 
+## FILE ATTACHMENT FEATURE
+
+Users can attach files using backtick autocomplete:
+- Type \`filename (backtick + partial name) to search workspace files
+- Example: \`index.html or \`style.css
+- Selected files are automatically loaded and included in the message
+
+**WHEN YOU NEED FILE CONTENT TO MAKE CHANGES:**
+
+If you want to modify a file but it wasn't provided:
+1. DO NOT output generic sample code without file paths
+2. Instead, ask the user to attach the specific file(s) using the backtick feature
+3. Add a nextSteps entry like: "Attach \`templates/index.html\` using backtick autocomplete"
+4. Explain what you'll do once you have the file content
+
+Example response when file is needed:
+{
+  "summary": "I can fix the hamburger menu, but need the actual file content first.",
+  "sections": [{"heading": "What I'll Do", "content": "Once you share the file, I'll provide a diff with the exact CSS fixes for the dropdown menu."}],
+  "nextSteps": ["Type \`index.html to attach the HTML file", "Type \`style.css to attach the CSS file", "I'll then provide Apply-ready changes"]
+}
+
+**WHEN FILE CONTENT IS PROVIDED:**
+
+When files ARE attached (shown as "📄 filename:" in user message):
+1. Use the EXACT content to create targeted diffs
+2. Output fileChanges with the correct path from the attachment
+3. Include proper context lines from the actual file
+4. The user will see an "Apply" button for each file change
+
 ## REMEMBER
 
 - Start with { and end with }
@@ -170,15 +200,16 @@ The user sees your todos as a checklist, so make them actionable and clear.
 - NO markdown anywhere - we render it ourselves
 - Keep content as plain text
 - Review and refine any provided plan/todos
+- Guide users to attach files using \`filename autocomplete when you need file content
 `;
 
 /**
  * Get the appropriate system prompt based on optimization settings
  */
 export function getSystemPrompt(): string {
-    const optimizePayload = getOptimizePayload();
+    const responseFormat = getResponseFormat();
     
-    if (optimizePayload === 'toon') {
+    if (responseFormat === 'toon') {
         // Replace JSON output instructions with TOON output instructions
         return `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
 ${getToonOutputPrompt()}
@@ -193,6 +224,17 @@ If a "Current Plan" with numbered steps is provided in the user message:
 5. Reorder if the sequence should change
 
 The user sees your todos as a checklist, so make them actionable and clear.
+
+## FILE ATTACHMENT FEATURE
+
+Users can attach files using backtick autocomplete:
+- Type \`filename (backtick + partial name) to search workspace files
+- Selected files are automatically loaded and included in the message
+
+If you need file content to make changes:
+1. Ask the user to attach files using the backtick feature
+2. Add a nextSteps entry like: "Type \`index.html to attach the file"
+3. Once files are attached, provide exact fileChanges with Apply buttons
 `;
     }
     
@@ -209,11 +251,43 @@ export function buildSystemPrompt(workspaceInfo?: WorkspaceInfo): string {
     let prompt = getSystemPrompt();
 
     if (workspaceInfo) {
-        prompt += `\n\nWORKSPACE CONTEXT:
-- Project: ${workspaceInfo.projectName || 'Unknown'}
-- Root: ${workspaceInfo.rootPath || 'Unknown'}
-- Open file: ${workspaceInfo.activeFile || 'None'}
+        prompt += `\n\n## WORKSPACE CONTEXT
+
+**Project:** ${workspaceInfo.projectName || 'Unknown'}
+**Root:** ${workspaceInfo.rootPath || 'Unknown'}
+**Open file:** ${workspaceInfo.activeFile || 'None'}
+**Cursor line:** ${workspaceInfo.cursorLine || 'N/A'}
+**Git branch:** ${workspaceInfo.gitBranch || 'N/A'}
 `;
+
+        // Add selected text if present
+        if (workspaceInfo.selectedText) {
+            const truncatedSelection = workspaceInfo.selectedText.length > 500 
+                ? workspaceInfo.selectedText.substring(0, 500) + '...(truncated)'
+                : workspaceInfo.selectedText;
+            prompt += `\n**Selected text:**\n\`\`\`\n${truncatedSelection}\n\`\`\`\n`;
+        }
+
+        // Add dependencies if present
+        if (workspaceInfo.dependencies?.length) {
+            prompt += `\n**Dependencies:** ${workspaceInfo.dependencies.join(', ')}\n`;
+        }
+        if (workspaceInfo.devDependencies?.length) {
+            prompt += `**Dev Dependencies:** ${workspaceInfo.devDependencies.join(', ')}\n`;
+        }
+
+        // Add diagnostics if present
+        if (workspaceInfo.diagnostics?.length) {
+            prompt += `\n**Current file diagnostics:**\n`;
+            for (const d of workspaceInfo.diagnostics) {
+                prompt += `- [${d.severity.toUpperCase()}] Line ${d.line}: ${d.message}\n`;
+            }
+        }
+
+        // Add AGENT.md content if found
+        if (workspaceInfo.agentMdContent) {
+            prompt += `\n## PROJECT AGENT INSTRUCTIONS (from AGENT.md/AGENTS.md)\n\n${workspaceInfo.agentMdContent}\n`;
+        }
     }
 
     return prompt;
@@ -223,19 +297,134 @@ export interface WorkspaceInfo {
     projectName?: string;
     rootPath?: string;
     activeFile?: string;
+    selectedText?: string;
+    cursorLine?: number;
+    gitBranch?: string;
+    dependencies?: string[];
+    devDependencies?: string[];
+    diagnostics?: DiagnosticInfo[];
+    agentMdContent?: string;
+}
+
+export interface DiagnosticInfo {
+    file: string;
+    line: number;
+    severity: string;
+    message: string;
 }
 
 /**
- * Gets current workspace information.
+ * Gets current workspace information including enhanced context.
  */
-export function getWorkspaceInfo(): WorkspaceInfo {
-    const vscode = require('vscode');
+export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const activeEditor = vscode.window.activeTextEditor;
+    const rootPath = workspaceFolders?.[0]?.uri.fsPath;
 
-    return {
+    const info: WorkspaceInfo = {
         projectName: workspaceFolders?.[0]?.name,
-        rootPath: workspaceFolders?.[0]?.uri.fsPath,
+        rootPath: rootPath,
         activeFile: activeEditor?.document.uri.fsPath
     };
+
+    // Get selected text and cursor position
+    if (activeEditor) {
+        const selection = activeEditor.selection;
+        if (!selection.isEmpty) {
+            info.selectedText = activeEditor.document.getText(selection);
+        }
+        info.cursorLine = selection.active.line + 1; // 1-indexed
+    }
+
+    // Get git branch
+    if (rootPath) {
+        info.gitBranch = await getGitBranch(rootPath);
+    }
+
+    // Get dependencies from package.json
+    if (rootPath) {
+        const deps = await getPackageDependencies(rootPath);
+        info.dependencies = deps.dependencies;
+        info.devDependencies = deps.devDependencies;
+    }
+
+    // Get diagnostics for active file
+    if (activeEditor) {
+        info.diagnostics = getDiagnosticsForFile(activeEditor.document.uri);
+    }
+
+    // Get AGENT.md or AGENTS.md content
+    if (rootPath) {
+        info.agentMdContent = await getAgentMdContent(rootPath);
+    }
+
+    return info;
+}
+
+/**
+ * Gets the current git branch name.
+ */
+async function getGitBranch(rootPath: string): Promise<string | undefined> {
+    try {
+        const { exec } = require('child_process');
+        const { promisify } = require('util');
+        const execAsync = promisify(exec);
+        const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: rootPath });
+        return stdout.trim();
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Gets dependencies from package.json.
+ */
+async function getPackageDependencies(rootPath: string): Promise<{ dependencies?: string[], devDependencies?: string[] }> {
+    try {
+        const packageJsonPath = vscode.Uri.file(`${rootPath}/package.json`);
+        const content = await vscode.workspace.fs.readFile(packageJsonPath);
+        const packageJson = JSON.parse(Buffer.from(content).toString('utf8'));
+        return {
+            dependencies: packageJson.dependencies ? Object.keys(packageJson.dependencies) : undefined,
+            devDependencies: packageJson.devDependencies ? Object.keys(packageJson.devDependencies) : undefined
+        };
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * Gets diagnostics (errors/warnings) for a file.
+ */
+function getDiagnosticsForFile(uri: vscode.Uri): DiagnosticInfo[] {
+    const diagnostics = vscode.languages.getDiagnostics(uri);
+    return diagnostics
+        .filter(d => d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning)
+        .slice(0, 10) // Limit to 10 diagnostics
+        .map(d => ({
+            file: uri.fsPath,
+            line: d.range.start.line + 1,
+            severity: d.severity === vscode.DiagnosticSeverity.Error ? 'error' : 'warning',
+            message: d.message
+        }));
+}
+
+/**
+ * Finds and reads AGENT.md or AGENTS.md file (case-insensitive).
+ */
+async function getAgentMdContent(rootPath: string): Promise<string | undefined> {
+    const possibleNames = ['AGENT.md', 'AGENTS.md', 'agent.md', 'agents.md', 'Agent.md', 'Agents.md'];
+    
+    for (const name of possibleNames) {
+        try {
+            const filePath = vscode.Uri.file(`${rootPath}/${name}`);
+            const content = await vscode.workspace.fs.readFile(filePath);
+            const text = Buffer.from(content).toString('utf8');
+            // Limit to first 2000 chars to avoid token bloat
+            return text.length > 2000 ? text.substring(0, 2000) + '\n...(truncated)' : text;
+        } catch {
+            // File doesn't exist, try next
+        }
+    }
+    return undefined;
 }

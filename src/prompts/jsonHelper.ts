@@ -96,6 +96,34 @@ export function repairJson(jsonString: string): string {
     
     debug('Attempting JSON repair on:', jsonString.substring(0, 100) + '...');
     
+    // FIX 0: Remove duplicate opening braces {{ -> {
+    // AI sometimes starts with double braces
+    repaired = repaired.replace(/^\s*\{\s*\{/, '{');
+    
+    // FIX 0a: Fix missing colon after key before array/object: "sections" [ -> "sections": [
+    // Common AI error where colon is omitted before [ or {
+    repaired = repaired.replace(/"(sections|todos|fileChanges|commands|nextSteps|codeBlocks|lineRange)"\s*(\[|\{)/gi, '"$1": $2');
+    
+    // FIX 0b: Fix word concatenated with array key: "improvementssections":[ -> "improvements", "sections": [
+    // AI sometimes omits ", " between value end and next key
+    repaired = repaired.replace(/([a-z])(sections|todos|fileChanges|commands|nextSteps|codeBlocks)"\s*:\s*\[/gi, '$1", "$2": [');
+    
+    // FIX 0b2: Fix missing array bracket after sections: "sections":heading" -> "sections": [{"heading"
+    // AI sometimes omits [{ between "sections": and "heading"
+    // Handles: "sections":heading": or "sections": heading": or "sections":"heading":
+    repaired = repaired.replace(/"sections"\s*:\s*"?heading"\s*:\s*/gi, '"sections": [{"heading": ');
+    
+    // FIX 0c: Fix missing opening [{ for array keys followed by object content
+    // Pattern: "sections": "heading": -> "sections": [{"heading":
+    repaired = repaired.replace(/"(sections|todos|fileChanges|commands|codeBlocks)"\s*:\s*"(heading|text|path|command|language)"\s*:/gi, '"$1": [{"$2":');
+    
+    // FIX 0d: Fix missing opening quote on value after key: "summary\":value -> "summary": "value
+    // AI sometimes outputs "key\":value instead of "key": "value"
+    repaired = repaired.replace(/"(summary|heading|content|text|message|path|command|description)"\\?:([A-Za-z])/gi, '"$1": "$2');
+    
+    // FIX 0e: Fix missing colon with space: "content "value -> "content": "value
+    repaired = repaired.replace(/"(summary|heading|content|text|message|path|command|description)"\s+"([^"]*?)"/gi, '"$1": "$2"');
+    
     // FIRST: Fix unclosed key followed by quoted value: "heading "value" -> "heading": "value"
     // Must run before empty key fixes so we can properly detect section structure
     repaired = repaired.replace(/"(text|message|path|command|description|content|heading)\s+"([^"]*?)"/gi, '"$1": "$2"');

@@ -54,11 +54,11 @@ export async function sendChatCompletion(
     const config = vscode.workspace.getConfiguration('grok');
     const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
     const timeoutSeconds = config.get<number>('apiTimeout') || 300;
-    const optimizePayload = config.get<string>('optimizePayload') || 'none';
+    const requestFormat = config.get<string>('requestFormat') || 'json';
 
-    // Apply TOON optimization if enabled
+    // Apply TOON optimization for requests if enabled
     let optimizedMessages = messages;
-    if (optimizePayload === 'toon') {
+    if (requestFormat === 'toon') {
         optimizedMessages = messages.map(msg => {
             if (msg.role === 'system') {
                 // Add TOON understanding to system prompt
@@ -77,7 +77,7 @@ export async function sendChatCompletion(
         streaming: !!onChunk,
         baseUrl,
         timeoutSeconds,
-        optimizePayload
+        requestFormat
     });
 
     const startTime = Date.now();
