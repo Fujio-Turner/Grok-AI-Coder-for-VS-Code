@@ -885,6 +885,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 usedCleanup
             });
 
+            // Filter out empty commands (command field must be non-empty)
+            const validCommands = structured.commands?.filter(
+                (cmd: { command?: string }) => cmd.command && cmd.command.trim().length > 0
+            );
+
             const successResponse: ChatResponse = {
                 text: grokResponse.text,
                 timestamp: new Date().toISOString(),
@@ -896,7 +901,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     sections: structured.sections,
                     todos: structured.todos,
                     fileChanges: structured.fileChanges,
-                    commands: structured.commands,
+                    commands: validCommands,
                     codeBlocks: structured.codeBlocks,
                     nextSteps: structured.nextSteps
                 }
@@ -1047,7 +1052,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     sections: structured.sections || [],
                     codeBlocks: structured.codeBlocks || [],
                     fileChanges: structured.fileChanges || [],
-                    commands: structured.commands || [],
+                    commands: validCommands || [],
                     nextSteps: structured.nextSteps || []
                 }
             });

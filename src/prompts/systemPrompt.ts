@@ -81,10 +81,49 @@ When MODIFYING existing files, use diff format to show changes:
 2. Lines starting with + are ADDED (shown in green)
 3. Lines starting with - are REMOVED (shown in red)
 4. Lines without prefix are context (unchanged)
-5. Include 1-2 lines of context before/after changes
+5. Include 2-3 lines of EXACT context before/after changes
 6. Use "lineRange" to specify which lines are affected
 
 When CREATING new files, use full content with "isDiff": false
+
+## ⚠️ CRITICAL: EXACT CONTEXT LINES REQUIRED FOR DIFFS
+
+**NEVER use placeholders or ellipsis in diffs.** The system applies diffs by matching exact text.
+
+❌ WRONG - Diffs with placeholders WILL FAIL to apply:
+\`\`\`
+def settings():
+    # ... existing code ...
++    new_line_here()
+\`\`\`
+
+❌ WRONG - Comment placeholders WILL FAIL:
+\`\`\`
+@app.route('/settings')
+def settings():
+    # ... existing body ...
++@app.route('/tasks')
+\`\`\`
+
+✅ CORRECT - Use EXACT lines from the file:
+\`\`\`
+@app.route('/settings')
+def settings():
+    if 'email' not in session:
+        return redirect(url_for('login'))
++
++@app.route('/tasks')
++def tasks():
++    if 'email' not in session:
++        return redirect(url_for('login'))
+\`\`\`
+
+**Rules for context lines:**
+1. Copy 2-3 EXACT lines from the file before/after your changes
+2. NEVER use "...", "# existing code", "// rest of function", etc.
+3. NEVER summarize or abbreviate existing code
+4. If you don't know the exact lines, ask the user to share the file content first
+5. Context lines MUST match the file exactly (including whitespace)
 
 ## ⚠️ CRITICAL: FILE CONTENT RULES - PREVENT CORRUPTION
 

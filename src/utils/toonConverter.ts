@@ -218,10 +218,10 @@ sections:
           print('hello')
         caption: Example
 todos:
-  fields: text, completed
-  rows: 2
-  "Step one description" false
-  "Step two description" false
+  - text: "Step one description"
+    completed: false
+  - text: "Step two description"
+    completed: false
 fileChanges:
   - path: src/file.py
     language: python
@@ -245,7 +245,7 @@ nextSteps:
 |-------|----------|-------------|
 | summary | YES | Brief 1-2 sentence summary |
 | sections | no | Array with heading, content, optional codeBlocks |
-| todos | no | Use tabular format: fields: text, completed |
+| todos | no | Array of {text, completed} objects |
 | fileChanges | no | Files to create/modify |
 | commands | no | Terminal commands to run |
 | nextSteps | no | Follow-up suggestions |
@@ -280,6 +280,45 @@ fileChanges:
       +    result = a + b
       +    return result
 \`\`\`
+
+## ⚠️ CRITICAL: EXACT CONTEXT LINES REQUIRED FOR DIFFS
+
+**NEVER use placeholders or ellipsis in diffs.** The system applies diffs by matching exact text.
+
+❌ WRONG - Diffs with placeholders WILL FAIL to apply:
+\`\`\`
+def settings():
+    # ... existing code ...
++    new_line_here()
+\`\`\`
+
+❌ WRONG - Comment placeholders WILL FAIL:
+\`\`\`
+@app.route('/settings')
+def settings():
+    # ... existing body ...
++@app.route('/tasks')
+\`\`\`
+
+✅ CORRECT - Use EXACT lines from the file:
+\`\`\`
+@app.route('/settings')
+def settings():
+    if 'email' not in session:
+        return redirect(url_for('login'))
++
++@app.route('/tasks')
++def tasks():
++    if 'email' not in session:
++        return redirect(url_for('login'))
+\`\`\`
+
+**Rules for context lines:**
+1. Copy 2-3 EXACT lines from the file before/after your changes
+2. NEVER use "...", "# existing code", "// rest of function", etc.
+3. NEVER summarize or abbreviate existing code
+4. If you don't know the exact lines, ask the user to share the file content first
+5. Context lines MUST match the file exactly (including whitespace)
 
 CRITICAL: Start your response directly with TOON content (summary: ...). No markdown fences around the entire response.
 `;
