@@ -9,14 +9,21 @@ import {
     updateLastPairResponse,
     updateSessionSummary,
     updateSessionUsage,
+    updateSessionModelUsage,
     updateSessionHandoff,
     updateSessionTodos,
+    updateSessionChangeHistory,
+    getSessionChangeHistory,
+    appendSessionBug,
     listSessions,
     ChatPair,
     ChatRequest,
     ChatResponse,
     ChatSessionDocument,
-    TodoItem
+    TodoItem,
+    ChangeHistoryData,
+    BugType,
+    BugReporter
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -58,7 +65,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const tracker = getChangeTracker();
         tracker.onChange((changes, position) => {
             this._sendChangesUpdate(changes, position);
+            this._persistChangeHistory();
         });
+    }
+
+    private async _persistChangeHistory() {
+        if (!this._currentSessionId) return;
+        
+        try {
+            const tracker = getChangeTracker();
+            const serializable = tracker.toSerializable() as ChangeHistoryData;
+            await updateSessionChangeHistory(this._currentSessionId, serializable);
+            debug('Persisted change history for session:', this._currentSessionId);
+        } catch (error) {
+            logError('Failed to persist change history:', error);
+        }
+    }
+
+    private async _restoreChangeHistory(sessionId: string) {
+        try {
+            const changeHistory = await getSessionChangeHistory(sessionId);
+            if (changeHistory) {
+                const tracker = getChangeTracker();
+                tracker.fromSerializable(changeHistory);
+                debug(`Restored change history for session: ${sessionId} - entries: ${changeHistory.history.length}`);
+            } else {
+                const tracker = getChangeTracker();
+                tracker.clear();
+                debug('No change history found for session, starting fresh:', sessionId);
+            }
+        } catch (error) {
+            logError('Failed to restore change history:', error);
+        }
     }
 
     public getCurrentSessionId(): string | undefined {
@@ -129,7 +167,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     await this.runTerminalCommand(message.command);
                     break;
                 case 'openSettings':
-                    vscode.commands.executeCommand('workbench.action.openSettings', 'grok');
+                    this._sendFullConfig();
+                    break;
+                case 'saveSettings':
+                    this._saveSettings(message.settings);
                     break;
                 case 'ready':
                     await this._initializeSession();
@@ -179,6 +220,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'saveTodos':
                     this._saveTodos(message.todos);
                     break;
+                case 'fetchChartData':
+                    this._fetchChartData(message.timeRange);
+                    break;
+                case 'reportBug':
+                    this._reportBug(message.pairIndex, message.bugType, message.description, message.by);
+                    break;
             }
         });
     }
@@ -211,6 +258,241 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    private async _sendFullConfig() {
+        const config = vscode.workspace.getConfiguration('grok');
+        const apiKey = await this._context.secrets.get('grokApiKey');
+        
+        this._postMessage({
+            type: 'fullConfig',
+            settings: {
+                // Database (Couchbase)
+                couchbaseDeployment: config.get<string>('couchbaseDeployment', 'self-hosted'),
+                couchbaseUrl: config.get<string>('couchbaseUrl', 'http://localhost'),
+                capellaDataApiUrl: config.get<string>('capellaDataApiUrl', ''),
+                couchbasePort: config.get<number>('couchbasePort', 8091),
+                couchbaseQueryPort: config.get<number>('couchbaseQueryPort', 8093),
+                couchbaseUsername: config.get<string>('couchbaseUsername', 'Administrator'),
+                couchbasePassword: config.get<string>('couchbasePassword', 'password'),
+                couchbaseBucket: config.get<string>('couchbaseBucket', 'grokCoder'),
+                couchbaseScope: config.get<string>('couchbaseScope', '_default'),
+                couchbaseCollection: config.get<string>('couchbaseCollection', '_default'),
+                couchbaseTimeout: config.get<number>('couchbaseTimeout', 30),
+                
+                // Models
+                apiBaseUrl: config.get<string>('apiBaseUrl', 'https://api.x.ai/v1'),
+                apiKey: apiKey ? '••••••••' + apiKey.slice(-4) : '',
+                hasApiKey: !!apiKey,
+                modelFast: config.get<string>('modelFast', 'grok-3-mini'),
+                modelReasoning: config.get<string>('modelReasoning', 'grok-4'),
+                modelVision: config.get<string>('modelVision', 'grok-4'),
+                modelBase: config.get<string>('modelBase', 'grok-3'),
+                modelMode: config.get<string>('modelMode', 'fast'),
+                apiTimeout: config.get<number>('apiTimeout', 300),
+                
+                // Chat
+                enterToSend: config.get<boolean>('enterToSend', false),
+                autoApply: config.get<boolean>('autoApply', true),
+                maxPayloadSizeMB: config.get<number>('maxPayloadSizeMB', 15),
+                
+                // Optimize
+                requestFormat: config.get<string>('requestFormat', 'json'),
+                responseFormat: config.get<string>('responseFormat', 'json'),
+                jsonCleanup: config.get<string>('jsonCleanup', 'auto'),
+                
+                // Debug
+                debug: config.get<boolean>('debug', false),
+                enableSound: config.get<boolean>('enableSound', false)
+            }
+        });
+    }
+
+    private async _saveSettings(settings: Record<string, any>) {
+        const config = vscode.workspace.getConfiguration('grok');
+        
+        try {
+            // Handle API key separately (stored in secrets)
+            if (settings.apiKey && !settings.apiKey.startsWith('••••')) {
+                await this._context.secrets.store('grokApiKey', settings.apiKey);
+                info('API key updated');
+            }
+            
+            // Update each setting
+            const settingsMap: Record<string, string> = {
+                // Database
+                couchbaseDeployment: 'couchbaseDeployment',
+                couchbaseUrl: 'couchbaseUrl',
+                capellaDataApiUrl: 'capellaDataApiUrl',
+                couchbasePort: 'couchbasePort',
+                couchbaseQueryPort: 'couchbaseQueryPort',
+                couchbaseUsername: 'couchbaseUsername',
+                couchbasePassword: 'couchbasePassword',
+                couchbaseBucket: 'couchbaseBucket',
+                couchbaseScope: 'couchbaseScope',
+                couchbaseCollection: 'couchbaseCollection',
+                couchbaseTimeout: 'couchbaseTimeout',
+                
+                // Models
+                apiBaseUrl: 'apiBaseUrl',
+                modelFast: 'modelFast',
+                modelReasoning: 'modelReasoning',
+                modelVision: 'modelVision',
+                modelBase: 'modelBase',
+                modelMode: 'modelMode',
+                apiTimeout: 'apiTimeout',
+                
+                // Chat
+                enterToSend: 'enterToSend',
+                autoApply: 'autoApply',
+                maxPayloadSizeMB: 'maxPayloadSizeMB',
+                
+                // Optimize
+                requestFormat: 'requestFormat',
+                responseFormat: 'responseFormat',
+                jsonCleanup: 'jsonCleanup',
+                
+                // Debug
+                debug: 'debug',
+                enableSound: 'enableSound'
+            };
+            
+            for (const [key, configKey] of Object.entries(settingsMap)) {
+                if (key in settings && key !== 'apiKey' && key !== 'hasApiKey') {
+                    await config.update(configKey, settings[key], vscode.ConfigurationTarget.Global);
+                }
+            }
+            
+            vscode.window.showInformationMessage('Settings saved successfully');
+            this._sendConfig();
+            this._testAndSendConnectionStatus();
+            
+        } catch (error: any) {
+            logError('Failed to save settings:', error);
+            vscode.window.showErrorMessage(`Failed to save settings: ${error.message}`);
+        }
+    }
+
+    private async _fetchChartData(timeRange: 'hour' | 'day' | 'week' | 'month') {
+        try {
+            const cbClient = getCouchbaseClient();
+            const config = vscode.workspace.getConfiguration('grok');
+            const bucket = config.get<string>('couchbaseBucket', 'grokCoder');
+            
+            // Calculate date threshold based on time range
+            const now = new Date();
+            let startDate: Date;
+            let dateFormat: string;
+            
+            // Couchbase DATE_FORMAT_STR uses strftime format specifiers
+            switch (timeRange) {
+                case 'hour':
+                    startDate = new Date(now.getTime() - 60 * 60 * 1000);
+                    dateFormat = '%H:%M';  // e.g., "14:30"
+                    break;
+                case 'day':
+                    startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+                    dateFormat = '%H:00';  // e.g., "14:00"
+                    break;
+                case 'week':
+                    startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                    dateFormat = '%Y-%m-%d';  // e.g., "2025-12-23"
+                    break;
+                case 'month':
+                default:
+                    startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+                    dateFormat = '%Y-%m-%d';  // e.g., "2025-12-23"
+                    break;
+            }
+            
+            const startDateStr = startDate.toISOString();
+            
+            // Query 1: Summary stats using root-level fields (tokensIn, tokensOut, cost)
+            // Uses index: find_chats_v1 ON grokCoder(projectId, updatedAt DESC) WHERE docType = "chat"
+            const summaryQuery = `
+                SELECT 
+                    COUNT(1) as sessionCount,
+                    SUM(IFMISSINGORNULL(tokensIn, 0)) as totalTokensIn,
+                    SUM(IFMISSINGORNULL(tokensOut, 0)) as totalTokensOut,
+                    SUM(IFMISSINGORNULL(cost, 0)) as totalCost
+                FROM \`${bucket}\`
+                WHERE docType = "chat" 
+                AND projectId IS NOT MISSING
+                AND updatedAt >= $startDate
+            `;
+            
+            // Query 2: Usage over time using root-level fields
+            const timeSeriesQuery = `
+                SELECT 
+                    DATE_FORMAT_STR(updatedAt, "${dateFormat}") as period,
+                    SUM(IFMISSINGORNULL(tokensIn, 0)) as tokensIn,
+                    SUM(IFMISSINGORNULL(tokensOut, 0)) as tokensOut,
+                    SUM(IFMISSINGORNULL(cost, 0)) as cost,
+                    COUNT(1) as sessions
+                FROM \`${bucket}\`
+                WHERE docType = "chat" 
+                AND projectId IS NOT MISSING
+                AND updatedAt >= $startDate
+                GROUP BY DATE_FORMAT_STR(updatedAt, "${dateFormat}")
+                ORDER BY period ASC
+            `;
+            
+            // Query 3: Model usage from root-level modelUsed[] array (fast, no UNNEST)
+            const modelUsageQuery = `
+                SELECT 
+                    m.model as model,
+                    SUM(IFMISSINGORNULL(m.text, 0) + IFMISSINGORNULL(m.img, 0)) as count,
+                    SUM(IFMISSINGORNULL(m.text, 0)) as textCalls,
+                    SUM(IFMISSINGORNULL(m.img, 0)) as imgCalls
+                FROM \`${bucket}\` d
+                UNNEST d.modelUsed as m
+                WHERE d.docType = "chat" 
+                AND d.projectId IS NOT MISSING
+                AND d.updatedAt IS NOT MISSING
+                AND d.updatedAt >= $startDate
+                AND d.modelUsed IS NOT MISSING
+                GROUP BY m.model
+                ORDER BY count DESC
+                LIMIT 10
+            `;
+            
+            // Execute queries in parallel
+            const [summaryResults, timeSeriesResults, modelResults] = await Promise.all([
+                cbClient.query<{ sessionCount: number; totalTokensIn: number; totalTokensOut: number; totalCost: number }>(
+                    summaryQuery, { startDate: startDateStr }
+                ),
+                cbClient.query<{ period: string; tokensIn: number; tokensOut: number; cost: number; sessions: number }>(
+                    timeSeriesQuery, { startDate: startDateStr }
+                ),
+                cbClient.query<{ model: string; count: number; textCalls: number; imgCalls: number }>(
+                    modelUsageQuery, { startDate: startDateStr }
+                )
+            ]);
+            
+            const summary = summaryResults[0] || { sessionCount: 0, totalTokensIn: 0, totalTokensOut: 0, totalCost: 0 };
+            
+            this._postMessage({
+                type: 'chartData',
+                timeRange,
+                summary: {
+                    sessionCount: summary.sessionCount || 0,
+                    totalTokensIn: summary.totalTokensIn || 0,
+                    totalTokensOut: summary.totalTokensOut || 0,
+                    totalCost: summary.totalCost || 0
+                },
+                timeSeries: timeSeriesResults || [],
+                modelUsage: modelResults || []
+            });
+            
+            debug('Chart data fetched:', { timeRange, summaryResults: summaryResults.length, timeSeriesResults: timeSeriesResults.length, modelResults: modelResults.length });
+            
+        } catch (error: any) {
+            logError('Failed to fetch chart data:', error);
+            this._postMessage({
+                type: 'chartData',
+                error: error.message || 'Failed to fetch chart data'
+            });
+        }
+    }
+
     public toggleAutoApply() {
         const config = vscode.workspace.getConfiguration('grok');
         const current = config.get<boolean>('autoApply', true);
@@ -222,6 +504,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const config = vscode.workspace.getConfiguration('grok');
         config.update('modelMode', mode, vscode.ConfigurationTarget.Global);
         this._sendConfig();
+    }
+
+    private async _reportBug(pairIndex: number, bugType: string, description: string, by: string) {
+        if (!this._currentSessionId) {
+            vscode.window.showErrorMessage('No active session');
+            return;
+        }
+        
+        try {
+            const bug = await appendSessionBug(this._currentSessionId, {
+                type: bugType as BugType,
+                pairIndex,
+                by: by as BugReporter,
+                description
+            });
+            
+            info(`Bug reported: ${bug.id} - ${bugType} at pair ${pairIndex}`);
+            vscode.window.showInformationMessage(`Bug reported: ${bugType} issue at response #${pairIndex + 1}`);
+        } catch (error: any) {
+            logError('Failed to report bug:', error);
+            vscode.window.showErrorMessage(`Failed to report bug: ${error.message}`);
+        }
+    }
+
+    public async reportBugFromScript(pairIndex: number, bugType: BugType, description: string) {
+        return this._reportBug(pairIndex, bugType, description, 'script');
     }
 
     private static readonly MODEL_CACHE_KEY = 'grok.modelInfoCache';
@@ -523,6 +831,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 this._currentSessionId = sessionId;
                 setCurrentSession(sessionId);
                 await this._context.globalState.update('grok.currentSessionId', sessionId);
+                
+                // Restore change history from Couchbase
+                await this._restoreChangeHistory(sessionId);
+                
                 this._postMessage({
                     type: 'sessionChanged',
                     sessionId: session.id,
@@ -530,6 +842,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     history: session.pairs,
                     todos: session.todos || []
                 });
+                
+                // Send the restored changes to the UI
+                this._sendInitialChanges();
+                
                 info('Loaded session:', sessionId);
             }
         } catch (error) {
@@ -576,6 +892,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     this._currentSessionId = savedSessionId;
                     setCurrentSession(savedSessionId);
                     info('Loaded existing session:', savedSessionId);
+                    
+                    // Restore change history from Couchbase
+                    await this._restoreChangeHistory(savedSessionId);
+                    
                     this._postMessage({
                         type: 'init',
                         sessionId: session.id,
@@ -898,11 +1218,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         parsingSucceeded = !!result;
                     }
                 }
-            } catch (parsingException) {
+            } catch (parsingException: any) {
                 logError('Response parsing failed completely:', parsingException);
                 // Ensure we still save the raw response text
                 structured = { summary: 'Parsing failed', message: grokResponse.text };
                 parsingSucceeded = false;
+                
+                // Auto-report parsing exception as bug
+                try {
+                    await appendSessionBug(this._currentSessionId!, {
+                        type: 'JSON',
+                        pairIndex,
+                        by: 'script',
+                        description: `Auto-detected: Response parsing failed - ${parsingException.message || 'Unknown error'}`
+                    });
+                    debug('Auto-reported parsing bug for pair:', pairIndex);
+                } catch (bugErr) {
+                    debug('Failed to auto-report bug:', bugErr);
+                }
             }
             
             debug('Parsed structured response:', { 
@@ -944,6 +1277,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     grokResponse.usage.completionTokens,
                     model
                 );
+                // Track model usage aggregate at root level
+                await updateSessionModelUsage(this._currentSessionId, model, hasImages);
             }
 
             if (pairIndex === 0) {
@@ -1090,14 +1425,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             logError('sendMessage error:', error.message);
             vscode.window.showErrorMessage(`Grok error: ${error.message}`);
             
+            const isAborted = error.name === 'AbortError';
             const errorResponse: ChatResponse = {
                 timestamp: new Date().toISOString(),
-                status: error.name === 'AbortError' ? 'cancelled' : 'error',
+                status: isAborted ? 'cancelled' : 'error',
                 errorMessage: error.message
             };
 
             try {
                 await updateLastPairResponse(this._currentSessionId!, errorResponse);
+                
+                // Auto-report non-abort errors as bugs
+                if (!isAborted && this._currentSessionId) {
+                    const session = await getSession(this._currentSessionId);
+                    const currentPairIndex = session ? session.pairs.length - 1 : 0;
+                    await appendSessionBug(this._currentSessionId, {
+                        type: 'Other',
+                        pairIndex: currentPairIndex,
+                        by: 'script',
+                        description: `Auto-detected: API error - ${error.message}`
+                    });
+                    debug('Auto-reported API error bug for pair:', currentPairIndex);
+                }
             } catch (dbError) {
                 logError('Failed to save error to Couchbase:', dbError);
             }
@@ -1512,8 +1861,9 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 
 #chat{flex:1;overflow-y:auto;padding:10px;scroll-behavior:smooth}
 .msg{margin-bottom:10px;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.5;word-wrap:break-word}
-.msg.u{background:rgba(56,139,213,0.1);color:var(--vscode-foreground);margin-left:20%;border-radius:12px 12px 4px 12px;border-left:3px solid var(--vscode-button-background)}
-.msg.u code{background:rgba(56,139,213,0.15);padding:1px 5px;border-radius:3px;font-family:var(--vscode-editor-font-family);font-size:12px}
+.msg.u{background:linear-gradient(135deg,rgba(56,139,213,0.12) 0%,rgba(56,139,213,0.06) 100%);color:var(--vscode-foreground);margin-left:15%;border-radius:16px 16px 4px 16px;border:1px solid rgba(56,139,213,0.25);position:relative}
+.msg.u::before{content:'';position:absolute;top:0;right:0;width:4px;height:100%;background:var(--vscode-button-background);border-radius:0 16px 4px 0}
+.msg.u code{background:rgba(56,139,213,0.2);padding:1px 5px;border-radius:3px;font-family:var(--vscode-editor-font-family);font-size:12px}
 .msg.a{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);margin-right:5%;border-radius:12px 12px 12px 4px}
 .msg.p{opacity:.7}
 .msg.e{background:var(--vscode-inputValidation-errorBackground);border-color:var(--vscode-inputValidation-errorBorder)}
@@ -1549,6 +1899,24 @@ pre code{background:none;padding:0}
 .done-pending{background:var(--vscode-testing-iconPassed);color:#fff;cursor:pointer;font-weight:500}
 .done-pending:hover{opacity:0.9}
 .done-tokens{margin-left:auto;font-size:11px;color:var(--vscode-descriptionForeground)}
+.msg-actions{display:flex;justify-content:flex-end;margin-bottom:4px}
+.bug-btn{background:none;border:none;cursor:pointer;opacity:0.4;padding:2px 4px;margin-left:4px;transition:opacity .15s;display:inline-flex;align-items:center}
+.bug-btn:hover{opacity:1}
+.bug-btn.reported{opacity:1}
+.bug-btn.reported svg{stroke:var(--vscode-testing-iconFailed)}
+.bug-btn svg{stroke:var(--vscode-descriptionForeground)}
+#bug-modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:none;align-items:center;justify-content:center;z-index:1000}
+#bug-modal.show{display:flex}
+.bug-modal-content{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:8px;padding:16px;width:90%;max-width:400px;box-shadow:0 4px 12px rgba(0,0,0,0.3)}
+.bug-modal-title{font-size:14px;font-weight:600;margin:0 0 12px 0;display:flex;align-items:center;gap:6px}
+.bug-modal-row{margin-bottom:12px}
+.bug-modal-row label{display:block;font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:4px}
+.bug-modal-row select,.bug-modal-row textarea{width:100%;padding:8px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground);border-radius:4px;font-size:12px;font-family:inherit}
+.bug-modal-row textarea{min-height:80px;resize:vertical}
+.bug-modal-btns{display:flex;gap:8px;justify-content:flex-end}
+.bug-modal-btns button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;font-size:12px}
+.bug-modal-cancel{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+.bug-modal-submit{background:var(--vscode-testing-iconFailed);color:#fff}
 .summary{font-size:13px;font-weight:500;color:var(--vscode-foreground);margin:0 0 12px 0;line-height:1.5}
 .section{margin-bottom:16px}
 .section h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 8px 0;padding-bottom:4px;border-bottom:1px solid var(--vscode-panel-border)}
@@ -1664,11 +2032,387 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 .summary-list li{margin:2px 0}
 .summary-list .file-item{color:var(--vscode-textLink-foreground);padding-left:8px;list-style:none}
 .summary-list .cmd-item{color:var(--vscode-descriptionForeground);font-family:var(--vscode-editor-font-family);padding-left:8px;list-style:none}
+
+/* Settings Panel */
+#settings-view{display:none;flex:1;overflow-y:auto;padding:12px;background:var(--vscode-sideBar-background)}
+#settings-view.show{display:block}
+#chat.hide,#inp.hide,#todo-bar.hide,#todo-list.hide{display:none!important}
+.settings-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--vscode-panel-border)}
+.settings-header h2{font-size:16px;font-weight:600;margin:0;color:var(--vscode-foreground)}
+.settings-close{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:none;border-radius:4px;padding:6px 12px;cursor:pointer;font-size:12px}
+.settings-close:hover{background:var(--vscode-button-secondaryHoverBackground)}
+.settings-tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
+.settings-tab{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:500;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);transition:all .15s}
+.settings-tab:hover{background:var(--vscode-button-secondaryHoverBackground)}
+.settings-tab.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+.settings-section{display:none}
+.settings-section.active{display:block}
+.settings-group{margin-bottom:20px}
+.settings-group h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 12px 0;padding-bottom:6px;border-bottom:1px solid var(--vscode-panel-border)}
+.setting-row{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.setting-row label{font-size:11px;font-weight:500;color:var(--vscode-foreground)}
+.setting-row .desc{font-size:10px;color:var(--vscode-descriptionForeground);margin-top:2px}
+.setting-row input[type="text"],.setting-row input[type="password"],.setting-row input[type="number"],.setting-row select{padding:6px 10px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground);border-radius:4px;font-size:12px;width:100%}
+.setting-row input[type="checkbox"]{width:auto;margin-right:8px}
+.setting-row .checkbox-row{display:flex;align-items:center}
+.setting-row .checkbox-row label{margin:0}
+.settings-actions{display:flex;gap:8px;margin-top:20px;padding-top:16px;border-top:1px solid var(--vscode-panel-border)}
+.settings-actions button{padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500}
+.settings-save{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+.settings-save:hover{background:var(--vscode-button-hoverBackground)}
+.settings-test{background:var(--vscode-testing-iconPassed);color:#fff}
+.settings-test:hover{opacity:.9}
+.test-result{margin-top:8px;padding:8px;border-radius:4px;font-size:11px}
+.test-result.success{background:rgba(40,167,69,.15);color:var(--vscode-testing-iconPassed)}
+.test-result.error{background:rgba(248,81,73,.15);color:var(--vscode-testing-iconFailed)}
+.api-key-row{display:flex;gap:6px}
+.api-key-row input{flex:1}
+.api-key-row button{padding:6px 10px;font-size:11px;white-space:nowrap}
+.future-badge{display:inline-block;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:9px;padding:2px 6px;border-radius:3px;margin-left:6px;vertical-align:middle}
+
+/* Chart Styles */
+.chart-time-filter{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.chart-radio{display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;padding:4px 8px;border-radius:4px;background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--vscode-panel-border));color:var(--vscode-input-foreground)}
+.chart-radio:hover{background:var(--vscode-list-hoverBackground)}
+.chart-radio input{margin:0}
+.chart-refresh-btn{padding:4px 12px;font-size:11px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;margin-left:auto}
+.chart-refresh-btn:hover{background:var(--vscode-button-hoverBackground)}
+.chart-loading{padding:20px;text-align:center;color:var(--vscode-descriptionForeground);display:none}
+.chart-loading.show{display:block}
+.chart-error{padding:10px;background:rgba(248,81,73,.15);color:var(--vscode-testing-iconFailed);border-radius:4px;margin-bottom:12px;display:none;font-size:11px}
+.chart-error.show{display:block}
+.chart-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
+.summary-card{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px;text-align:center}
+.summary-card.cost{border-color:var(--vscode-charts-green)}
+.summary-value{font-size:18px;font-weight:700;color:var(--vscode-foreground)}
+.summary-card.cost .summary-value{color:var(--vscode-charts-green)}
+.summary-label{font-size:10px;color:var(--vscode-descriptionForeground);margin-top:4px}
+.chart-container{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px;margin-bottom:12px}
+.chart-container h4{font-size:12px;font-weight:600;margin:0 0 12px 0;color:var(--vscode-foreground)}
+.bar-chart{height:120px;display:flex;align-items:flex-end;gap:2px;padding-bottom:20px;padding-top:16px;position:relative}
+.bar-group{display:flex;gap:1px;flex:1;align-items:flex-end;position:relative;height:100px}
+.bar{min-width:4px;max-width:20px;border-radius:2px 2px 0 0;transition:height .3s;flex:1}
+.bar.tokens-in{background:var(--vscode-charts-blue)}
+.bar.tokens-out{background:var(--vscode-charts-purple)}
+.bar.cost-bar{background:var(--vscode-charts-green)}
+.bar-label{position:absolute;bottom:-18px;left:50%;transform:translateX(-50%);font-size:8px;color:var(--vscode-descriptionForeground);white-space:nowrap}
+.bar-value{position:absolute;top:-14px;left:50%;transform:translateX(-50%);font-size:8px;color:var(--vscode-foreground);white-space:nowrap;font-weight:500}
+.chart-legend{display:flex;gap:12px;justify-content:center;margin-top:8px}
+.legend-item{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--vscode-descriptionForeground)}
+.legend-dot{width:8px;height:8px;border-radius:2px}
+.legend-dot.tokens-in{background:var(--vscode-charts-blue)}
+.legend-dot.tokens-out{background:var(--vscode-charts-purple)}
+.pie-chart-wrapper{display:flex;gap:16px;align-items:center}
+.pie-chart{width:100px;height:100px;border-radius:50%;position:relative;flex-shrink:0}
+.pie-legend{flex:1;font-size:11px}
+.pie-legend-item{display:flex;align-items:center;gap:6px;padding:4px 0}
+.pie-legend-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.pie-legend-text{flex:1;color:var(--vscode-foreground)}
+.pie-legend-value{color:var(--vscode-descriptionForeground);font-size:10px}
+.no-data{padding:20px;text-align:center;color:var(--vscode-descriptionForeground);font-size:12px}
 </style></head><body>
 <div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
 
+<!-- Settings View -->
+<div id="settings-view">
+    <div class="settings-header">
+        <h2>⚙️ Settings</h2>
+        <button class="settings-close" id="settings-close">← Back to Chat</button>
+    </div>
+    <div class="settings-tabs">
+        <button class="settings-tab active" data-tab="database">Database</button>
+        <button class="settings-tab" data-tab="models">Models</button>
+        <button class="settings-tab" data-tab="chat">Chat</button>
+        <button class="settings-tab" data-tab="optimize">Optimize</button>
+        <button class="settings-tab" data-tab="debug">Debug</button>
+        <button class="settings-tab" data-tab="chart">Usage</button>
+    </div>
+    
+    <!-- Database Section -->
+    <div class="settings-section active" id="section-database">
+        <div class="settings-group">
+            <h3>Couchbase Connection</h3>
+            <div class="setting-row">
+                <label>Deployment Type</label>
+                <select id="set-couchbaseDeployment">
+                    <option value="self-hosted">Self-hosted</option>
+                    <option value="capella">Couchbase Capella</option>
+                </select>
+                <div class="desc">Choose between self-hosted Couchbase Server or Couchbase Capella DBaaS</div>
+            </div>
+            <div class="setting-row" id="row-couchbaseUrl">
+                <label>Server URL</label>
+                <input type="text" id="set-couchbaseUrl" placeholder="http://localhost">
+                <div class="desc">Base URL for self-hosted Couchbase (e.g., http://localhost)</div>
+            </div>
+            <div class="setting-row" id="row-capellaDataApiUrl" style="display:none">
+                <label>Capella Data API URL</label>
+                <input type="text" id="set-capellaDataApiUrl" placeholder="https://your-cluster.data.cloud.couchbase.com">
+                <div class="desc">Capella Data API endpoint URL</div>
+            </div>
+            <div class="setting-row" id="row-ports">
+                <label>Ports</label>
+                <div style="display:flex;gap:8px">
+                    <div style="flex:1"><input type="number" id="set-couchbasePort" placeholder="8091"><div class="desc">REST API</div></div>
+                    <div style="flex:1"><input type="number" id="set-couchbaseQueryPort" placeholder="8093"><div class="desc">Query Service</div></div>
+                </div>
+            </div>
+            <div class="setting-row">
+                <label>Username</label>
+                <input type="text" id="set-couchbaseUsername" placeholder="Administrator">
+            </div>
+            <div class="setting-row">
+                <label>Password</label>
+                <input type="password" id="set-couchbasePassword" placeholder="password">
+            </div>
+            <div class="setting-row">
+                <label>Bucket</label>
+                <input type="text" id="set-couchbaseBucket" placeholder="grokCoder">
+            </div>
+            <div class="setting-row">
+                <label>Scope / Collection</label>
+                <div style="display:flex;gap:8px">
+                    <input type="text" id="set-couchbaseScope" placeholder="_default" style="flex:1">
+                    <input type="text" id="set-couchbaseCollection" placeholder="_default" style="flex:1">
+                </div>
+            </div>
+            <div class="setting-row">
+                <label>Timeout (seconds)</label>
+                <input type="number" id="set-couchbaseTimeout" placeholder="30">
+            </div>
+            <div id="db-test-result"></div>
+        </div>
+    </div>
+    
+    <!-- Models Section -->
+    <div class="settings-section" id="section-models">
+        <div class="settings-group">
+            <h3>API Configuration</h3>
+            <div class="setting-row">
+                <label>API Base URL</label>
+                <input type="text" id="set-apiBaseUrl" placeholder="https://api.x.ai/v1">
+            </div>
+            <div class="setting-row">
+                <label>API Key</label>
+                <div class="api-key-row">
+                    <input type="password" id="set-apiKey" placeholder="xai-...">
+                    <button id="toggle-api-key" class="settings-close">Show</button>
+                </div>
+                <div class="desc">Your xAI API key (starts with xai-)</div>
+            </div>
+            <div class="setting-row">
+                <label>API Timeout (seconds)</label>
+                <input type="number" id="set-apiTimeout" placeholder="300">
+                <div class="desc">Timeout for API requests (default 5 minutes for complex responses)</div>
+            </div>
+        </div>
+        <div class="settings-group">
+            <h3>Model Selection</h3>
+            <div class="setting-row">
+                <label>Default Mode</label>
+                <select id="set-modelMode">
+                    <option value="fast">Fast (F) - Quick, cost-efficient</option>
+                    <option value="smart">Smart (S) - Complex reasoning</option>
+                    <option value="base">Base (B) - Standard</option>
+                </select>
+            </div>
+            <div class="setting-row">
+                <label>Fast Model</label>
+                <input type="text" id="set-modelFast" placeholder="grok-3-mini">
+                <div class="desc">Used for quick tasks and file analysis</div>
+            </div>
+            <div class="setting-row">
+                <label>Reasoning Model</label>
+                <input type="text" id="set-modelReasoning" placeholder="grok-4">
+                <div class="desc">Used for complex, multi-step tasks</div>
+            </div>
+            <div class="setting-row">
+                <label>Vision Model</label>
+                <input type="text" id="set-modelVision" placeholder="grok-4">
+                <div class="desc">Used when images are attached</div>
+            </div>
+            <div class="setting-row">
+                <label>Base Model</label>
+                <input type="text" id="set-modelBase" placeholder="grok-3">
+            </div>
+            <div id="api-test-result"></div>
+        </div>
+    </div>
+    
+    <!-- Chat Section -->
+    <div class="settings-section" id="section-chat">
+        <div class="settings-group">
+            <h3>Chat Behavior</h3>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-enterToSend">
+                    <label>Enter to Send</label>
+                </div>
+                <div class="desc">When enabled: Enter sends, Ctrl+Enter for new line. Otherwise reversed.</div>
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-autoApply">
+                    <label>Auto Apply Changes</label>
+                </div>
+                <div class="desc">Automatically apply code changes from AI responses</div>
+            </div>
+            <div class="setting-row">
+                <label>Max Payload Size (MB)</label>
+                <input type="number" id="set-maxPayloadSizeMB" placeholder="15">
+                <div class="desc">Maximum size for Couchbase documents (limit: 20MB)</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Optimize Section -->
+    <div class="settings-section" id="section-optimize">
+        <div class="settings-group">
+            <h3>Token Optimization</h3>
+            <div class="setting-row">
+                <label>Request Format</label>
+                <select id="set-requestFormat">
+                    <option value="json">JSON - Standard format</option>
+                    <option value="toon">TOON - Token-efficient (30-60% fewer tokens)</option>
+                </select>
+            </div>
+            <div class="setting-row">
+                <label>Response Format</label>
+                <select id="set-responseFormat">
+                    <option value="json">JSON - Reliable parsing</option>
+                    <option value="toon">TOON - Fewer tokens, less reliable</option>
+                </select>
+            </div>
+            <div class="setting-row">
+                <label>JSON Cleanup</label>
+                <select id="set-jsonCleanup">
+                    <option value="auto">Auto - AI cleanup on parse failure</option>
+                    <option value="off">Off - Logic-based parsing only</option>
+                    <option value="on">On - Always use AI cleanup</option>
+                </select>
+                <div class="desc">Control when AI is used to fix malformed responses</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Debug Section -->
+    <div class="settings-section" id="section-debug">
+        <div class="settings-group">
+            <h3>Debugging</h3>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-debug">
+                    <label>Enable Debug Logging</label>
+                </div>
+                <div class="desc">Output detailed logs to the Output channel</div>
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-enableSound">
+                    <label>Enable Sound</label>
+                </div>
+                <div class="desc">Play sound when task completes</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Chart Section -->
+    <div class="settings-section" id="section-chart">
+        <div class="settings-group">
+            <h3>Usage Analytics</h3>
+            <div class="chart-time-filter">
+                <label class="chart-radio"><input type="radio" name="chartTime" value="hour"> Last Hour</label>
+                <label class="chart-radio"><input type="radio" name="chartTime" value="day"> Last 24h</label>
+                <label class="chart-radio"><input type="radio" name="chartTime" value="week" checked> Last Week</label>
+                <label class="chart-radio"><input type="radio" name="chartTime" value="month"> Last Month</label>
+                <button id="chart-refresh" class="chart-refresh-btn">Refresh</button>
+            </div>
+            <div id="chart-loading" class="chart-loading">Loading charts...</div>
+            <div id="chart-error" class="chart-error"></div>
+            
+            <!-- Summary Cards -->
+            <div class="chart-summary" id="chart-summary">
+                <div class="summary-card">
+                    <div class="summary-value" id="sum-sessions">0</div>
+                    <div class="summary-label">Sessions</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-value" id="sum-tokens-in">0</div>
+                    <div class="summary-label">Tokens In</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-value" id="sum-tokens-out">0</div>
+                    <div class="summary-label">Tokens Out</div>
+                </div>
+                <div class="summary-card cost">
+                    <div class="summary-value" id="sum-cost">$0.00</div>
+                    <div class="summary-label">Total Cost</div>
+                </div>
+            </div>
+            
+            <!-- Token Usage Over Time (Bar Chart) -->
+            <div class="chart-container">
+                <h4>Token Usage Over Time</h4>
+                <div class="bar-chart" id="tokens-chart"></div>
+                <div class="chart-legend">
+                    <span class="legend-item"><span class="legend-dot tokens-in"></span> Tokens In</span>
+                    <span class="legend-item"><span class="legend-dot tokens-out"></span> Tokens Out</span>
+                </div>
+            </div>
+            
+            <!-- Cost Over Time (Bar Chart) -->
+            <div class="chart-container">
+                <h4>Cost Over Time</h4>
+                <div class="bar-chart" id="cost-chart"></div>
+            </div>
+            
+            <!-- Model Usage (Pie Chart) -->
+            <div class="chart-container">
+                <h4>Model Usage Distribution</h4>
+                <div class="pie-chart-wrapper">
+                    <div class="pie-chart" id="model-chart"></div>
+                    <div class="pie-legend" id="model-legend"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="settings-actions">
+        <button class="settings-save" id="settings-save">💾 Save Settings</button>
+        <button class="settings-test" id="settings-test">🔌 Test Connections</button>
+    </div>
+</div>
+
 <div id="chat"></div>
+
+<!-- Bug Report Modal -->
+<div id="bug-modal">
+    <div class="bug-modal-content">
+        <div class="bug-modal-title">🐛 Report Bug</div>
+        <div class="bug-modal-row">
+            <label>Bug Type</label>
+            <select id="bug-type">
+                <option value="HTML">HTML</option>
+                <option value="CSS">CSS</option>
+                <option value="JSON">JSON</option>
+                <option value="JS">JavaScript</option>
+                <option value="TypeScript">TypeScript</option>
+                <option value="Markdown">Markdown</option>
+                <option value="SQL">SQL</option>
+                <option value="Other">Other</option>
+            </select>
+        </div>
+        <div class="bug-modal-row">
+            <label>Description</label>
+            <textarea id="bug-desc" placeholder="Describe what went wrong..."></textarea>
+        </div>
+        <div class="bug-modal-btns">
+            <button class="bug-modal-cancel" id="bug-cancel">Cancel</button>
+            <button class="bug-modal-submit" id="bug-submit">Report Bug</button>
+        </div>
+    </div>
+</div>
 
 <!-- Expanded Changes Panel (dropdown from stats bar) -->
 <div id="changes-panel">
@@ -1718,6 +2462,294 @@ function getCtxLimit(){return (modelInfo[currentModel]||{ctx:131072}).ctx;}
 function getModelPricing(){return modelInfo[currentModel]||{inPrice:0.30,outPrice:0.50};}
 const autocomplete=document.getElementById('autocomplete');
 let acFiles=[],acIndex=-1,acWordStart=-1,acWordEnd=-1,acDebounce=null;
+
+// Settings view
+const settingsView=document.getElementById('settings-view');
+const settingsClose=document.getElementById('settings-close');
+const settingsSave=document.getElementById('settings-save');
+const settingsTest=document.getElementById('settings-test');
+const settingsTabs=document.querySelectorAll('.settings-tab');
+const inp=document.getElementById('inp');
+let currentSettings={};
+
+// Bug reporting
+const bugModal=document.getElementById('bug-modal');
+const bugType=document.getElementById('bug-type');
+const bugDesc=document.getElementById('bug-desc');
+const bugCancel=document.getElementById('bug-cancel');
+const bugSubmit=document.getElementById('bug-submit');
+let bugPairIndex=-1;
+
+function showBugModal(pairIndex){
+    bugPairIndex=pairIndex;
+    bugType.value='Other';
+    bugDesc.value='';
+    bugModal.classList.add('show');
+    bugDesc.focus();
+}
+function hideBugModal(){
+    bugModal.classList.remove('show');
+    bugPairIndex=-1;
+}
+bugCancel.addEventListener('click',hideBugModal);
+bugModal.addEventListener('click',e=>{if(e.target===bugModal)hideBugModal();});
+bugSubmit.addEventListener('click',()=>{
+    if(bugPairIndex<0)return;
+    const desc=bugDesc.value.trim();
+    if(!desc){bugDesc.focus();return;}
+    vs.postMessage({type:'reportBug',pairIndex:bugPairIndex,bugType:bugType.value,description:desc,by:'user'});
+    // Mark button as reported
+    const btn=document.querySelector('.msg.a[data-i="'+bugPairIndex+'"] .bug-btn');
+    if(btn){btn.classList.add('reported');btn.title='Bug reported';}
+    hideBugModal();
+});
+function reportBug(pairIndex){showBugModal(pairIndex);}
+
+function showSettings(){
+    settingsView.classList.add('show');
+    chat.classList.add('hide');
+    inp.classList.add('hide');
+    todoBar.classList.add('hide');
+    todoList.classList.add('hide');
+    vs.postMessage({type:'openSettings'});
+}
+function hideSettings(){
+    settingsView.classList.remove('show');
+    chat.classList.remove('hide');
+    inp.classList.remove('hide');
+    todoBar.classList.remove('hide');
+    if(todoExpanded)todoList.classList.remove('hide');
+}
+document.getElementById('cfg').onclick=showSettings;
+settingsClose.onclick=hideSettings;
+
+// Settings tabs
+let chartDataLoaded=false;
+settingsTabs.forEach(tab=>{
+    tab.onclick=()=>{
+        const tabName=tab.dataset.tab;
+        settingsTabs.forEach(t=>t.classList.remove('active'));
+        tab.classList.add('active');
+        document.querySelectorAll('.settings-section').forEach(s=>s.classList.remove('active'));
+        document.getElementById('section-'+tabName).classList.add('active');
+        
+        // Fetch chart data when Chart tab is clicked (only first time or on refresh)
+        if(tabName==='chart'&&!chartDataLoaded){
+            fetchChartData();
+        }
+    };
+});
+
+// Chart functionality
+function getSelectedTimeRange(){
+    const selected=document.querySelector('input[name="chartTime"]:checked');
+    return selected?selected.value:'week';
+}
+
+function fetchChartData(){
+    const timeRange=getSelectedTimeRange();
+    document.getElementById('chart-loading').classList.add('show');
+    document.getElementById('chart-error').classList.remove('show');
+    vs.postMessage({type:'fetchChartData',timeRange});
+}
+
+document.getElementById('chart-refresh').onclick=()=>{
+    chartDataLoaded=false;
+    fetchChartData();
+};
+
+document.querySelectorAll('input[name="chartTime"]').forEach(radio=>{
+    radio.onchange=()=>{
+        chartDataLoaded=false;
+        fetchChartData();
+    };
+});
+
+function formatNumber(n){
+    if(n>=1000000)return (n/1000000).toFixed(1)+'M';
+    if(n>=1000)return (n/1000).toFixed(1)+'K';
+    return n.toString();
+}
+
+const chartColors=['#4ec9b0','#569cd6','#ce9178','#dcdcaa','#c586c0','#9cdcfe','#4fc1ff','#d7ba7d'];
+
+function renderCharts(data){
+    chartDataLoaded=true;
+    document.getElementById('chart-loading').classList.remove('show');
+    
+    if(data.error){
+        document.getElementById('chart-error').textContent=data.error;
+        document.getElementById('chart-error').classList.add('show');
+        return;
+    }
+    
+    // Summary cards
+    document.getElementById('sum-sessions').textContent=formatNumber(data.summary.sessionCount||0);
+    document.getElementById('sum-tokens-in').textContent=formatNumber(data.summary.totalTokensIn||0);
+    document.getElementById('sum-tokens-out').textContent=formatNumber(data.summary.totalTokensOut||0);
+    document.getElementById('sum-cost').textContent='$'+(data.summary.totalCost||0).toFixed(2);
+    
+    // Token usage bar chart
+    const tokensChart=document.getElementById('tokens-chart');
+    const timeSeries=data.timeSeries||[];
+    
+    if(timeSeries.length===0){
+        tokensChart.innerHTML='<div class="no-data">No data for selected period</div>';
+    }else{
+        const maxTokens=Math.max(...timeSeries.map(d=>Math.max(d.tokensIn||0,d.tokensOut||0)),1);
+        tokensChart.innerHTML=timeSeries.map(d=>{
+            const inH=Math.max(2,((d.tokensIn||0)/maxTokens)*100);
+            const outH=Math.max(2,((d.tokensOut||0)/maxTokens)*100);
+            const inVal=formatNumber(d.tokensIn||0);
+            return '<div class="bar-group"><span class="bar-value">'+inVal+'</span><div class="bar tokens-in" style="height:'+inH+'%" title="In: '+inVal+'"></div><div class="bar tokens-out" style="height:'+outH+'%" title="Out: '+formatNumber(d.tokensOut||0)+'"></div><span class="bar-label">'+d.period+'</span></div>';
+        }).join('');
+    }
+    
+    // Cost bar chart
+    const costChart=document.getElementById('cost-chart');
+    if(timeSeries.length===0){
+        costChart.innerHTML='<div class="no-data">No data for selected period</div>';
+    }else{
+        const maxCost=Math.max(...timeSeries.map(d=>d.cost||0),0.01);
+        costChart.innerHTML=timeSeries.map(d=>{
+            const h=Math.max(2,((d.cost||0)/maxCost)*100);
+            const costVal='$'+(d.cost||0).toFixed(2);
+            return '<div class="bar-group"><span class="bar-value">'+costVal+'</span><div class="bar cost-bar" style="height:'+h+'%" title="'+costVal+'"></div><span class="bar-label">'+d.period+'</span></div>';
+        }).join('');
+    }
+    
+    // Model usage pie chart
+    const modelChart=document.getElementById('model-chart');
+    const modelLegend=document.getElementById('model-legend');
+    const modelUsage=data.modelUsage||[];
+    
+    if(modelUsage.length===0){
+        modelChart.innerHTML='<div class="no-data" style="display:flex;align-items:center;justify-content:center;height:100%">No data</div>';
+        modelLegend.innerHTML='';
+    }else{
+        const total=modelUsage.reduce((sum,m)=>sum+(m.count||0),0);
+        let cumulative=0;
+        const gradientStops=modelUsage.map((m,i)=>{
+            const pct=(m.count||0)/total*100;
+            const start=cumulative;
+            cumulative+=pct;
+            return chartColors[i%chartColors.length]+' '+start+'% '+cumulative+'%';
+        }).join(', ');
+        modelChart.style.background='conic-gradient('+gradientStops+')';
+        
+        modelLegend.innerHTML=modelUsage.map((m,i)=>{
+            const pct=((m.count||0)/total*100).toFixed(1);
+            const name=(m.model||'unknown').replace('grok-','');
+            return '<div class="pie-legend-item"><span class="pie-legend-dot" style="background:'+chartColors[i%chartColors.length]+'"></span><span class="pie-legend-text">'+name+'</span><span class="pie-legend-value">'+pct+'%</span></div>';
+        }).join('');
+    }
+}
+
+// Toggle deployment type fields
+function updateDeploymentFields(){
+    const deployment=document.getElementById('set-couchbaseDeployment').value;
+    const isSelfHosted=deployment==='self-hosted';
+    document.getElementById('row-couchbaseUrl').style.display=isSelfHosted?'flex':'none';
+    document.getElementById('row-capellaDataApiUrl').style.display=isSelfHosted?'none':'flex';
+    document.getElementById('row-ports').style.display=isSelfHosted?'flex':'none';
+}
+document.getElementById('set-couchbaseDeployment').onchange=updateDeploymentFields;
+
+// Toggle API key visibility
+document.getElementById('toggle-api-key').onclick=function(){
+    const input=document.getElementById('set-apiKey');
+    if(input.type==='password'){input.type='text';this.textContent='Hide';}
+    else{input.type='password';this.textContent='Show';}
+};
+
+// Populate settings form
+function populateSettings(s){
+    currentSettings=s;
+    // Database
+    document.getElementById('set-couchbaseDeployment').value=s.couchbaseDeployment||'self-hosted';
+    document.getElementById('set-couchbaseUrl').value=s.couchbaseUrl||'';
+    document.getElementById('set-capellaDataApiUrl').value=s.capellaDataApiUrl||'';
+    document.getElementById('set-couchbasePort').value=s.couchbasePort||8091;
+    document.getElementById('set-couchbaseQueryPort').value=s.couchbaseQueryPort||8093;
+    document.getElementById('set-couchbaseUsername').value=s.couchbaseUsername||'';
+    document.getElementById('set-couchbasePassword').value=s.couchbasePassword||'';
+    document.getElementById('set-couchbaseBucket').value=s.couchbaseBucket||'';
+    document.getElementById('set-couchbaseScope').value=s.couchbaseScope||'';
+    document.getElementById('set-couchbaseCollection').value=s.couchbaseCollection||'';
+    document.getElementById('set-couchbaseTimeout').value=s.couchbaseTimeout||30;
+    // Models
+    document.getElementById('set-apiBaseUrl').value=s.apiBaseUrl||'';
+    document.getElementById('set-apiKey').value=s.apiKey||'';
+    document.getElementById('set-apiKey').placeholder=s.hasApiKey?'(API key set)':'xai-...';
+    document.getElementById('set-apiTimeout').value=s.apiTimeout||300;
+    document.getElementById('set-modelFast').value=s.modelFast||'';
+    document.getElementById('set-modelReasoning').value=s.modelReasoning||'';
+    document.getElementById('set-modelVision').value=s.modelVision||'';
+    document.getElementById('set-modelBase').value=s.modelBase||'';
+    document.getElementById('set-modelMode').value=s.modelMode||'fast';
+    // Chat
+    document.getElementById('set-enterToSend').checked=s.enterToSend||false;
+    document.getElementById('set-autoApply').checked=s.autoApply!==false;
+    document.getElementById('set-maxPayloadSizeMB').value=s.maxPayloadSizeMB||15;
+    // Optimize
+    document.getElementById('set-requestFormat').value=s.requestFormat||'json';
+    document.getElementById('set-responseFormat').value=s.responseFormat||'json';
+    document.getElementById('set-jsonCleanup').value=s.jsonCleanup||'auto';
+    // Debug
+    document.getElementById('set-debug').checked=s.debug||false;
+    document.getElementById('set-enableSound').checked=s.enableSound||false;
+    
+    updateDeploymentFields();
+}
+
+// Collect settings from form
+function collectSettings(){
+    return {
+        // Database
+        couchbaseDeployment:document.getElementById('set-couchbaseDeployment').value,
+        couchbaseUrl:document.getElementById('set-couchbaseUrl').value,
+        capellaDataApiUrl:document.getElementById('set-capellaDataApiUrl').value,
+        couchbasePort:parseInt(document.getElementById('set-couchbasePort').value)||8091,
+        couchbaseQueryPort:parseInt(document.getElementById('set-couchbaseQueryPort').value)||8093,
+        couchbaseUsername:document.getElementById('set-couchbaseUsername').value,
+        couchbasePassword:document.getElementById('set-couchbasePassword').value,
+        couchbaseBucket:document.getElementById('set-couchbaseBucket').value,
+        couchbaseScope:document.getElementById('set-couchbaseScope').value,
+        couchbaseCollection:document.getElementById('set-couchbaseCollection').value,
+        couchbaseTimeout:parseInt(document.getElementById('set-couchbaseTimeout').value)||30,
+        // Models
+        apiBaseUrl:document.getElementById('set-apiBaseUrl').value,
+        apiKey:document.getElementById('set-apiKey').value,
+        apiTimeout:parseInt(document.getElementById('set-apiTimeout').value)||300,
+        modelFast:document.getElementById('set-modelFast').value,
+        modelReasoning:document.getElementById('set-modelReasoning').value,
+        modelVision:document.getElementById('set-modelVision').value,
+        modelBase:document.getElementById('set-modelBase').value,
+        modelMode:document.getElementById('set-modelMode').value,
+        // Chat
+        enterToSend:document.getElementById('set-enterToSend').checked,
+        autoApply:document.getElementById('set-autoApply').checked,
+        maxPayloadSizeMB:parseInt(document.getElementById('set-maxPayloadSizeMB').value)||15,
+        // Optimize
+        requestFormat:document.getElementById('set-requestFormat').value,
+        responseFormat:document.getElementById('set-responseFormat').value,
+        jsonCleanup:document.getElementById('set-jsonCleanup').value,
+        // Debug
+        debug:document.getElementById('set-debug').checked,
+        enableSound:document.getElementById('set-enableSound').checked
+    };
+}
+
+settingsSave.onclick=()=>{
+    const settings=collectSettings();
+    vs.postMessage({type:'saveSettings',settings});
+};
+
+settingsTest.onclick=()=>{
+    vs.postMessage({type:'testConnections'});
+    document.getElementById('db-test-result').innerHTML='<div class="test-result">Testing connections...</div>';
+    document.getElementById('api-test-result').innerHTML='<div class="test-result">Testing connections...</div>';
+};
 
 // Handoff popup
 const pctWrap=document.getElementById('pct-wrap');
@@ -1922,7 +2954,6 @@ function updateAcSelection(){
 }
 stop.onclick=()=>vs.postMessage({type:'cancelRequest'});
 document.getElementById('new').onclick=()=>{hist.classList.remove('show');totalTokens=0;totalCost=0;currentTodos=[];todosCompleted=0;renderTodos();updStats(null);vs.postMessage({type:'newSession'});};
-document.getElementById('cfg').onclick=()=>vs.postMessage({type:'openSettings'});
 sessEl.onclick=()=>{if(hist.classList.contains('show')){hist.classList.remove('show');}else{vs.postMessage({type:'getHistory'});hist.classList.add('show');}};
 document.addEventListener('click',e=>{if(!sessEl.contains(e.target)&&!hist.contains(e.target))hist.classList.remove('show');});
 function scrollToBottom(){setTimeout(()=>{chat.scrollTop=chat.scrollHeight;},50);}
@@ -1964,10 +2995,19 @@ const nextIdx=currentTodos.findIndex(t=>!t.completed);
 if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
 renderTodos();updateActionSummary('applies',m.count||1);}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
-case'connectionStatus':connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();break;
+case'fullConfig':if(m.settings)populateSettings(m.settings);break;
+case'connectionStatus':
+    connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();
+    // Update settings panel test results
+    const dbResult=document.getElementById('db-test-result');
+    const apiResult=document.getElementById('api-test-result');
+    if(dbResult){dbResult.innerHTML='<div class="test-result '+(m.couchbase?'success':'error')+'">'+(m.couchbase?'✓ Couchbase connected':'✗ Couchbase connection failed')+'</div>';}
+    if(apiResult){apiResult.innerHTML='<div class="test-result '+(m.api?'success':'error')+'">'+(m.api?'✓ Grok API connected':'✗ API connection failed')+'</div>';}
+    break;
 case'fileSearchResults':showAutocomplete(m.files||[]);break;
 case'prefillInput':msg.value=m.text;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';saveInputState();break;
 case'modelInfo':if(m.models){for(const[id,info]of Object.entries(m.models)){modelInfo[id]={ctx:info.contextLength||131072,inPrice:info.inputPrice||0.30,outPrice:info.outputPrice||0.50};}}break;
+case'chartData':renderCharts(m);break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
@@ -2013,20 +3053,22 @@ return null;
 function fmtUserMsg(t){return esc(t).replace(/\`([^\`]+)\`/g,'<code>$1</code>');}
 function addPair(p,i,streaming){const u=document.createElement('div');u.className='msg u';u.innerHTML=fmtUserMsg(p.request.text);chat.appendChild(u);
 const a=document.createElement('div');a.className='msg a';a.dataset.i=i;
+const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';
+const bugBtn='<button class="bug-btn" onclick="reportBug('+i+')" title="Report bug in this response">'+bugIcon+'</button>';
 if(p.response.status==='pending'&&streaming){a.classList.add('p');a.innerHTML='<div class="c"><div class="think"><div class="spin"></div>Thinking...</div></div>';curDiv=a;}
-else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div class="c">⚠️ Error: '+esc(p.response.errorMessage||'')+'</div>';}
-else if(p.response.status==='cancelled'){a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',null,null)+'<div style="color:#c44;margin-top:6px">⏹ Cancelled</div></div>';}
+else if(p.response.status==='error'){a.classList.add('e');a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>⚠️ Error: '+esc(p.response.errorMessage||'')+'</div>';}
+else if(p.response.status==='cancelled'){a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(p.response.text||'',null,null)+'<div style="color:#c44;margin-top:6px">⏹ Cancelled</div></div>';}
 else if(p.response.status==='success'){
 // Use stored structured data if available (new format), else try to parse text (legacy)
 var structured=p.response.structured||tryParseStructured(p.response.text);
 var storedDiffPreview=p.response.diffPreview||null;
 if(structured&&(structured.summary||structured.message||structured.sections||structured.fileChanges)){
-a.innerHTML='<div class="c">'+fmtFinalStructured(structured,p.response.usage,storedDiffPreview,false)+'</div>';
+a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinalStructured(structured,p.response.usage,storedDiffPreview,false)+'</div>';
 }else{
-a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,storedDiffPreview)+'</div>';
+a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(p.response.text||'',p.response.usage,storedDiffPreview)+'</div>';
 }
 }
-else{a.innerHTML='<div class="c">'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
+else{a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
 function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;height:120px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px">'+fmtMd(stream.slice(-800))+'</div>');}
 function fmtFinal(t,u,diffPreview){const result=fmtCode(t,diffPreview);let h=result.html;

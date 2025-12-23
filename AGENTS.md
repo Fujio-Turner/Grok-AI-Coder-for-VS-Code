@@ -4,6 +4,13 @@ A VS Code extension integrating xAI's Grok API with Couchbase persistence for AI
 
 **Repository:** https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code
 
+
+## How This extention Chat works with AI to understand your code and updated it as needed
+
+/docs/CHAT_DESIGN.md
+
+## Chat history is stored in Couchbase as JSON
+
 ## Response Format Requirements
 
 The extension parses AI responses to extract code changes, terminal commands, and TODO lists. Use these exact formats:

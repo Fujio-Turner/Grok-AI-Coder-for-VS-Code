@@ -85,6 +85,50 @@ export interface TodoItem {
     completed: boolean;
 }
 
+export interface SerializedChangeSet {
+    id: string;
+    sessionId: string;
+    timestamp: string;
+    files: Array<{
+        filePath: string;
+        fileName: string;
+        oldContent: string;
+        newContent: string;
+        stats: { added: number; removed: number; modified: number };
+        isNewFile: boolean;
+    }>;
+    totalStats: { added: number; removed: number; modified: number };
+    cost: number;
+    tokensUsed: number;
+    durationMs: number;
+    applied: boolean;
+    description?: string;
+}
+
+export interface ChangeHistoryData {
+    history: SerializedChangeSet[];
+    position: number;
+}
+
+export interface ModelUsageEntry {
+    model: string;      // e.g., "grok-4", "grok-3-mini"
+    text: number;       // Number of text-only calls
+    img: number;        // Number of calls with images (vision)
+}
+
+export type BugType = 'HTML' | 'CSS' | 'JSON' | 'JS' | 'TypeScript' | 'Markdown' | 'SQL' | 'Other';
+export type BugReporter = 'user' | 'script';
+
+export interface BugReport {
+    id: string;              // Unique bug ID
+    type: BugType;           // Type of bug
+    pairIndex: number;       // Position in pairs array
+    by: BugReporter;         // Who reported it
+    description: string;     // Description of the bug
+    timestamp: string;       // When it was reported
+    resolved?: boolean;      // Whether bug has been addressed
+}
+
 export interface ChatSessionDocument {
     id: string;
     docType: 'chat';
@@ -102,6 +146,9 @@ export interface ChatSessionDocument {
     handoffText?: string;  // Summary for handoff to new session
     handoffToSessionId?: string;  // ID of the session this was handed off to
     parentSessionId?: string;  // ID of parent session (for handoff sessions)
+    changeHistory?: ChangeHistoryData;  // Persisted change tracking history
+    modelUsed?: ModelUsageEntry[];  // Aggregate model usage at root level for fast queries
+    bugs?: BugReport[];  // Bug reports for malformed responses
 }
 
 /**
@@ -150,7 +197,8 @@ export async function createSession(parentSessionId?: string): Promise<ChatSessi
         tokensOut: 0,
         pairs: [],
         stepTracker: [],
-        parentSessionId
+        parentSessionId,
+        modelUsed: []
     };
 
     const success = await client.insert(id, doc);
@@ -337,6 +385,58 @@ export async function updateSessionUsage(
 }
 
 /**
+ * Update model usage aggregate at root level.
+ * @param sessionId - Session to update
+ * @param model - Model name (e.g., "grok-4", "grok-3-mini")
+ * @param hasImages - Whether the request included images (vision call)
+ */
+export async function updateSessionModelUsage(
+    sessionId: string,
+    model: string,
+    hasImages: boolean = false
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize modelUsed if not present (for existing sessions)
+    if (!doc.modelUsed) {
+        doc.modelUsed = [];
+    }
+    
+    // Find existing entry for this model or create new one
+    let entry = doc.modelUsed.find(e => e.model === model);
+    if (entry) {
+        if (hasImages) {
+            entry.img += 1;
+        } else {
+            entry.text += 1;
+        }
+    } else {
+        doc.modelUsed.push({
+            model,
+            text: hasImages ? 0 : 1,
+            img: hasImages ? 1 : 0
+        });
+    }
+    
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update session model usage');
+    }
+    
+    console.log('Updated model usage for session:', sessionId, '- model:', model, hasImages ? '(vision)' : '(text)');
+}
+
+/**
  * Update step tracker for a specific step type (cumulative stats).
  */
 export async function updateStepTracker(
@@ -447,4 +547,91 @@ export async function updateSessionHandoff(
     session.updatedAt = new Date().toISOString();
     
     await client.replace(sessionId, session);
+}
+
+/**
+ * Update session change history (for version control / revert functionality)
+ */
+export async function updateSessionChangeHistory(
+    sessionId: string,
+    changeHistory: ChangeHistoryData
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    doc.changeHistory = changeHistory;
+    doc.updatedAt = now;
+    
+    // Check payload size and trim old messages if needed
+    trimOldPairsIfNeeded(doc);
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update session change history');
+    }
+    
+    console.log('Updated change history for session:', sessionId, '- entries:', changeHistory.history.length);
+}
+
+/**
+ * Get the change history for a session
+ */
+export async function getSessionChangeHistory(sessionId: string): Promise<ChangeHistoryData | null> {
+    const session = await getSession(sessionId);
+    return session?.changeHistory || null;
+}
+
+/**
+ * Append a bug report to a session
+ */
+export async function appendSessionBug(
+    sessionId: string,
+    bug: Omit<BugReport, 'id' | 'timestamp'>
+): Promise<BugReport> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize bugs array if not present
+    if (!doc.bugs) {
+        doc.bugs = [];
+    }
+    
+    const fullBug: BugReport = {
+        id: uuidv4(),
+        ...bug,
+        timestamp: now,
+        resolved: false
+    };
+    
+    doc.bugs.push(fullBug);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append bug report');
+    }
+    
+    console.log('Added bug report to session:', sessionId, '- type:', bug.type, 'pairIndex:', bug.pairIndex);
+    return fullBug;
+}
+
+/**
+ * Get all bugs for a session
+ */
+export async function getSessionBugs(sessionId: string): Promise<BugReport[]> {
+    const session = await getSession(sessionId);
+    return session?.bugs || [];
 }
