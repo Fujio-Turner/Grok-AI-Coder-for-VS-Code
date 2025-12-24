@@ -200,6 +200,21 @@ export async function applyEdits(
             // File doesn't exist yet
         }
 
+        // SAFETY CHECK: Detect if newText looks like unprocessed diff content
+        const lines = edit.newText.split('\n');
+        const diffMarkerCount = lines.filter(l => l.startsWith('+') || l.startsWith('-')).length;
+        const totalLines = lines.filter(l => l.trim()).length;
+        const looksLikeDiff = totalLines > 3 && diffMarkerCount > totalLines * 0.5;
+        
+        if (looksLikeDiff && !isNewFile) {
+            console.warn(`[Grok] BLOCKED: Content looks like unprocessed diff (${diffMarkerCount}/${totalLines} lines have +/- prefix). Stripping markers.`);
+            // Strip diff markers to prevent corruption
+            edit.newText = lines
+                .filter(line => !line.startsWith('-'))
+                .map(line => line.startsWith('+') ? line.substring(1) : line)
+                .join('\n');
+        }
+
         const fileChange = changeTracker.createFileChange(
             edit.fileUri.fsPath,
             oldContent,
@@ -218,10 +233,21 @@ export async function applyEdits(
 
     editSnapshots.set(editGroupId, snapshots);
 
+    // Log what we're about to apply for debugging
+    console.log(`[Grok] Applying ${edits.length} edits:`, edits.map(e => ({
+        path: e.fileUri.fsPath,
+        hasRange: !!e.range,
+        textLength: e.newText.length,
+        textPreview: e.newText.substring(0, 100)
+    })));
+
     const success = await vscode.workspace.applyEdit(workspaceEdit);
     
     if (!success) {
-        return { success: false, error: 'Failed to apply edits' };
+        // Try to provide more detailed error info
+        const failedFiles = edits.map(e => e.fileUri.fsPath).join(', ');
+        console.error('[Grok] Failed to apply edits to:', failedFiles);
+        return { success: false, error: `Failed to apply edits to: ${failedFiles}. The file may be read-only, locked, or have conflicting changes.` };
     }
 
     // Save all modified files to disk
@@ -505,6 +531,12 @@ export function applySimpleDiff(originalContent: string, diffContent: string): s
     const diffLines = diffContent.split('\n');
     const resultLines: string[] = [];
     
+    // Check if diff content is empty or malformed
+    if (!diffContent || diffContent.trim() === '') {
+        console.warn('[Grok] Empty diff content, returning original');
+        return originalContent;
+    }
+    
     // Check if this is a simple +/- diff without context
     const hasOnlyAddRemove = diffLines.every(line => 
         line.startsWith('+') || line.startsWith('-') || line.trim() === ''
@@ -518,6 +550,12 @@ export function applySimpleDiff(originalContent: string, diffContent: string): s
             }
             // Skip - lines (removed content)
         }
+        
+        // Validate result isn't empty when there was content
+        if (resultLines.length === 0 && diffLines.some(l => l.startsWith('+'))) {
+            console.warn('[Grok] Diff produced empty result, checking for issues');
+        }
+        
         return resultLines.join('\n');
     }
     

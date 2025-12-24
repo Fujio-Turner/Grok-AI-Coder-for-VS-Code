@@ -71,12 +71,45 @@ ${RESPONSE_JSON_SCHEMA}
 ### File change (new file - full content, isDiff: false):
 {"summary": "Created new helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "def add(a, b):\\n    return a + b", "isDiff": false}]}
 
-### File change (modifying existing file - use diff format, isDiff: true):
+### File change (modifying existing file - PREFERRED: use lineOperations):
+{"summary": "Fixed the helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "", "lineOperations": [
+  {"type": "delete", "line": 6, "expectedContent": "return a + b"},
+  {"type": "insertAfter", "line": 5, "newContent": "    result = a + b"},
+  {"type": "insertAfter", "line": 6, "newContent": "    return result"}
+]}]}
+
+### File change (modifying existing file - FALLBACK: use diff format, isDiff: true):
 {"summary": "Fixed the helper function.", "fileChanges": [{"path": "src/utils.py", "language": "python", "content": "def add(a, b):\\n-    return a + b\\n+    result = a + b\\n+    return result", "isDiff": true, "lineRange": {"start": 5, "end": 7}}]}
 
-## DIFF FORMAT RULES
+## PREFERRED: LINE OPERATIONS (Safest method)
 
-When MODIFYING existing files, use diff format to show changes:
+For MODIFYING existing files, use lineOperations for precise, validated changes:
+
+\`\`\`json
+"lineOperations": [
+  {"type": "delete", "line": 10, "expectedContent": "old code"},
+  {"type": "replace", "line": 15, "expectedContent": "foo", "newContent": "bar"},
+  {"type": "insertAfter", "line": 20, "newContent": "    new_line()"},
+  {"type": "insertBefore", "line": 5, "newContent": "# comment"}
+]
+\`\`\`
+
+**Line operation types:**
+- \`delete\`: Remove line (validates expectedContent exists first)
+- \`replace\`: Replace text on line (validates expectedContent, replaces with newContent)
+- \`insert\`: Insert at line number (pushes existing content down)
+- \`insertAfter\`: Insert after specified line
+- \`insertBefore\`: Insert before specified line
+
+**Why lineOperations is preferred:**
+1. **Validates** before applying - checks expectedContent matches
+2. **Fails safely** - if validation fails, no changes are made
+3. **No truncation** - only specified lines are affected
+4. **Clear intent** - each operation is explicit
+
+## FALLBACK: DIFF FORMAT RULES
+
+When MODIFYING existing files with diff format:
 1. Set "isDiff": true
 2. Lines starting with + are ADDED (shown in green)
 3. Lines starting with - are REMOVED (shown in red)
@@ -192,6 +225,21 @@ When files ARE attached (shown as "📄 filename:" in user message):
 3. Include proper context lines from the actual file
 4. The user will see an "Apply" button for each file change
 
+## MULTI-STEP TASK HANDLING - PREVENT TRUNCATION
+
+**CRITICAL**: Complex tasks with 3+ steps MUST be executed ONE STEP AT A TIME to prevent response truncation.
+
+When to use incremental execution:
+- Task requires creating/modifying 3+ files
+- Task spans multiple concerns (frontend, backend, config, docs)
+- Response would include 3+ fileChanges
+
+How to handle:
+1. First response: Create TODO list with ALL steps, execute ONLY first 1-2 steps, end with nextSteps: ["Say 'continue' to proceed"]
+2. On "continue": Mark completed steps done, execute next 1-2 steps, repeat until complete
+
+This prevents massive responses that get truncated mid-output.
+
 ## REMEMBER
 
 - Start with { and end with }
@@ -235,6 +283,12 @@ If you need file content to make changes:
 1. Ask the user to attach files using the backtick feature
 2. Add a nextSteps entry like: "Type \`index.html to attach the file"
 3. Once files are attached, provide exact fileChanges with Apply buttons
+
+## MULTI-STEP TASK HANDLING
+
+Complex tasks with 3+ steps: Execute ONE STEP AT A TIME.
+- First response: Create TODO list with ALL steps, execute only first 1-2, end with nextSteps: ["Say 'continue' to proceed"]
+- On "continue": Mark completed, execute next 1-2 steps, repeat until done
 `;
     }
     

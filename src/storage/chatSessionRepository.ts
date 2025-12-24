@@ -129,6 +129,37 @@ export interface BugReport {
     resolved?: boolean;      // Whether bug has been addressed
 }
 
+// Operation failure tracking for debugging file edit issues
+export interface OperationFailure {
+    id: string;
+    timestamp: string;
+    pairIndex: number;
+    filePath: string;
+    operationType: 'lineOperation' | 'diff' | 'fullReplace';
+    error: string;
+    // Snapshot of file state at time of failure
+    fileSnapshot?: {
+        hash: string;           // MD5 hash of content at time of operation
+        lineCount: number;
+        sizeBytes: number;
+        capturedAt: string;     // When snapshot was taken
+    };
+    // The operation that failed
+    failedOperation?: {
+        type: string;
+        line?: number;
+        expectedContent?: string;
+        actualContent?: string;
+        newContent?: string;
+    };
+    // All operations in the batch (for context)
+    allOperations?: unknown[];
+    // Was file modified during processing?
+    fileModifiedDuringProcessing?: boolean;
+    originalHash?: string;      // Hash when AI started processing
+    currentHash?: string;       // Hash when operation was attempted
+}
+
 export interface ChatSessionDocument {
     id: string;
     docType: 'chat';
@@ -149,6 +180,7 @@ export interface ChatSessionDocument {
     changeHistory?: ChangeHistoryData;  // Persisted change tracking history
     modelUsed?: ModelUsageEntry[];  // Aggregate model usage at root level for fast queries
     bugs?: BugReport[];  // Bug reports for malformed responses
+    operationFailures?: OperationFailure[];  // Detailed logs of file operation failures
 }
 
 /**
@@ -634,4 +666,64 @@ export async function appendSessionBug(
 export async function getSessionBugs(sessionId: string): Promise<BugReport[]> {
     const session = await getSession(sessionId);
     return session?.bugs || [];
+}
+
+/**
+ * Append an operation failure to a session for debugging
+ */
+export async function appendOperationFailure(
+    sessionId: string,
+    failure: Omit<OperationFailure, 'id' | 'timestamp'>
+): Promise<OperationFailure> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize operationFailures array if not present
+    if (!doc.operationFailures) {
+        doc.operationFailures = [];
+    }
+    
+    const fullFailure: OperationFailure = {
+        id: uuidv4(),
+        ...failure,
+        timestamp: now
+    };
+    
+    // Keep only last 50 failures to prevent unbounded growth
+    if (doc.operationFailures.length >= 50) {
+        doc.operationFailures = doc.operationFailures.slice(-49);
+    }
+    
+    doc.operationFailures.push(fullFailure);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append operation failure');
+    }
+    
+    console.log('Logged operation failure to session:', sessionId, '- file:', failure.filePath, 'error:', failure.error);
+    return fullFailure;
+}
+
+/**
+ * Get all operation failures for a session
+ */
+export async function getOperationFailures(sessionId: string): Promise<OperationFailure[]> {
+    const session = await getSession(sessionId);
+    return session?.operationFailures || [];
+}
+
+/**
+ * Compute MD5 hash of file content for tracking changes
+ */
+export function computeFileHash(content: string): string {
+    return crypto.createHash('md5').update(content).digest('hex');
 }

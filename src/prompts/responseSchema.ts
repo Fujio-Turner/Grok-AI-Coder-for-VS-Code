@@ -9,6 +9,13 @@ export interface TodoItem {
     completed: boolean;
 }
 
+export interface LineOperation {
+    type: 'insert' | 'delete' | 'replace' | 'insertAfter' | 'insertBefore';
+    line: number;              // 1-indexed line number
+    expectedContent?: string;  // For delete/replace: what we expect to find (validation)
+    newContent?: string;       // For insert/replace: what to add
+}
+
 export interface FileChange {
     path: string;
     language: string;
@@ -18,6 +25,8 @@ export interface FileChange {
         end: number;
     };
     isDiff?: boolean;
+    // NEW: Safer line-level operations (preferred over content/isDiff)
+    lineOperations?: LineOperation[];
 }
 
 export interface TerminalCommand {

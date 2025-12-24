@@ -23,7 +23,10 @@ import {
     TodoItem,
     ChangeHistoryData,
     BugType,
-    BugReporter
+    BugReporter,
+    appendOperationFailure,
+    computeFileHash,
+    OperationFailure
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -45,6 +48,7 @@ import {
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
+import { validateAndApplyOperations, LineOperation } from '../edits/lineOperations';
 import { runAgentWorkflow } from '../agent/agentOrchestrator';
 import { findFiles } from '../agent/workspaceFiles';
 import { fetchUrl } from '../agent/httpFetcher';
@@ -1159,6 +1163,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const warningMsg = `⚠️ Response was truncated! Only ${recoveredCount} file change(s) were recovered. Consider breaking the task into smaller steps.`;
                         vscode.window.showWarningMessage(warningMsg);
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n${warningMsg}\n` });
+                        
+                        // Auto-report truncation as a bug
+                        try {
+                            await appendSessionBug(this._currentSessionId!, {
+                                type: 'Other',
+                                pairIndex,
+                                by: 'script',
+                                description: `Auto-detected: Response was truncated - ${recoveredCount} file change(s) recovered from incomplete response`
+                            });
+                            debug('Auto-reported truncation bug for pair:', pairIndex);
+                        } catch (bugErr) {
+                            debug('Failed to auto-report truncation bug:', bugErr);
+                        }
                     }
                     
                     if (usedCleanup) {
@@ -1244,6 +1261,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 hasCommands: !!structured.commands?.length,
                 usedCleanup
             });
+            
+            // Check for truncation in ALL parsing paths (not just AI cleanup)
+            // This catches cases where parseResponse() was used directly
+            if (!usedCleanup) {
+                const { safeParseJson } = await import('../prompts/jsonHelper');
+                const jsonParseResult = safeParseJson(grokResponse.text);
+                if (jsonParseResult?.truncatedFileChanges && jsonParseResult.truncatedFileChanges.length > 0) {
+                    const recoveredCount = jsonParseResult.truncatedFileChanges.length;
+                    const warningMsg = `⚠️ Response was truncated! ${recoveredCount} file change(s) were recovered. Consider breaking the task into smaller steps.`;
+                    vscode.window.showWarningMessage(warningMsg);
+                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n${warningMsg}\n` });
+                    
+                    // Auto-report truncation as a bug
+                    try {
+                        await appendSessionBug(this._currentSessionId!, {
+                            type: 'Other',
+                            pairIndex,
+                            by: 'script',
+                            description: `Auto-detected: Response was truncated - ${recoveredCount} file change(s) recovered from incomplete response`
+                        });
+                        debug('Auto-reported truncation bug for pair:', pairIndex);
+                    } catch (bugErr) {
+                        debug('Failed to auto-report truncation bug:', bugErr);
+                    }
+                }
+            }
 
             // Filter out empty commands (command field must be non-empty)
             const validCommands = structured.commands?.filter(
@@ -1310,8 +1353,70 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     let newText = fc.content;
                     
-                    // If isDiff is true, apply the diff to the existing file content
-                    if (fc.isDiff) {
+                    // PREFERRED: Use lineOperations if provided (safest method)
+                    if (fc.lineOperations && fc.lineOperations.length > 0) {
+                        try {
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            const originalContent = doc.getText();
+                            const originalHash = computeFileHash(originalContent);
+                            const result = validateAndApplyOperations(originalContent, fc.lineOperations as LineOperation[]);
+                            
+                            if (result.success && result.newContent) {
+                                newText = result.newContent;
+                                debug(`Applied ${fc.lineOperations.length} line operations to ${fc.path}`);
+                            } else {
+                                // Line operation validation failed - log to Couchbase
+                                blockedChanges.push(`${fc.path}: Line operation failed - ${result.error}`);
+                                logError(`BLOCKED: Line operation validation failed: ${result.error}`);
+                                
+                                // Log detailed failure to Couchbase for debugging
+                                if (this._currentSessionId) {
+                                    const failedOp = result.failedOperation;
+                                    const lines = originalContent.split('\n');
+                                    const actualContent = failedOp?.line ? lines[failedOp.line - 1] : undefined;
+                                    
+                                    appendOperationFailure(this._currentSessionId, {
+                                        pairIndex,
+                                        filePath: fc.path,
+                                        operationType: 'lineOperation',
+                                        error: result.error || 'Unknown error',
+                                        fileSnapshot: {
+                                            hash: originalHash,
+                                            lineCount: lines.length,
+                                            sizeBytes: originalContent.length,
+                                            capturedAt: new Date().toISOString()
+                                        },
+                                        failedOperation: failedOp ? {
+                                            type: failedOp.type,
+                                            line: failedOp.line,
+                                            expectedContent: failedOp.expectedContent,
+                                            actualContent,
+                                            newContent: failedOp.newContent
+                                        } : undefined,
+                                        allOperations: fc.lineOperations
+                                    }).catch(err => debug('Failed to log operation failure:', err));
+                                }
+                                return null;
+                            }
+                        } catch (err: any) {
+                            blockedChanges.push(`${fc.path}: ${err.message}`);
+                            logError(`BLOCKED: Failed to apply line operations: ${err.message}`);
+                            
+                            // Log exception to Couchbase
+                            if (this._currentSessionId) {
+                                appendOperationFailure(this._currentSessionId, {
+                                    pairIndex,
+                                    filePath: fc.path,
+                                    operationType: 'lineOperation',
+                                    error: err.message,
+                                    allOperations: fc.lineOperations
+                                }).catch(logErr => debug('Failed to log operation failure:', logErr));
+                            }
+                            return null;
+                        }
+                    }
+                    // FALLBACK: If isDiff is true, apply the diff to the existing file content
+                    else if (fc.isDiff) {
                         try {
                             const doc = await vscode.workspace.openTextDocument(fileUri);
                             const originalContent = doc.getText();
@@ -1333,6 +1438,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             // Block this change - it looks like truncated content
                             blockedChanges.push(`${fc.path}: ${validation.warning}`);
                             logError(`BLOCKED file change: ${validation.warning}`);
+                            
+                            // Log truncation/corruption failure to Couchbase
+                            if (this._currentSessionId) {
+                                try {
+                                    const doc = await vscode.workspace.openTextDocument(fileUri);
+                                    const originalContent = doc.getText();
+                                    appendOperationFailure(this._currentSessionId, {
+                                        pairIndex,
+                                        filePath: fc.path,
+                                        operationType: 'fullReplace',
+                                        error: validation.warning || 'Content validation failed',
+                                        fileSnapshot: {
+                                            hash: computeFileHash(originalContent),
+                                            lineCount: originalContent.split('\n').length,
+                                            sizeBytes: originalContent.length,
+                                            capturedAt: new Date().toISOString()
+                                        }
+                                    }).catch(err => debug('Failed to log operation failure:', err));
+                                } catch (docErr) {
+                                    // File doesn't exist - still log the failure
+                                    appendOperationFailure(this._currentSessionId, {
+                                        pairIndex,
+                                        filePath: fc.path,
+                                        operationType: 'fullReplace',
+                                        error: validation.warning || 'Content validation failed'
+                                    }).catch(err => debug('Failed to log operation failure:', err));
+                                }
+                            }
                             return null; // Skip this edit
                         }
                         
@@ -1867,12 +2000,19 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .msg.a{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);margin-right:5%;border-radius:12px 12px 12px 4px}
 .msg.p{opacity:.7}
 .msg.e{background:var(--vscode-inputValidation-errorBackground);border-color:var(--vscode-inputValidation-errorBorder)}
-.msg .c{line-height:1.4}
-.msg .c p{margin:4px 0}
-.msg .c ul,.msg .c ol{margin:4px 0 4px 16px;padding-left:0}
-.msg .c li{margin:2px 0;line-height:1.4}
-.msg .c h1,.msg .c h2,.msg .c h3{margin:8px 0 4px 0;color:var(--vscode-textLink-foreground)}
+.error-suggestion{background:rgba(255,200,50,0.1);border-left:3px solid #f0ad4e;padding:8px 12px;margin:8px 0;font-size:12px;border-radius:0 4px 4px 0;color:var(--vscode-foreground)}
+.error-btns{display:flex;gap:8px;margin-top:8px}
+.btn-diag{background:var(--vscode-textLink-foreground);color:#fff}
+.msg .c{line-height:1.6;font-size:12px}
+.msg .c p{margin:8px 0;line-height:1.7}
+.msg .c ul,.msg .c ol{margin:10px 0 10px 20px;padding-left:0}
+.msg .c li{margin:6px 0;line-height:1.6}
+.msg .c li::marker{color:var(--vscode-textLink-foreground)}
+.msg .c h1,.msg .c h2,.msg .c h3{margin:16px 0 8px 0;color:var(--vscode-textLink-foreground);font-weight:600;padding-bottom:4px;border-bottom:1px solid var(--vscode-panel-border)}
 .msg .c h1{font-size:16px}.msg .c h2{font-size:14px}.msg .c h3{font-size:13px}
+.msg .c strong{color:var(--vscode-foreground);font-weight:600}
+.msg .c em{font-style:italic;color:var(--vscode-descriptionForeground)}
+.msg .c blockquote{margin:10px 0;padding:8px 12px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border);border-radius:0 4px 4px 0}
 .think{display:flex;align-items:center;gap:8px;color:var(--vscode-descriptionForeground);font-size:12px;padding:6px 0}
 .spin{width:14px;height:14px;border:2px solid var(--vscode-descriptionForeground);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -1917,10 +2057,15 @@ pre code{background:none;padding:0}
 .bug-modal-btns button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;font-size:12px}
 .bug-modal-cancel{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 .bug-modal-submit{background:var(--vscode-testing-iconFailed);color:#fff}
-.summary{font-size:13px;font-weight:500;color:var(--vscode-foreground);margin:0 0 12px 0;line-height:1.5}
-.section{margin-bottom:16px}
-.section h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 8px 0;padding-bottom:4px;border-bottom:1px solid var(--vscode-panel-border)}
-.section p{font-size:12px;line-height:1.5;margin:0 0 8px 0;color:var(--vscode-foreground)}
+.summary{font-size:13px;font-weight:500;color:var(--vscode-foreground);margin:0 0 16px 0;line-height:1.6;padding:10px 12px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-textLink-foreground)}
+.section{margin-bottom:20px;padding:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:8px}
+.section h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 10px 0;padding-bottom:6px;border-bottom:1px solid var(--vscode-panel-border);display:flex;align-items:center;gap:6px}
+.section h3::before{content:'';display:inline-block;width:4px;height:14px;background:var(--vscode-textLink-foreground);border-radius:2px}
+.section p{font-size:12px;line-height:1.7;margin:0 0 10px 0;color:var(--vscode-foreground)}
+.section ul,.section ol{margin:8px 0 12px 20px;padding:0}
+.section li{font-size:12px;line-height:1.6;margin:6px 0;color:var(--vscode-foreground)}
+.section li::marker{color:var(--vscode-textLink-foreground)}
+.section code{background:var(--vscode-textCodeBlock-background);padding:2px 6px;border-radius:4px;font-size:11px}
 .code-caption{font-size:11px;color:var(--vscode-descriptionForeground);margin:8px 0 4px 0;font-style:italic}
 .todos-panel{margin-bottom:12px;padding:10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-charts-blue)}
 .todos-hdr{font-size:12px;font-weight:600;color:var(--vscode-foreground);margin-bottom:6px;display:flex;align-items:center;gap:8px}
@@ -2505,6 +2650,39 @@ bugSubmit.addEventListener('click',()=>{
 });
 function reportBug(pairIndex){showBugModal(pairIndex);}
 
+// Error categorization for smart suggestions
+function categorizeError(msg){
+    const m=(msg||'').toLowerCase();
+    if(m.includes('fetch failed')||m.includes('network')||m.includes('econnrefused')||m.includes('enotfound')){
+        return {type:'network',suggestion:'Check your internet connection and try again. The API server may be temporarily unreachable.'};
+    }
+    if(m.includes('timeout')||m.includes('timed out')||m.includes('etimedout')){
+        return {type:'timeout',suggestion:'Request took too long. Try breaking your task into smaller steps or increasing timeout in settings.'};
+    }
+    if(m.includes('rate limit')||m.includes('429')||m.includes('too many requests')){
+        return {type:'ratelimit',suggestion:'API rate limit reached. Wait a few minutes before retrying.'};
+    }
+    if(m.includes('401')||m.includes('unauthorized')||m.includes('invalid api key')||m.includes('authentication')){
+        return {type:'auth',suggestion:'Check your API key in settings. It may be invalid or expired.'};
+    }
+    if(m.includes('500')||m.includes('502')||m.includes('503')||m.includes('server error')){
+        return {type:'server',suggestion:'The API server is having issues. Try again in a few minutes.'};
+    }
+    if(m.includes('truncat')||m.includes('incomplete')){
+        return {type:'truncation',suggestion:'Response was cut off. Try asking for one step at a time.'};
+    }
+    return {type:'unknown',suggestion:null};
+}
+
+// Diagnose error by prefilling a helpful prompt
+function diagnoseError(errMsg){
+    const prompt='The previous request failed with: "'+errMsg+'". Can you help diagnose this and suggest how to proceed? What was the last successful step and what should I try next?';
+    msg.value=prompt;
+    msg.style.height='auto';
+    msg.style.height=Math.min(msg.scrollHeight,120)+'px';
+    msg.focus();
+}
+
 function showSettings(){
     settingsView.classList.add('show');
     chat.classList.add('hide');
@@ -2973,7 +3151,7 @@ d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'load
 case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
-if(curDiv){curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML=fmtFinalStructured(m.structured,m.response.usage,m.diffPreview,m.usedCleanup);updStats(m.response.usage);}
+if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div>'+fmtFinalStructured(m.structured,m.response.usage,m.diffPreview,m.usedCleanup);updStats(m.response.usage);}
 // Use structured TODOs if available, fallback to legacy parsing
 let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
@@ -2984,8 +3162,8 @@ const hasFileChanges=(m.diffPreview&&m.diffPreview.length>0)||(m.structured&&m.s
 console.log('[Grok] Auto-apply check: autoApply='+autoApply+', diffPreview='+JSON.stringify(m.diffPreview)+', fileChanges='+(m.structured?.fileChanges?.length||0));
 if(autoApply&&hasFileChanges){console.log('[Grok] Triggering auto-apply');vs.postMessage({type:'applyEdits',editId:'all'});}
 busy=0;curDiv=null;stream='';updUI();scrollToBottom();saveChatState();break;
-case'requestCancelled':if(curDiv){curDiv.classList.add('e');curDiv.querySelector('.c').innerHTML+='<div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
-case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');curDiv.querySelector('.c').innerHTML='<div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div><button class="btn btn-s" style="margin-top:6px" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button>';}busy=0;curDiv=null;stream='';updUI();break;
+case'requestCancelled':if(curDiv){curDiv.classList.add('e');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
+case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';const errInfo=categorizeError(m.message);curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div>'+(errInfo.suggestion?'<div class="error-suggestion">💡 '+esc(errInfo.suggestion)+'</div>':'')+'<div class="error-btns"><button class="btn btn-s" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button><button class="btn btn-s btn-diag" onclick="diagnoseError(\\''+esc(m.message.replace(/'/g,"\\\\'")||'')+'\\')">🔍 Diagnose</button></div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSummary('commands',1);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
