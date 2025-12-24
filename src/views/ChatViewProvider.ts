@@ -2339,11 +2339,11 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 </div>
                 <div class="summary-card">
                     <div class="summary-value" id="sum-tokens-in">0</div>
-                    <div class="summary-label">Tokens In</div>
+                    <div class="summary-label">Tokens Requests</div>
                 </div>
                 <div class="summary-card">
                     <div class="summary-value" id="sum-tokens-out">0</div>
-                    <div class="summary-label">Tokens Out</div>
+                    <div class="summary-label">Tokens Responses</div>
                 </div>
                 <div class="summary-card cost">
                     <div class="summary-value" id="sum-cost">$0.00</div>
@@ -2356,8 +2356,8 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 <h4>Token Usage Over Time</h4>
                 <div class="bar-chart" id="tokens-chart"></div>
                 <div class="chart-legend">
-                    <span class="legend-item"><span class="legend-dot tokens-in"></span> Tokens In</span>
-                    <span class="legend-item"><span class="legend-dot tokens-out"></span> Tokens Out</span>
+                    <span class="legend-item"><span class="legend-dot tokens-in"></span> Requests</span>
+                    <span class="legend-item"><span class="legend-dot tokens-out"></span> Responses</span>
                 </div>
             </div>
             
@@ -2601,7 +2601,7 @@ function renderCharts(data){
             const inH=Math.max(2,((d.tokensIn||0)/maxTokens)*100);
             const outH=Math.max(2,((d.tokensOut||0)/maxTokens)*100);
             const inVal=formatNumber(d.tokensIn||0);
-            return '<div class="bar-group"><span class="bar-value">'+inVal+'</span><div class="bar tokens-in" style="height:'+inH+'%" title="In: '+inVal+'"></div><div class="bar tokens-out" style="height:'+outH+'%" title="Out: '+formatNumber(d.tokensOut||0)+'"></div><span class="bar-label">'+d.period+'</span></div>';
+            return '<div class="bar-group"><span class="bar-value">'+inVal+'</span><div class="bar tokens-in" style="height:'+inH+'%" title="Requests: '+inVal+'"></div><div class="bar tokens-out" style="height:'+outH+'%" title="Responses: '+formatNumber(d.tokensOut||0)+'"></div><span class="bar-label">'+d.period+'</span></div>';
         }).join('');
     }
     
@@ -2806,7 +2806,7 @@ statsEl.onclick=()=>changesPanel.classList.toggle('show');
 changesClose.onclick=e=>{e.stopPropagation();changesPanel.classList.remove('show');};
 document.addEventListener('click',e=>{if(!statsEl.contains(e.target)&&!changesPanel.contains(e.target))changesPanel.classList.remove('show');});
 
-function updateAutoBtn(){autoBtn.textContent=autoApply?'A':'M';autoBtn.className=autoApply?'auto':'manual';autoBtn.title=autoApply?'Auto Apply (click for Manual)':'Manual Apply (click for Auto)';}
+function updateAutoBtn(){autoBtn.textContent=autoApply?'A':'M';autoBtn.className=autoApply?'auto':'manual';autoBtn.title=autoApply?'Auto (A): Applies AI response actions automatically\\nClick for Manual mode':'Manual (M): Waits for user to apply actions\\nClick for Auto mode';}
 
 function renderTodos(){
     if(currentTodos.length===0){
