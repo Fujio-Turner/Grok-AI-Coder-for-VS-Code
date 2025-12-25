@@ -475,3 +475,235 @@ Default to "Let AI decide" which uses heuristics based on:
 - Task complexity
 - Number of files involved
 - Historical truncation rates for similar tasks
+
+---
+
+## Image Generation Workflow
+
+### Overview
+
+The extension supports AI-powered image generation using the `grok-2-image` model. Unlike chat/vision models that take images as input, the image generation model:
+- Takes **text only** as input
+- Produces **images** as output
+- Uses a separate endpoint: `/v1/images/generations`
+
+### Model Configuration
+
+| Setting | Model | Purpose |
+|---------|-------|---------|
+| `grok.modelVision` | grok-4 | **Understanding** images (input: image → output: text) |
+| `grok.modelImageCreate` | grok-2-image | **Creating** images (input: text → output: image) |
+
+### Image Generation Flow
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Request Analysis"]
+        A[User message] --> B{Contains image<br/>generation keywords?}
+        B -->|No| C[Normal chat flow]
+        B -->|Yes| D{Multiple images<br/>requested?}
+    end
+    
+    subgraph SingleImage["🎨 Single Image"]
+        E[Call /images/generations<br/>with prompt]
+        F[Display image with controls]
+    end
+    
+    subgraph MultiImage["🎨 Multiple Images"]
+        G[Generate N prompts<br/>using grok-3-mini]
+        H[Parallel API calls<br/>to /images/generations]
+        I[Display thumbnail gallery]
+    end
+    
+    subgraph Gallery["🖼️ Image Gallery UI"]
+        J[Thumbnail grid view]
+        K[Hover/click to enlarge]
+        L[Selection checkboxes]
+        M[Per-image regenerate button]
+        N[Download selected button]
+    end
+    
+    subgraph Regenerate["🔄 Regeneration Flow"]
+        O[Click regenerate ↺]
+        P[Popup with editable prompt]
+        Q[Prepopulate original prompt]
+        R[User modifies/appends]
+        S[New API call]
+        T[Replace image in gallery]
+    end
+    
+    subgraph Save["💾 Save Flow"]
+        U[Select images via checkbox]
+        V[Click download/save]
+        W[User picks destination folder]
+        X[Save selected images to project]
+    end
+    
+    D -->|Single| E --> F
+    D -->|Multiple| G --> H --> I
+    F --> J
+    I --> J
+    J --> K
+    J --> L
+    J --> M
+    L --> N --> U --> V --> W --> X
+    M --> O --> P --> Q --> R --> S --> T
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Gallery fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Regenerate fill:#3a1a3a,stroke:#c94eb0,color:#fff
+    style Save fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+```
+
+### API Details
+
+#### Endpoint
+```
+POST https://api.x.ai/v1/images/generations
+```
+
+#### Request Body
+```json
+{
+  "model": "grok-2-image",
+  "prompt": "A cat sitting on a rainbow bridge in space",
+  "n": 4,
+  "response_format": "url"
+}
+```
+
+#### Response
+```json
+{
+  "data": [
+    {
+      "url": "https://..../image1.jpg",
+      "revised_prompt": "A detailed 3D render of a fluffy orange cat..."
+    },
+    {
+      "url": "https://..../image2.jpg",
+      "revised_prompt": "..."
+    }
+  ]
+}
+```
+
+### Detection Keywords
+
+The system detects image generation requests by looking for phrases like:
+- "create an image", "generate an image", "make an image"
+- "draw", "create a picture", "generate a picture"
+- "create icon(s)", "generate icon(s)", "create logo"
+- "create illustration", "generate artwork"
+- "design an image", "produce an image"
+
+Count detection via patterns like "4 icons", "3 images", "5 logo ideas".
+
+### Multi-Image Generation Example
+
+**User**: "Create 4 icon ideas for my mobile app logo based on the README of the project"
+
+**Flow**:
+1. Detect image generation request with count=4
+2. Load README content as context
+3. Use `grok-3-mini` to generate 4 distinct prompts:
+   ```json
+   [
+     "A minimalist mobile app icon featuring a stylized chat bubble with a gear inside...",
+     "A modern gradient app icon showing interconnected nodes representing AI...",
+     "A bold circular icon with a lightning bolt and code brackets...",
+     "A friendly mascot-style icon featuring a robot assistant..."
+   ]
+   ```
+4. Make 4 parallel calls to `/images/generations`
+5. Display 4 thumbnails in a grid
+
+### Image Gallery UI
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🎨 Generated Images (4)                    [💾 Save Selected]  │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ [☐]      │  │ [☑]      │  │ [☐]      │  │ [☑]      │        │
+│  │          │  │          │  │          │  │          │        │
+│  │  img 1   │  │  img 2   │  │  img 3   │  │  img 4   │        │
+│  │          │  │          │  │          │  │          │        │
+│  │   [↺]    │  │   [↺]    │  │   [↺]    │  │   [↺]    │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+│                                                                 │
+│  Hover to enlarge • Click to view full size                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Controls**:
+- `[☐/☑]` - Checkbox to select for download
+- `[↺]` - Regenerate button (opens prompt editor)
+- `[💾 Save Selected]` - Download selected images
+
+### Regeneration Popup
+
+When clicking the regenerate button [↺]:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🔄 Regenerate Image                                      [✕]  │
+├─────────────────────────────────────────────────────────────────┤
+│  Original Prompt:                                               │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ A minimalist mobile app icon featuring a stylized chat  │   │
+│  │ bubble with a gear inside, using blue and white colors, │   │
+│  │ clean lines, modern design aesthetic                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  💡 Edit the prompt above or add to it below:                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ make it darker, add a gradient, more 3D look            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│                          [Cancel]  [🎨 Regenerate]              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Behavior**:
+1. Shows original prompt (prepopulated, editable)
+2. Optional "add refinement" field that appends to prompt
+3. On regenerate: combines prompt + refinements, makes new API call
+4. New image replaces original in gallery position
+
+### Save/Download Flow
+
+1. User selects images via checkboxes
+2. Clicks "Save Selected" button
+3. VS Code file picker opens
+4. User selects destination folder
+5. Images saved as `image-001.jpg`, `image-002.jpg`, etc.
+6. Confirmation message shown
+
+### Data Schema (Couchbase)
+
+Generated images are stored in the chat pair's response:
+
+```json
+{
+  "docType": "chat-pair",
+  "structured": {
+    "generatedImages": [
+      {
+        "id": "img-1703123456789-abc123",
+        "originalPrompt": "Create a minimalist app icon...",
+        "revisedPrompt": "A 3D rendered minimalist...",
+        "url": "https://..../image.jpg",
+        "timestamp": 1703123456789,
+        "selected": false
+      }
+    ]
+  }
+}
+```
+
+### Cost Tracking
+
+Image generation uses a flat per-image pricing model:
+- ~$0.07 per image (as of 2024)
+- Displayed in the token/cost bar after generation

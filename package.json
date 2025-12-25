@@ -152,8 +152,14 @@
         "grok.modelVision": {
           "type": "string",
           "default": "grok-4",
-          "description": "Vision model for image analysis",
+          "description": "Vision model for image analysis (understanding images)",
           "order": 4
+        },
+        "grok.modelImageCreate": {
+          "type": "string",
+          "default": "grok-2-image",
+          "description": "Image generation model for creating images from text prompts",
+          "order": 5
         },
         "grok.modelBase": {
           "type": "string",

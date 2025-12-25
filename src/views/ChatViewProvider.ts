@@ -59,6 +59,7 @@ import { validateAndApplyOperations, LineOperation } from '../edits/lineOperatio
 import { runAgentWorkflow } from '../agent/agentOrchestrator';
 import { findFiles } from '../agent/workspaceFiles';
 import { fetchUrl } from '../agent/httpFetcher';
+import { generateImages, detectImageGenerationRequest, generateImagePrompts, createImageId, GeneratedImage } from '../api/imageGenClient';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -239,6 +240,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'reportBug':
                     this._reportBug(message.pairIndex, message.bugType, message.description, message.by);
+                    break;
+                case 'regenerateImage':
+                    await this._regenerateImage(message.imageId, message.galleryId, message.prompt);
+                    break;
+                case 'saveGeneratedImages':
+                    await this._saveGeneratedImages(message.galleryId, message.images);
+                    break;
+                case 'downloadImage':
+                    await this._downloadImage(message.url, message.filename);
                     break;
             }
         });
@@ -544,6 +554,208 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     public async reportBugFromScript(pairIndex: number, bugType: BugType, description: string) {
         return this._reportBug(pairIndex, bugType, description, 'script');
+    }
+
+    // Image generation state
+    private _generatedImagesMap: Map<string, GeneratedImage[]> = new Map();
+
+    private async _regenerateImage(imageId: string, galleryId: string, prompt: string) {
+        try {
+            const apiKey = await this._context.secrets.get('grokApiKey');
+            if (!apiKey) {
+                vscode.window.showErrorMessage('API key not set. Run "Grok: Set API Key" first.');
+                return;
+            }
+
+            this._postMessage({ type: 'imageRegenerating', imageId, galleryId });
+
+            const result = await generateImages(prompt, 1, apiKey, 'url');
+            
+            if (result.images.length > 0) {
+                const newImage = result.images[0];
+                
+                // Update the image in our state
+                const gallery = this._generatedImagesMap.get(galleryId);
+                if (gallery) {
+                    const idx = gallery.findIndex(img => img.id === imageId);
+                    if (idx >= 0) {
+                        gallery[idx] = {
+                            ...gallery[idx],
+                            url: newImage.url,
+                            revisedPrompt: newImage.revised_prompt,
+                            originalPrompt: prompt,
+                            timestamp: Date.now()
+                        };
+                    }
+                }
+
+                this._postMessage({
+                    type: 'imageRegenerated',
+                    imageId,
+                    galleryId,
+                    newUrl: newImage.url,
+                    revisedPrompt: newImage.revised_prompt
+                });
+
+                vscode.window.showInformationMessage('Image regenerated successfully!');
+            }
+        } catch (error: any) {
+            logError('Image regeneration failed:', error);
+            vscode.window.showErrorMessage(`Image regeneration failed: ${error.message}`);
+            this._postMessage({ type: 'imageRegenFailed', imageId, galleryId, error: error.message });
+        }
+    }
+
+    private async _saveGeneratedImages(galleryId: string, images: Array<{ id: string; url: string }>) {
+        try {
+            // Let user pick a folder
+            const folders = await vscode.window.showOpenDialog({
+                canSelectFiles: false,
+                canSelectFolders: true,
+                canSelectMany: false,
+                openLabel: 'Select Folder to Save Images'
+            });
+
+            if (!folders || folders.length === 0) return;
+            
+            const targetFolder = folders[0];
+            let savedCount = 0;
+
+            for (let i = 0; i < images.length; i++) {
+                const img = images[i];
+                try {
+                    // Fetch image data
+                    const response = await fetch(img.url);
+                    if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
+                    
+                    const buffer = await response.arrayBuffer();
+                    const filename = `generated-image-${String(i + 1).padStart(3, '0')}.jpg`;
+                    const filePath = vscode.Uri.joinPath(targetFolder, filename);
+                    
+                    await vscode.workspace.fs.writeFile(filePath, new Uint8Array(buffer));
+                    savedCount++;
+                } catch (imgError: any) {
+                    logError(`Failed to save image ${img.id}:`, imgError);
+                }
+            }
+
+            if (savedCount > 0) {
+                vscode.window.showInformationMessage(`Saved ${savedCount} image(s) to ${targetFolder.fsPath}`);
+            }
+        } catch (error: any) {
+            logError('Failed to save images:', error);
+            vscode.window.showErrorMessage(`Failed to save images: ${error.message}`);
+        }
+    }
+
+    private async _downloadImage(url: string, filename: string) {
+        try {
+            // Let user pick save location
+            const saveUri = await vscode.window.showSaveDialog({
+                defaultUri: vscode.Uri.file(filename),
+                filters: { 'Images': ['jpg', 'jpeg', 'png'] }
+            });
+
+            if (!saveUri) return;
+
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
+            
+            const buffer = await response.arrayBuffer();
+            await vscode.workspace.fs.writeFile(saveUri, new Uint8Array(buffer));
+            
+            vscode.window.showInformationMessage(`Image saved to ${saveUri.fsPath}`);
+        } catch (error: any) {
+            logError('Failed to download image:', error);
+            vscode.window.showErrorMessage(`Failed to download image: ${error.message}`);
+        }
+    }
+
+    private async _handleImageGenerationRequest(
+        text: string,
+        imageCount: number
+    ): Promise<{ handled: boolean; galleryHtml?: string; images?: GeneratedImage[] }> {
+        try {
+            const apiKey = await this._context.secrets.get('grokApiKey');
+            if (!apiKey) {
+                return { handled: false };
+            }
+
+            const galleryId = `gallery-${Date.now()}`;
+            
+            // If multiple images requested, generate diverse prompts first
+            let prompts: string[] = [text];
+            if (imageCount > 1) {
+                this._postMessage({ type: 'updateResponseChunk', chunk: '🎨 Generating image prompts...\n' });
+                
+                // Get workspace context for better prompts
+                const workspaceInfo = await getWorkspaceInfo();
+                const contextStr = workspaceInfo.projectName ? `Project: ${workspaceInfo.projectName}` : undefined;
+                prompts = await generateImagePrompts(text, imageCount, apiKey, contextStr);
+            }
+
+            this._postMessage({ type: 'updateResponseChunk', chunk: `🖼️ Generating ${prompts.length} image(s)...\n` });
+
+            // Generate images (parallel for multiple)
+            const imagePromises = prompts.map(async (prompt, idx) => {
+                const result = await generateImages(prompt, 1, apiKey, 'url');
+                const img = result.images[0];
+                return {
+                    id: createImageId(),
+                    originalPrompt: prompt,
+                    revisedPrompt: img?.revised_prompt,
+                    url: img?.url,
+                    timestamp: Date.now(),
+                    selected: false
+                } as GeneratedImage;
+            });
+
+            const generatedImages = await Promise.all(imagePromises);
+            
+            // Store in our map
+            this._generatedImagesMap.set(galleryId, generatedImages);
+
+            return {
+                handled: true,
+                galleryHtml: this._buildImageGalleryHtml(galleryId, generatedImages),
+                images: generatedImages
+            };
+        } catch (error: any) {
+            logError('Image generation failed:', error);
+            return { handled: false };
+        }
+    }
+
+    private _buildImageGalleryHtml(galleryId: string, images: GeneratedImage[]): string {
+        const escapeHtml = (s: string) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        
+        let html = `<div class="img-gallery" data-gallery="${galleryId}">
+            <div class="img-gallery-hdr">
+                <span class="img-gallery-title">Generated Images (${images.length})</span>
+                <div class="img-gallery-actions">
+                    <button class="img-save-btn" disabled onclick="saveSelectedImages('${galleryId}')">💾 Save Selected (0)</button>
+                </div>
+            </div>
+            <div class="img-grid">`;
+
+        for (const img of images) {
+            const promptEsc = escapeHtml(img.originalPrompt || '');
+            html += `<div class="img-card" data-gallery="${galleryId}" data-img="${img.id}" onclick="toggleImageSelect('${galleryId}','${img.id}')">
+                <img class="img-card-img" src="${img.url || ''}" alt="Generated image" onerror="this.src='data:image/svg+xml,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'120\\' height=\\'120\\'><rect fill=\\'%23333\\' width=\\'100%\\' height=\\'100%\\'/><text fill=\\'%23999\\' x=\\'50%\\' y=\\'50%\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>Error</text></svg>'">
+                <div class="img-card-overlay">
+                    <div class="img-card-top">
+                        <div class="img-card-check" onclick="event.stopPropagation();toggleImageSelect('${galleryId}','${img.id}')"></div>
+                        <button class="img-card-download" onclick="event.stopPropagation();downloadSingleImage('${img.url || ''}','image-${img.id}.jpg')" title="Download">💾</button>
+                    </div>
+                    <div class="img-card-bottom">
+                        <button class="img-card-regen" onclick="event.stopPropagation();showImgRegenModal('${img.id}','${galleryId}','${promptEsc.replace(/'/g, "\\'")}')">↺ Regenerate</button>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        html += `</div><div class="img-gallery-hint">Click to select • Hover for options</div></div>`;
+        return html;
     }
 
     private static readonly MODEL_CACHE_KEY = 'grok.modelInfoCache';
@@ -1151,6 +1363,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }
                 } catch (agentError) {
                     debug('Agent workflow error (continuing without files):', agentError);
+                }
+            }
+
+            // Check if this is an image generation request
+            const imageDetection = detectImageGenerationRequest(messageText);
+            if (imageDetection.isImageRequest && !hasImages) {
+                info(`Detected image generation request: count=${imageDetection.imageCount}`);
+                
+                try {
+                    const imageResult = await this._handleImageGenerationRequest(
+                        finalMessageText,
+                        imageDetection.imageCount
+                    );
+                    
+                    if (imageResult.handled && imageResult.galleryHtml) {
+                        // Build a response with the gallery
+                        const imageResponse: ChatResponse = {
+                            text: `Generated ${imageResult.images?.length || 0} image(s) based on your request.`,
+                            status: 'success',
+                            structured: {
+                                summary: `Generated ${imageResult.images?.length || 0} image(s)`
+                            }
+                        };
+                        // Store generated images separately (not in GrokStructuredResponse type)
+                        (imageResponse as any).generatedImages = imageResult.images;
+                        
+                        await updateLastPairResponseWithExtension(this._currentSessionId, imageResponse);
+                        
+                        this._postMessage({
+                            type: 'requestComplete',
+                            pairIndex,
+                            structured: imageResponse.structured,
+                            imageGalleryHtml: imageResult.galleryHtml
+                        });
+                        
+                        this._isRequestInProgress = false;
+                        vscode.commands.executeCommand('setContext', 'grok.requestInProgress', false);
+                        return;
+                    }
+                } catch (imgError: any) {
+                    logError('Image generation failed, falling back to chat:', imgError);
+                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `⚠️ Image generation failed: ${imgError.message}\nFalling back to text response...\n\n` });
                 }
             }
 
@@ -2075,6 +2329,12 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .msg .c em{font-style:italic;color:var(--vscode-descriptionForeground)}
 .msg .c blockquote{margin:10px 0;padding:8px 12px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border);border-radius:0 4px 4px 0}
 .think{display:flex;align-items:center;gap:8px;color:var(--vscode-descriptionForeground);font-size:12px;padding:6px 0}
+.think-toggle{cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:4px}
+.think-toggle:hover{color:var(--vscode-foreground)}
+.think-arrow{transition:transform 0.2s;font-size:10px}
+.think-arrow.open{transform:rotate(90deg)}
+.stream-content{font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:150px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px;display:none}
+.stream-content.show{display:block}
 .spin{width:14px;height:14px;border:2px solid var(--vscode-descriptionForeground);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .diff{margin:10px 0;border:1px solid var(--vscode-panel-border);border-radius:6px;overflow:hidden}
@@ -2200,6 +2460,55 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 .img-thumb{position:relative;width:52px;height:52px;border-radius:6px;overflow:hidden;border:1px solid var(--vscode-panel-border)}
 .img-thumb img{width:100%;height:100%;object-fit:cover}
 .img-thumb .rm{position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:#c44;color:#fff;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;border:none}
+
+/* Image Generation Gallery */
+.img-gallery{margin:12px 0;padding:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:8px}
+.img-gallery-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--vscode-panel-border)}
+.img-gallery-title{font-size:12px;font-weight:600;color:var(--vscode-foreground);display:flex;align-items:center;gap:6px}
+.img-gallery-title::before{content:'🎨'}
+.img-gallery-actions{display:flex;gap:6px}
+.img-save-btn{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:4px}
+.img-save-btn:hover{opacity:.9}
+.img-save-btn:disabled{opacity:.5;cursor:not-allowed}
+.img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
+.img-card{position:relative;border-radius:8px;overflow:hidden;border:2px solid transparent;transition:all .2s;cursor:pointer;background:var(--vscode-textCodeBlock-background)}
+.img-card:hover{border-color:var(--vscode-textLink-foreground);transform:scale(1.02)}
+.img-card.selected{border-color:var(--vscode-testing-iconPassed)}
+.img-card-img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
+.img-card-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);opacity:0;transition:opacity .2s;display:flex;flex-direction:column;justify-content:space-between;padding:6px}
+.img-card:hover .img-card-overlay{opacity:1}
+.img-card-top{display:flex;justify-content:space-between}
+.img-card-check{width:20px;height:20px;border:2px solid #fff;border-radius:4px;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px}
+.img-card.selected .img-card-check{background:var(--vscode-testing-iconPassed);border-color:var(--vscode-testing-iconPassed)}
+.img-card-download{width:24px;height:24px;border:none;border-radius:4px;background:rgba(255,255,255,.2);cursor:pointer;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px}
+.img-card-download:hover{background:rgba(255,255,255,.4)}
+.img-card-bottom{display:flex;justify-content:center}
+.img-card-regen{background:rgba(255,255,255,.2);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:10px;cursor:pointer;display:flex;align-items:center;gap:4px}
+.img-card-regen:hover{background:rgba(255,255,255,.4)}
+.img-gallery-hint{font-size:10px;color:var(--vscode-descriptionForeground);text-align:center;margin-top:8px}
+
+/* Image Lightbox (full view on click) */
+.img-lightbox{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:1000;flex-direction:column;gap:12px}
+.img-lightbox.show{display:flex}
+.img-lightbox-img{max-width:90%;max-height:80%;object-fit:contain;border-radius:8px}
+.img-lightbox-close{position:absolute;top:16px;right:16px;background:rgba(255,255,255,.2);color:#fff;border:none;border-radius:50%;width:36px;height:36px;font-size:18px;cursor:pointer}
+.img-lightbox-close:hover{background:rgba(255,255,255,.4)}
+.img-lightbox-prompt{max-width:80%;background:rgba(0,0,0,.7);color:#fff;padding:10px 16px;border-radius:8px;font-size:11px;text-align:center}
+
+/* Image Regenerate Modal */
+#img-regen-modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:1001}
+#img-regen-modal.show{display:flex}
+.img-regen-content{background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:8px;padding:16px;width:90%;max-width:450px;box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.img-regen-title{font-size:14px;font-weight:600;margin:0 0 12px 0;display:flex;align-items:center;gap:6px}
+.img-regen-row{margin-bottom:12px}
+.img-regen-row label{display:block;font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:4px}
+.img-regen-row textarea{width:100%;padding:8px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground);border-radius:4px;font-size:12px;font-family:inherit;resize:vertical}
+.img-regen-original{min-height:60px}
+.img-regen-refine{min-height:40px}
+.img-regen-btns{display:flex;gap:8px;justify-content:flex-end}
+.img-regen-btns button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;font-size:12px}
+.img-regen-cancel{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+.img-regen-submit{background:var(--vscode-button-background);color:var(--vscode-button-foreground);display:flex;align-items:center;gap:4px}
 
 .apply-all{margin:10px 0;padding:8px 12px;background:var(--vscode-testing-iconPassed);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:6px;width:100%}
 .apply-all:hover{opacity:.9}
@@ -2623,6 +2932,32 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
     </div>
 </div>
 
+<!-- Image Regenerate Modal -->
+<div id="img-regen-modal">
+    <div class="img-regen-content">
+        <div class="img-regen-title">🔄 Regenerate Image</div>
+        <div class="img-regen-row">
+            <label>Original Prompt (editable)</label>
+            <textarea id="img-regen-original" class="img-regen-original" placeholder="Original prompt..."></textarea>
+        </div>
+        <div class="img-regen-row">
+            <label>💡 Add refinements (optional - appended to prompt)</label>
+            <textarea id="img-regen-refine" class="img-regen-refine" placeholder="e.g., make it darker, add more detail..."></textarea>
+        </div>
+        <div class="img-regen-btns">
+            <button class="img-regen-cancel" id="img-regen-cancel">Cancel</button>
+            <button class="img-regen-submit" id="img-regen-submit">🎨 Regenerate</button>
+        </div>
+    </div>
+</div>
+
+<!-- Image Lightbox (full view) -->
+<div id="img-lightbox" class="img-lightbox">
+    <button class="img-lightbox-close" id="img-lightbox-close">✕</button>
+    <img id="img-lightbox-img" class="img-lightbox-img" src="" alt="Full size image">
+    <div id="img-lightbox-prompt" class="img-lightbox-prompt"></div>
+</div>
+
 <!-- Expanded Changes Panel (dropdown from stats bar) -->
 <div id="changes-panel">
     <div id="changes-hdr"><span>📁 Change History</span><span id="changes-close" style="cursor:pointer">✕</span></div>
@@ -2734,6 +3069,94 @@ bugSubmit.addEventListener('click',()=>{
     hideBugModal();
 });
 function reportBug(pairIndex){showBugModal(pairIndex);}
+
+// Image Generation Gallery handling
+const imgRegenModal=document.getElementById('img-regen-modal');
+const imgRegenOriginal=document.getElementById('img-regen-original');
+const imgRegenRefine=document.getElementById('img-regen-refine');
+const imgRegenCancel=document.getElementById('img-regen-cancel');
+const imgRegenSubmit=document.getElementById('img-regen-submit');
+const imgLightbox=document.getElementById('img-lightbox');
+const imgLightboxImg=document.getElementById('img-lightbox-img');
+const imgLightboxPrompt=document.getElementById('img-lightbox-prompt');
+const imgLightboxClose=document.getElementById('img-lightbox-close');
+let regenImageId='',regenGalleryId='';
+let generatedImagesState={};
+
+function showImgLightbox(url,prompt){
+    imgLightboxImg.src=url;
+    imgLightboxPrompt.textContent=prompt||'';
+    imgLightbox.classList.add('show');
+}
+function hideImgLightbox(){imgLightbox.classList.remove('show');imgLightboxImg.src='';}
+imgLightboxClose.addEventListener('click',hideImgLightbox);
+imgLightbox.addEventListener('click',e=>{if(e.target===imgLightbox)hideImgLightbox();});
+
+function showImgRegenModal(imageId,galleryId,originalPrompt){
+    regenImageId=imageId;
+    regenGalleryId=galleryId;
+    imgRegenOriginal.value=originalPrompt||'';
+    imgRegenRefine.value='';
+    imgRegenModal.classList.add('show');
+    imgRegenOriginal.focus();
+}
+function hideImgRegenModal(){
+    imgRegenModal.classList.remove('show');
+    regenImageId='';
+    regenGalleryId='';
+}
+imgRegenCancel.addEventListener('click',hideImgRegenModal);
+imgRegenModal.addEventListener('click',e=>{if(e.target===imgRegenModal)hideImgRegenModal();});
+imgRegenSubmit.addEventListener('click',()=>{
+    const base=imgRegenOriginal.value.trim();
+    const refine=imgRegenRefine.value.trim();
+    if(!base){imgRegenOriginal.focus();return;}
+    const finalPrompt=refine?base+'. '+refine:base;
+    vs.postMessage({type:'regenerateImage',imageId:regenImageId,galleryId:regenGalleryId,prompt:finalPrompt});
+    hideImgRegenModal();
+});
+
+function toggleImageSelect(galleryId,imageId){
+    const card=document.querySelector('.img-card[data-gallery="'+galleryId+'"][data-img="'+imageId+'"]');
+    if(card){
+        card.classList.toggle('selected');
+        const check=card.querySelector('.img-card-check');
+        if(check)check.textContent=card.classList.contains('selected')?'✓':'';
+        updateSaveButtonState(galleryId);
+    }
+}
+function updateSaveButtonState(galleryId){
+    const gallery=document.querySelector('.img-gallery[data-gallery="'+galleryId+'"]');
+    if(!gallery)return;
+    const selected=gallery.querySelectorAll('.img-card.selected').length;
+    const saveBtn=gallery.querySelector('.img-save-btn');
+    if(saveBtn){
+        saveBtn.disabled=selected===0;
+        saveBtn.textContent='💾 Save Selected ('+selected+')';
+    }
+}
+function saveSelectedImages(galleryId){
+    const gallery=document.querySelector('.img-gallery[data-gallery="'+galleryId+'"]');
+    if(!gallery)return;
+    const selected=Array.from(gallery.querySelectorAll('.img-card.selected')).map(c=>({
+        id:c.dataset.img,
+        url:c.querySelector('.img-card-img')?.src||''
+    }));
+    if(selected.length===0)return;
+    vs.postMessage({type:'saveGeneratedImages',galleryId:galleryId,images:selected});
+}
+function downloadSingleImage(url,filename){
+    vs.postMessage({type:'downloadImage',url:url,filename:filename||'generated-image.jpg'});
+}
+function renderImageGallery(galleryId,images){
+    let html='<div class="img-gallery" data-gallery="'+galleryId+'"><div class="img-gallery-hdr"><span class="img-gallery-title">Generated Images ('+images.length+')</span><div class="img-gallery-actions"><button class="img-save-btn" disabled onclick="saveSelectedImages(\\''+galleryId+'\\')">💾 Save Selected (0)</button></div></div><div class="img-grid">';
+    for(const img of images){
+        html+='<div class="img-card" data-gallery="'+galleryId+'" data-img="'+img.id+'" onclick="toggleImageSelect(\\''+galleryId+'\\',\\''+img.id+'\\')"><img class="img-card-img" src="'+img.url+'" alt="Generated image"><div class="img-card-overlay"><div class="img-card-top"><div class="img-card-check" onclick="event.stopPropagation();toggleImageSelect(\\''+galleryId+'\\',\\''+img.id+'\\')"></div><button class="img-card-download" onclick="event.stopPropagation();downloadSingleImage(\\''+img.url+'\\',\\'image-'+img.id+'.jpg\\')" title="Download">💾</button></div><div class="img-card-bottom"><button class="img-card-regen" onclick="event.stopPropagation();showImgRegenModal(\\''+img.id+'\\',\\''+galleryId+'\\',\\''+escHtml(img.prompt||'')+'\\')">↺ Regenerate</button></div></div></div>';
+    }
+    html+='</div><div class="img-gallery-hint">Click to select • Hover for options • Click image to enlarge</div></div>';
+    return html;
+}
+function escHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 // Error categorization for smart suggestions
 function categorizeError(msg){
@@ -3317,7 +3740,7 @@ d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'load
 case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
-if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div>'+fmtFinalStructured(m.structured,m.response.usage,m.diffPreview,m.usedCleanup);updStats(m.response.usage);}
+if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';let content='<div class="msg-actions">'+bugBtn+'</div>';if(m.imageGalleryHtml){content+=m.imageGalleryHtml;}else{content+=fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup);}curDiv.querySelector('.c').innerHTML=content;if(m.response?.usage)updStats(m.response.usage);}
 // Use structured TODOs if available, fallback to legacy parsing
 let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
@@ -3352,6 +3775,18 @@ case'fileSearchResults':showAutocomplete(m.files||[]);break;
 case'prefillInput':msg.value=m.text;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';saveInputState();break;
 case'modelInfo':if(m.models){for(const[id,info]of Object.entries(m.models)){modelInfo[id]={ctx:info.contextLength||131072,inPrice:info.inputPrice||0.30,outPrice:info.outputPrice||0.50};}}break;
 case'chartData':renderCharts(m);break;
+case'imageRegenerating':
+    const regenCard=document.querySelector('.img-card[data-gallery="'+m.galleryId+'"][data-img="'+m.imageId+'"]');
+    if(regenCard){regenCard.style.opacity='0.5';regenCard.querySelector('.img-card-regen').textContent='⏳ Generating...';}
+    break;
+case'imageRegenerated':
+    const regenCard2=document.querySelector('.img-card[data-gallery="'+m.galleryId+'"][data-img="'+m.imageId+'"]');
+    if(regenCard2){regenCard2.style.opacity='1';const img=regenCard2.querySelector('.img-card-img');if(img)img.src=m.newUrl;regenCard2.querySelector('.img-card-regen').textContent='↺ Regenerate';}
+    break;
+case'imageRegenFailed':
+    const regenCard3=document.querySelector('.img-card[data-gallery="'+m.galleryId+'"][data-img="'+m.imageId+'"]');
+    if(regenCard3){regenCard3.style.opacity='1';regenCard3.querySelector('.img-card-regen').textContent='↺ Retry';}
+    break;
 case'sessionExtended':
     // Update extension info and storage after user clicked Extend
     if(typeof m.totalStorageBytes==='number'){estimatedStorageBytes=m.totalStorageBytes;}
@@ -3430,7 +3865,9 @@ a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(
 }
 else{a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
-function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div>Generating...</div>'+(isJson?'':'<div style="font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;height:120px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px">'+fmtMd(stream.slice(-800))+'</div>');}
+let streamExpanded=false;
+function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');const arrowClass=streamExpanded?'think-arrow open':'think-arrow';const contentClass=streamExpanded?'stream-content show':'stream-content';curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div><span class="think-toggle" onclick="toggleStream()"><span class="'+arrowClass+'">▶</span> Generating...</span></div>'+(isJson?'':'<div class="'+contentClass+'">'+fmtMd(stream.slice(-800))+'</div>');}
+function toggleStream(){streamExpanded=!streamExpanded;updStream();}
 function fmtFinal(t,u,diffPreview){const result=fmtCode(t,diffPreview);let h=result.html;
 // Build done bar with optional action buttons
 const filesApplied=autoApply&&result.fileCount>0;
