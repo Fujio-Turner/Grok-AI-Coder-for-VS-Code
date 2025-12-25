@@ -178,6 +178,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'runCommand':
                     await this.runTerminalCommand(message.command);
                     break;
+                case 'runAllCommands':
+                    await this.runAllCommands(message.commands);
+                    break;
                 case 'openSettings':
                     this._sendFullConfig();
                     break;
@@ -277,6 +280,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             type: 'config',
             enterToSend: config.get<boolean>('enterToSend', false),
             autoApply: config.get<boolean>('autoApply', true),
+            autoApplyFiles: config.get<boolean>('autoApplyFiles', true),
+            autoApplyCli: config.get<boolean>('autoApplyCli', false),
             modelMode: modelMode,
             activeModel: activeModel
         });
@@ -316,7 +321,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 // Chat
                 enterToSend: config.get<boolean>('enterToSend', false),
                 autoApply: config.get<boolean>('autoApply', true),
+                autoApplyFiles: config.get<boolean>('autoApplyFiles', true),
+                autoApplyCli: config.get<boolean>('autoApplyCli', false),
                 maxPayloadSizeMB: config.get<number>('maxPayloadSizeMB', 15),
+                cliWhitelist: config.get<string[]>('cliWhitelist', []),
                 
                 // Optimize
                 requestFormat: config.get<string>('requestFormat', 'json'),
@@ -367,7 +375,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 // Chat
                 enterToSend: 'enterToSend',
                 autoApply: 'autoApply',
+                autoApplyFiles: 'autoApplyFiles',
+                autoApplyCli: 'autoApplyCli',
                 maxPayloadSizeMB: 'maxPayloadSizeMB',
+                cliWhitelist: 'cliWhitelist',
                 
                 // Optimize
                 requestFormat: 'requestFormat',
@@ -1867,6 +1878,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }
             });
 
+            // Auto-execute CLI commands if enabled
+            await this._autoExecuteCommands(validCommands || []);
+
+            // Check if AI response indicates to continue pending commands
+            await this._checkContinueCommands(structured);
+
             vscode.window.showInformationMessage('Grok completed the request.');
 
         } catch (error: any) {
@@ -2134,6 +2151,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    /**
+     * Check if a command is whitelisted for auto-execution
+     */
+    private _isCommandWhitelisted(command: string): boolean {
+        const config = vscode.workspace.getConfiguration('grok');
+        const whitelist = config.get<string[]>('cliWhitelist', []);
+        const cmdLower = command.trim().toLowerCase();
+        
+        return whitelist.some(prefix => cmdLower.startsWith(prefix.toLowerCase()));
+    }
+
+    /**
+     * Auto-execute whitelisted commands when Auto mode is enabled
+     */
+    private async _autoExecuteCommands(commands: Array<{ command?: string; description?: string }>) {
+        const config = vscode.workspace.getConfiguration('grok');
+        const autoApply = config.get<boolean>('autoApply', true);
+        const autoApplyCli = config.get<boolean>('autoApplyCli', false);
+        
+        if (!autoApply || !autoApplyCli || !commands || commands.length === 0) {
+            return;
+        }
+
+        for (const cmd of commands) {
+            if (!cmd.command || cmd.command.trim().length === 0) continue;
+            
+            const command = cmd.command.trim();
+            
+            if (this._isCommandWhitelisted(command)) {
+                info(`Auto-executing whitelisted command: ${command}`);
+                await this.runTerminalCommand(command);
+            } else {
+                // Command not whitelisted - show prompt to user
+                const action = await vscode.window.showWarningMessage(
+                    `AI wants to run: "${command}"`,
+                    'Run Once',
+                    'Add to Whitelist & Run',
+                    'Skip'
+                );
+                
+                if (action === 'Run Once') {
+                    await this.runTerminalCommand(command);
+                } else if (action === 'Add to Whitelist & Run') {
+                    // Add command prefix to whitelist
+                    const whitelist = config.get<string[]>('cliWhitelist', []);
+                    const cmdPrefix = command.split(' ')[0]; // Get first word as prefix
+                    if (!whitelist.includes(cmdPrefix)) {
+                        whitelist.push(cmdPrefix);
+                        await config.update('cliWhitelist', whitelist, vscode.ConfigurationTarget.Global);
+                        info(`Added "${cmdPrefix}" to CLI whitelist`);
+                    }
+                    await this.runTerminalCommand(command);
+                }
+                // 'Skip' or dismiss - do nothing
+            }
+        }
+    }
+
     public async runTerminalCommand(command: string) {
         if (!command || command.trim().length === 0) {
             return;
@@ -2165,18 +2240,222 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 output: output.slice(0, 5000)
             });
 
-            if (output) {
-                await this.sendMessage(`I ran the command: \`${command}\`\n\nOutput:\n\`\`\`\n${output.slice(0, 3000)}\n\`\`\`\n\nPlease analyze this output.`);
-            }
+            // Always feed output back to AI for analysis
+            const feedbackMsg = output 
+                ? `I ran the command: \`${command}\`\n\nOutput:\n\`\`\`\n${output.slice(0, 3000)}\n\`\`\`\n\nPlease analyze this output and let me know if there are any issues or next steps.`
+                : `I ran the command: \`${command}\`\n\nThe command completed successfully with no output. Please continue with the next steps if any.`;
+            await this.sendMessage(feedbackMsg);
 
         } catch (error: any) {
             logError('Command failed:', error);
+            const errorOutput = `Error: ${error.message}`;
+            this._postMessage({
+                type: 'commandOutput',
+                command,
+                output: errorOutput,
+                isError: true
+            });
+            // Feed error back to AI so it can suggest fixes
+            await this.sendMessage(`I ran the command: \`${command}\`\n\nThe command failed:\n\`\`\`\n${errorOutput}\n\`\`\`\n\nPlease analyze this error and suggest a fix.`);
+        }
+    }
+
+    // Store pending commands for sequential execution
+    private _pendingCommands: string[] = [];
+    private _commandResults: Array<{ command: string; output: string; success: boolean }> = [];
+
+    public async runAllCommands(commands: string[]) {
+        if (!commands || commands.length === 0) {
+            return;
+        }
+
+        // Store all commands and reset results
+        this._pendingCommands = [...commands];
+        this._commandResults = [];
+
+        info(`Starting sequential execution of ${commands.length} commands`);
+
+        // Run first command
+        await this._runNextCommand();
+    }
+
+    private async _runNextCommand() {
+        if (this._pendingCommands.length === 0) {
+            // All done - send final summary
+            await this._sendFinalCommandSummary();
+            return;
+        }
+
+        const command = this._pendingCommands.shift()!;
+        const remainingCount = this._pendingCommands.length;
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const cwd = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const { exec } = require('child_process');
+
+        info(`Running command (${this._commandResults.length + 1}/${this._commandResults.length + 1 + remainingCount}): ${command}`);
+
+        let output = '';
+        let success = true;
+
+        try {
+            const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+                exec(command, { cwd, maxBuffer: 1024 * 1024, timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
+                    if (error && !stdout && !stderr) {
+                        reject(error);
+                    } else {
+                        resolve({ stdout: stdout || '', stderr: stderr || '' });
+                    }
+                });
+            });
+
+            output = (result.stdout + result.stderr).trim();
+            this._postMessage({
+                type: 'commandOutput',
+                command,
+                output: output.slice(0, 2000)
+            });
+
+        } catch (error: any) {
+            output = error.message;
+            success = false;
             this._postMessage({
                 type: 'commandOutput',
                 command,
                 output: `Error: ${error.message}`,
                 isError: true
             });
+        }
+
+        // Store result
+        this._commandResults.push({ command, output: output.slice(0, 500), success });
+
+        // Build progress summary
+        const completed = this._commandResults.length;
+        const total = completed + remainingCount;
+        const successCount = this._commandResults.filter(r => r.success).length;
+        const failCount = this._commandResults.filter(r => !r.success).length;
+
+        // Send sticky summary panel update
+        this._postMessage({
+            type: 'cliSummaryUpdate',
+            completed,
+            total,
+            successCount,
+            failCount,
+            results: this._commandResults.map(r => ({
+                command: r.command.slice(0, 50) + (r.command.length > 50 ? '...' : ''),
+                success: r.success,
+                output: r.output.slice(0, 100)
+            })),
+            remaining: this._pendingCommands.slice(0, 3).map(c => c.slice(0, 50)),
+            isComplete: remainingCount === 0
+        });
+
+        let msg = `**Command ${completed}/${total}** ${success ? '✓' : '✗'}\n`;
+        msg += `\`${command}\`\n\n`;
+
+        if (output) {
+            msg += `**Output:**\n\`\`\`\n${output.slice(0, 1000)}\n\`\`\`\n\n`;
+        } else {
+            msg += `*No output*\n\n`;
+        }
+
+        msg += `**Progress:** ✓ ${successCount} succeeded, ✗ ${failCount} failed\n\n`;
+
+        if (remainingCount > 0) {
+            msg += `**Remaining commands (${remainingCount}):**\n`;
+            this._pendingCommands.slice(0, 3).forEach(c => {
+                msg += `- \`${c.slice(0, 60)}${c.length > 60 ? '...' : ''}\`\n`;
+            });
+            if (remainingCount > 3) {
+                msg += `- ...and ${remainingCount - 3} more\n`;
+            }
+            msg += `\nAnalyze this result. Reply with:\n`;
+            msg += `- \`continue\` to run the next command\n`;
+            msg += `- A different command if you need to fix something first\n`;
+            msg += `- \`stop\` if we should pause here\n`;
+        } else {
+            msg += `\n**All commands complete.** Please provide a summary of the results.`;
+        }
+
+        await this.sendMessage(msg);
+    }
+
+    private async _sendFinalCommandSummary() {
+        const successCount = this._commandResults.filter(r => r.success).length;
+        const failCount = this._commandResults.filter(r => !r.success).length;
+        const total = this._commandResults.length;
+
+        let summary = `## Command Execution Complete\n\n`;
+        summary += `**Results:** ${successCount}/${total} succeeded`;
+        if (failCount > 0) {
+            summary += `, ${failCount} failed`;
+        }
+        summary += `\n\n`;
+
+        if (failCount > 0) {
+            summary += `**Failed:**\n`;
+            this._commandResults.filter(r => !r.success).forEach(r => {
+                summary += `- \`${r.command}\`: ${r.output.slice(0, 100)}\n`;
+            });
+            summary += `\n`;
+        }
+
+        summary += `Please summarize what was accomplished and suggest any next steps.`;
+
+        this._commandResults = [];
+        await this.sendMessage(summary);
+    }
+
+    // Handle AI response to continue command execution
+    public async handleContinueCommands() {
+        if (this._pendingCommands.length > 0) {
+            await this._runNextCommand();
+        }
+    }
+
+    // Check if AI response indicates to continue with pending commands
+    private async _checkContinueCommands(structured: GrokStructuredResponse) {
+        if (this._pendingCommands.length === 0) {
+            return;
+        }
+
+        // Check if AI response contains "continue" keyword
+        const responseText = (structured.summary || '') + ' ' + (structured.message || '');
+        const lowerText = responseText.toLowerCase();
+        
+        // Check for continue signals
+        const continuePatterns = [
+            /\bcontinue\b/,
+            /\bproceed\b/,
+            /\bnext command\b/,
+            /\brun next\b/,
+            /\ball good\b/,
+            /\blooks good\b/
+        ];
+        
+        const stopPatterns = [
+            /\bstop\b/,
+            /\bpause\b/,
+            /\bwait\b/,
+            /\bfix.*first\b/,
+            /\berror\b.*\baddress\b/
+        ];
+        
+        const shouldStop = stopPatterns.some(p => p.test(lowerText));
+        const shouldContinue = continuePatterns.some(p => p.test(lowerText));
+        
+        if (shouldStop) {
+            info('AI indicated to stop - pausing command execution');
+            this._pendingCommands = []; // Clear pending
+            return;
+        }
+        
+        if (shouldContinue && this._pendingCommands.length > 0) {
+            info(`AI indicated continue - running next command (${this._pendingCommands.length} remaining)`);
+            // Small delay to let UI update
+            setTimeout(() => this._runNextCommand(), 500);
         }
     }
 
@@ -2351,8 +2630,27 @@ pre code{background:none;padding:0}
 .btn-s{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 .btn-ok{background:var(--vscode-testing-iconPassed);color:#fff}
 .done{display:flex;align-items:center;gap:8px;margin-top:8px;padding:8px 12px;background:rgba(80,200,80,.08);border-radius:4px;border-left:3px solid var(--vscode-testing-iconPassed);font-size:12px}
+.done.pending{background:rgba(255,180,0,.08);border-left-color:#ffb400}
+#cli-summary{display:none;background:var(--vscode-editorWidget-background);border:1px solid var(--vscode-panel-border);border-radius:8px;margin:8px;padding:10px;font-size:12px}
+#cli-summary.active{display:block}
+.cli-sum-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-weight:600}
+.cli-sum-progress{display:flex;gap:12px;font-size:11px}
+.cli-sum-ok{color:#6a9}
+.cli-sum-err{color:#c44}
+.cli-sum-bar{height:4px;background:var(--vscode-progressBar-background);border-radius:2px;margin:8px 0}
+.cli-sum-fill{height:100%;background:var(--vscode-testing-iconPassed);border-radius:2px;transition:width 0.3s}
+.cli-sum-list{max-height:120px;overflow-y:auto;font-size:11px}
+.cli-sum-item{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--vscode-panel-border)}
+.cli-sum-item:last-child{border-bottom:none}
+.cli-sum-icon{flex-shrink:0}
+.cli-sum-cmd{flex:1;font-family:var(--vscode-editor-font-family);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cli-sum-out{color:var(--vscode-descriptionForeground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+.cli-sum-close{background:none;border:none;cursor:pointer;color:var(--vscode-foreground);opacity:0.7}
+.cli-sum-close:hover{opacity:1}
 .done-check{color:var(--vscode-testing-iconPassed);font-weight:600}
+.done.pending .done-check{color:#ffb400}
 .done-txt{font-weight:500;color:var(--vscode-testing-iconPassed)}
+.done.pending .done-txt{color:#ffb400}
 .done-icon{font-size:11px}
 .done-actions{display:flex;gap:6px;margin-left:8px}
 .done-action{font-size:10px;padding:2px 8px;border-radius:3px;border:none}
@@ -2770,16 +3068,44 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 <div class="desc">When enabled: Enter sends, Ctrl+Enter for new line. Otherwise reversed.</div>
             </div>
             <div class="setting-row">
-                <div class="checkbox-row">
-                    <input type="checkbox" id="set-autoApply">
-                    <label>Auto Apply Changes</label>
-                </div>
-                <div class="desc">Automatically apply code changes from AI responses</div>
-            </div>
-            <div class="setting-row">
                 <label>Max Payload Size (MB)</label>
                 <input type="number" id="set-maxPayloadSizeMB" placeholder="15">
                 <div class="desc">Maximum size for Couchbase documents (limit: 20MB)</div>
+            </div>
+        </div>
+        <div class="settings-group">
+            <h3>Auto Apply (A Button)</h3>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-autoApply">
+                    <label>Enable Auto Apply</label>
+                </div>
+                <div class="desc">Master toggle for automatic execution (A=Auto, M=Manual)</div>
+            </div>
+            <div class="setting-row" style="margin-left:20px">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-autoApplyFiles">
+                    <label>📄 File Operations (CRUD)</label>
+                </div>
+                <div class="desc">Auto-apply file changes when AI suggests edits</div>
+            </div>
+            <div class="setting-row" style="margin-left:20px">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-autoApplyCli">
+                    <label>🖥️ CLI Commands</label>
+                </div>
+                <div class="desc">Auto-execute whitelisted CLI commands</div>
+            </div>
+        </div>
+        <div class="settings-group">
+            <h3>CLI Whitelist</h3>
+            <div class="desc" style="margin-bottom:8px">Commands starting with these prefixes can auto-execute. One per line.</div>
+            <div class="setting-row">
+                <textarea id="set-cliWhitelist" rows="10" style="width:100%;font-family:var(--vscode-editor-font-family);font-size:11px;resize:vertical"></textarea>
+            </div>
+            <div class="setting-row" style="display:flex;gap:8px;align-items:center">
+                <button id="cli-whitelist-reset" class="btn btn-s" style="font-size:11px">Reset to Default</button>
+                <span class="desc" id="cli-whitelist-count">0 commands</span>
             </div>
         </div>
     </div>
@@ -2904,6 +3230,21 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="chat"></div>
 
+<!-- CLI Execution Summary Panel -->
+<div id="cli-summary">
+    <div class="cli-sum-hdr">
+        <span>🖥️ CLI Execution</span>
+        <div class="cli-sum-progress">
+            <span class="cli-sum-ok">✓ <span id="cli-ok">0</span></span>
+            <span class="cli-sum-err">✗ <span id="cli-err">0</span></span>
+            <span id="cli-count">0/0</span>
+        </div>
+        <button class="cli-sum-close" onclick="closeCliSummary()">✕</button>
+    </div>
+    <div class="cli-sum-bar"><div class="cli-sum-fill" id="cli-bar"></div></div>
+    <div class="cli-sum-list" id="cli-list"></div>
+</div>
+
 <!-- Bug Report Modal -->
 <div id="bug-modal">
     <div class="bug-modal-content">
@@ -2985,7 +3326,7 @@ const todoBar=document.getElementById('todo-bar'),todoToggle=document.getElement
 const autoBtn=document.getElementById('auto-btn');
 const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
-let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
+let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,autoApplyFiles=true,autoApplyCli=false,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=true;
 // Track estimated context for next request (sum of all input tokens from history)
 let estimatedContextTokens=0;
@@ -3376,7 +3717,13 @@ function populateSettings(s){
     // Chat
     document.getElementById('set-enterToSend').checked=s.enterToSend||false;
     document.getElementById('set-autoApply').checked=s.autoApply!==false;
+    document.getElementById('set-autoApplyFiles').checked=s.autoApplyFiles!==false;
+    document.getElementById('set-autoApplyCli').checked=s.autoApplyCli||false;
     document.getElementById('set-maxPayloadSizeMB').value=s.maxPayloadSizeMB||15;
+    // CLI Whitelist
+    const whitelist=s.cliWhitelist||[];
+    document.getElementById('set-cliWhitelist').value=whitelist.join('\\n');
+    document.getElementById('cli-whitelist-count').textContent=whitelist.length+' commands';
     // Optimize
     document.getElementById('set-requestFormat').value=s.requestFormat||'json';
     document.getElementById('set-responseFormat').value=s.responseFormat||'json';
@@ -3415,7 +3762,10 @@ function collectSettings(){
         // Chat
         enterToSend:document.getElementById('set-enterToSend').checked,
         autoApply:document.getElementById('set-autoApply').checked,
+        autoApplyFiles:document.getElementById('set-autoApplyFiles').checked,
+        autoApplyCli:document.getElementById('set-autoApplyCli').checked,
         maxPayloadSizeMB:parseInt(document.getElementById('set-maxPayloadSizeMB').value)||15,
+        cliWhitelist:document.getElementById('set-cliWhitelist').value.split('\\n').map(s=>s.trim()).filter(s=>s),
         // Optimize
         requestFormat:document.getElementById('set-requestFormat').value,
         responseFormat:document.getElementById('set-responseFormat').value,
@@ -3435,6 +3785,20 @@ settingsTest.onclick=()=>{
     vs.postMessage({type:'testConnections'});
     document.getElementById('db-test-result').innerHTML='<div class="test-result">Testing connections...</div>';
     document.getElementById('api-test-result').innerHTML='<div class="test-result">Testing connections...</div>';
+};
+
+// CLI Whitelist handlers
+const cliWhitelistEl=document.getElementById('set-cliWhitelist');
+const cliWhitelistCountEl=document.getElementById('cli-whitelist-count');
+const cliWhitelistResetBtn=document.getElementById('cli-whitelist-reset');
+const defaultCliWhitelist=['npm install','npm run','npm test','npm run build','npm run dev','npm run lint','npm run format','yarn install','yarn add','yarn test','yarn build','pnpm install','pnpm run','git status','git diff','git log','git branch','ls','pwd','cat','head','tail','grep','find','mkdir','touch','echo','tsc','tsc --noEmit','python','python3','pip install','pip3 install','cargo build','cargo run','cargo test','cargo check','go build','go run','go test'];
+cliWhitelistEl.oninput=()=>{
+    const count=cliWhitelistEl.value.split('\\n').map(s=>s.trim()).filter(s=>s).length;
+    cliWhitelistCountEl.textContent=count+' commands';
+};
+cliWhitelistResetBtn.onclick=()=>{
+    cliWhitelistEl.value=defaultCliWhitelist.join('\\n');
+    cliWhitelistCountEl.textContent=defaultCliWhitelist.length+' commands';
 };
 
 // Handoff popup
@@ -3746,22 +4110,23 @@ let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
 else{todos=parseTodos(m.response.text||'');}
 if(todos.length>0){currentTodos=todos;renderTodos();}
-// Auto-apply if enabled and has file changes (check both diffPreview and structured.fileChanges)
+// Auto-apply file changes if enabled (check master toggle AND file toggle)
 const hasFileChanges=(m.diffPreview&&m.diffPreview.length>0)||(m.structured&&m.structured.fileChanges&&m.structured.fileChanges.length>0);
-console.log('[Grok] Auto-apply check: autoApply='+autoApply+', diffPreview='+JSON.stringify(m.diffPreview)+', fileChanges='+(m.structured?.fileChanges?.length||0));
-if(autoApply&&hasFileChanges){console.log('[Grok] Triggering auto-apply');vs.postMessage({type:'applyEdits',editId:'all'});}
+console.log('[Grok] Auto-apply check: autoApply='+autoApply+', autoApplyFiles='+autoApplyFiles+', diffPreview='+JSON.stringify(m.diffPreview)+', fileChanges='+(m.structured?.fileChanges?.length||0));
+if(autoApply&&autoApplyFiles&&hasFileChanges){console.log('[Grok] Triggering auto-apply');vs.postMessage({type:'applyEdits',editId:'all'});}
 busy=0;curDiv=null;stream='';updUI();scrollToBottom();saveChatState();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';const errInfo=categorizeError(m.message);curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div>'+(errInfo.suggestion?'<div class="error-suggestion">💡 '+esc(errInfo.suggestion)+'</div>':'')+'<div class="error-btns"><button class="btn btn-s" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button><button class="btn btn-s btn-diag" onclick="diagnoseError(\\''+esc(m.message.replace(/'/g,"\\\\'")||'')+'\\')">🔍 Diagnose</button></div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSummary('commands',1);break;
+case'cliSummaryUpdate':updateCliSummary(m);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
 // Mark next uncompleted todo as done
 const nextIdx=currentTodos.findIndex(t=>!t.completed);
 if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
 renderTodos();updateActionSummary('applies',m.count||1);}break;
-case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
+case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;autoApplyFiles=m.autoApplyFiles!==false;autoApplyCli=m.autoApplyCli||false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
 case'fullConfig':if(m.settings)populateSettings(m.settings);break;
 case'connectionStatus':
     connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();
@@ -3805,6 +4170,33 @@ case'sessionExtended':
     break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
+function updateCliSummary(m){
+const panel=document.getElementById('cli-summary');
+const okEl=document.getElementById('cli-ok');
+const errEl=document.getElementById('cli-err');
+const countEl=document.getElementById('cli-count');
+const barEl=document.getElementById('cli-bar');
+const listEl=document.getElementById('cli-list');
+panel.classList.add('active');
+okEl.textContent=m.successCount;
+errEl.textContent=m.failCount;
+countEl.textContent=m.completed+'/'+m.total;
+barEl.style.width=Math.round(m.completed/m.total*100)+'%';
+if(m.failCount>0)barEl.style.background='#c44';
+else barEl.style.background='';
+let html='';
+m.results.forEach(r=>{
+html+='<div class="cli-sum-item"><span class="cli-sum-icon">'+(r.success?'✓':'✗')+'</span><span class="cli-sum-cmd">'+esc(r.command)+'</span>'+(r.output?'<span class="cli-sum-out" title="'+esc(r.output)+'">'+esc(r.output)+'</span>':'')+'</div>';
+});
+if(m.remaining&&m.remaining.length>0){
+html+='<div style="margin-top:6px;color:var(--vscode-descriptionForeground);font-size:10px">Next: '+m.remaining.map(c=>'<code>'+esc(c)+'</code>').join(', ')+'</div>';
+}
+if(m.isComplete){
+html+='<div style="margin-top:8px;text-align:center;color:#6a9;font-weight:500">✓ All commands complete</div>';
+}
+listEl.innerHTML=html;
+}
+function closeCliSummary(){document.getElementById('cli-summary').classList.remove('active');}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function repairAndParseJson(text){
 if(!text)return null;
@@ -3877,8 +4269,12 @@ const uInfo=u?'<span class="done-tokens">'+u.totalTokens.toLocaleString()+' toke
 let actionBtns='';
 if(filesApplied){actionBtns+='<span class="done-action done-applied">✓ '+result.fileCount+' applied</span>';}
 if(filesPending){actionBtns+='<button class="done-action done-pending" onclick="scrollToApply()">Apply '+result.fileCount+'</button>';}
-if(cmdsPending){actionBtns+='<button class="done-action done-pending" onclick="scrollToCmd()">Run '+result.cmdCount+' cmd'+(result.cmdCount>1?'s':'')+'</button>';}
-h+='<div class="done"><span class="done-check">✓</span><span class="done-txt">Done</span><span class="done-actions">'+actionBtns+'</span>'+uInfo+'</div>';return h;}
+if(cmdsPending){actionBtns+='<button class="done-action done-pending" onclick="runAllCmds()">Run '+result.cmdCount+' cmd'+(result.cmdCount>1?'s':'')+'</button>';}
+const hasPending=filesPending||cmdsPending;
+const statusIcon=hasPending?'⏳':'✓';
+const statusText=hasPending?'Pending':'Done';
+const statusClass=hasPending?'done pending':'done';
+h+='<div class="'+statusClass+'"><span class="done-check">'+statusIcon+'</span><span class="done-txt">'+statusText+'</span><span class="done-actions">'+actionBtns+'</span>'+uInfo+'</div>';return h;}
 function fmtFinalStructured(s,u,diffPreview,usedCleanup){
 if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
 const msgId='msg-'+Date.now();
@@ -3937,7 +4333,7 @@ const rpFilesApplied=autoApply&&rpFileCount>0;const rpFilesPending=!autoApply&&r
 let rpActionBtns='';
 if(rpFilesApplied){rpActionBtns+='<span class="done-action done-applied">✓ '+rpFileCount+' applied</span>';}
 if(rpFilesPending){rpActionBtns+='<button class="done-action done-pending" onclick="scrollToApply()">Apply '+rpFileCount+'</button>';}
-if(rpCmdCount>0){rpActionBtns+='<button class="done-action done-pending" onclick="scrollToCmd()">Run '+rpCmdCount+' cmd'+(rpCmdCount>1?'s':'')+'</button>';}
+if(rpCmdCount>0){rpActionBtns+='<button class="done-action done-pending" onclick="runAllCmds()">Run '+rpCmdCount+' cmd'+(rpCmdCount>1?'s':'')+'</button>';}
 h+='<div class="done"><span class="done-check">✓</span><span class="done-txt">Done</span><span class="done-actions">'+rpActionBtns+'</span></div>';
 // TODOs
 if(reparsed.todos&&reparsed.todos.length>0){currentTodos=reparsed.todos.map(t=>({text:t.text,done:t.completed}));renderTodos();}
@@ -3973,8 +4369,12 @@ const uInfo=u?'<span class="done-tokens">'+u.totalTokens.toLocaleString()+' toke
 let actionBtns='';
 if(filesApplied){actionBtns+='<span class="done-action done-applied">✓ '+fileCount+' applied</span>';}
 if(filesPending){actionBtns+='<button class="done-action done-pending" onclick="scrollToApply()">Apply '+fileCount+'</button>';}
-if(cmdsPending){actionBtns+='<button class="done-action done-pending" onclick="scrollToCmd()">Run '+cmdCount+' cmd'+(cmdCount>1?'s':'')+'</button>';}
-h+='<div class="done"><span class="done-check">✓</span><span class="done-txt">Done</span>'+cleanupInfo+'<span class="done-actions">'+actionBtns+'</span>'+uInfo+'</div>';return h;}
+if(cmdsPending){actionBtns+='<button class="done-action done-pending" onclick="runAllCmds()">Run '+cmdCount+' cmd'+(cmdCount>1?'s':'')+'</button>';}
+const hasPending=filesPending||cmdsPending;
+const statusIcon=hasPending?'⏳':'✓';
+const statusText=hasPending?'Pending':'Done';
+const statusClass=hasPending?'done pending':'done';
+h+='<div class="'+statusClass+'"><span class="done-check">'+statusIcon+'</span><span class="done-txt">'+statusText+'</span>'+cleanupInfo+'<span class="done-actions">'+actionBtns+'</span>'+uInfo+'</div>';return h;}
 function fmtCode(t,diffPreview){
 let out=t;const fileBlocks=[];const bt=String.fromCharCode(96);
 const pat=new RegExp('[📄🗎]\\\\s*([^\\\\s\\\\n(]+)\\\\s*(?:\\\\(lines?\\\\s*(\\\\d+)(?:-(\\\\d+))?\\\\))?[\\\\s\\\\n]*'+bt+bt+bt+'(\\\\w+)?\\\\n([\\\\s\\\\S]*?)'+bt+bt+bt,'g');
@@ -4061,6 +4461,19 @@ function copyCmd(btn,c){navigator.clipboard.writeText(c).then(()=>{btn.textConte
 function scrollToEl(id){const el=document.getElementById(id);if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}}
 function scrollToApply(){const el=document.querySelector('.diff .btn-ok, .apply-all');if(el){el.scrollIntoView({behavior:'smooth',block:'center'});}}
 function scrollToCmd(){const el=document.querySelector('.term-run');if(el){el.scrollIntoView({behavior:'smooth',block:'center'});}}
+function runAllCmds(){
+const cmdEls=document.querySelectorAll('.term-cmd');
+if(cmdEls.length===0)return;
+const commands=[];
+cmdEls.forEach(el=>{
+const txt=el.textContent||'';
+const cmd=txt.replace(/^\\$\\s*/,'').trim();
+if(cmd)commands.push(cmd);
+});
+if(commands.length>0){
+vs.postMessage({type:'runAllCommands',commands:commands});
+}
+}
 function updateActionSummary(actionType,count){
 // Find all action summaries and update the relevant counts
 const items=document.querySelectorAll('.action-item[data-action="'+actionType+'"]');

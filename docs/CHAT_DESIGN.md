@@ -99,9 +99,175 @@ flowchart TD
   - Commands with Run buttons
   - Next Steps buttons
   - "What was done" summary
-  - Done bar with action buttons + token count
+  - Status bar with action buttons + token count:
+    - **✓ Done** (green) - All actions complete
+    - **⏳ Pending** (amber) - File changes or CLI commands still need action
 - Caches HTML in webview state
 - Scrolls to bottom
+
+---
+
+## Auto CLI Execution
+
+### Overview
+
+The extension supports automatic execution of CLI commands with a whitelist-based safety system. This enables iterative workflows where the AI can run commands, analyze output, and fix issues automatically.
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.autoApply` | `true` | Master toggle for auto-apply (A=Auto) |
+| `grok.autoApplyFiles` | `true` | Auto-apply file changes (CRUD) when Auto mode enabled |
+| `grok.autoApplyCli` | `false` | Auto-execute CLI commands when Auto mode enabled |
+| `grok.cliWhitelist` | ~40 commands | Allowed command prefixes for auto-execution |
+
+### How It Works
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Command Detection"]
+        A[AI Response contains<br/>🖥️ command] --> B{Auto mode<br/>enabled?}
+        B -->|No| C[Show Run button only]
+        B -->|Yes| D{autoApplyCli<br/>enabled?}
+        D -->|No| C
+        D -->|Yes| E{Command<br/>whitelisted?}
+    end
+    
+    subgraph Execution["⚡ Auto Execution"]
+        E -->|Yes| F[Execute command<br/>automatically]
+        E -->|No| G[Prompt user:<br/>Run Once / Add & Run / Skip]
+        G -->|Run Once| F
+        G -->|Add & Run| H[Add to whitelist]
+        H --> F
+        G -->|Skip| I[Do nothing]
+    end
+    
+    subgraph Feedback["🔄 Feedback Loop"]
+        F --> J[Capture stdout/stderr]
+        J --> K[Display output in chat]
+        J --> L[Send output to AI<br/>for analysis]
+        L --> M[AI can fix issues<br/>or continue workflow]
+    end
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Execution fill:#2a1a3a,stroke:#c94eb0,color:#fff
+    style Feedback fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+### Whitelist System
+
+Commands are matched by **prefix**. A command like `npm run build` is allowed if `npm run` is in the whitelist.
+
+**Default Whitelist:**
+```
+npm install, npm run, npm test, yarn install, yarn add, yarn test, yarn build,
+pnpm install, pnpm run, git status, git diff, git log, git branch,
+ls, pwd, cat, head, tail, grep, find, mkdir, touch, echo,
+curl, wget, cp, mv,
+tsc, tsc --noEmit, python, python3, pip install, pip3 install,
+cargo build, cargo run, cargo test, cargo check, go build, go run, go test
+```
+
+**Dangerous commands excluded**: `rm` is intentionally NOT whitelisted. Users will be prompted before any delete operations.
+
+### Run All Commands Button (AI-in-the-Loop)
+
+When a response contains multiple CLI commands, the status bar shows a **"Run X cmds"** button:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ⏳ Pending    ✓ 1 applied    [Run 11 cmds]       38,016 tokens │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Clicking this button starts **sequential AI-supervised execution**:
+
+```mermaid
+flowchart TD
+    subgraph Loop["🔄 Command Loop"]
+        A[Run Command 1] --> B[Show Output + Summary]
+        B --> C[Send to AI for Analysis]
+        C --> D{AI Response}
+        D -->|"continue"| E[Run Next Command]
+        D -->|"stop/error"| F[Pause Execution]
+        D -->|New Command| G[Run AI's Command Instead]
+        E --> B
+        G --> B
+    end
+    
+    subgraph Summary["📊 Progress Tracking"]
+        H[Command X/Y ✓ or ✗]
+        I[Output preview]
+        J[✓ N succeeded, ✗ M failed]
+        K[Remaining commands list]
+    end
+    
+    style Loop fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Summary fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+```
+
+**How it works:**
+1. First command runs, output displayed with progress summary
+2. Summary sent to AI with remaining commands list
+3. AI analyzes and responds:
+   - Says **"continue"** → next command runs automatically
+   - Says **"stop"** or mentions error → execution pauses
+   - Suggests different command → AI's command runs instead
+4. Loop continues until all done or AI stops it
+
+**Example flow:**
+```
+Command 1/5 ✓
+`mkdir -p app/assets`
+Output: (no output)
+Progress: ✓ 1 succeeded, ✗ 0 failed
+Remaining: curl..., curl..., curl...
+
+→ AI: "Directory created. Continue."
+→ [Auto-runs next command]
+
+Command 2/5 ✗
+`curl -o file.png https://invalid-url`
+Output: curl: (6) Could not resolve host
+Progress: ✓ 1 succeeded, ✗ 1 failed
+
+→ AI: "The URL is invalid. Let me fix it..."
+→ AI suggests: `curl -o file.png https://correct-url`
+→ [Runs AI's corrected command]
+```
+
+This enables intelligent error recovery - if `mkdir` fails, AI can check `pwd`, fix the path, and retry.
+
+### Feedback Loop
+
+When a command executes, the output is automatically sent back to the AI:
+
+```
+I ran the command: `npm run build`
+
+Output:
+```
+src/utils.ts(15,10): error TS2322: Type 'string' is not assignable to type 'number'.
+```
+
+Please analyze this output.
+```
+
+This enables workflows like:
+1. User: "Fix the TypeScript errors"
+2. AI: Suggests fix + includes `🖥️ tsc --noEmit` command
+3. Command auto-executes → output shows remaining errors
+4. AI: Analyzes output, suggests next fix
+5. Repeat until build passes
+
+### Security Considerations
+
+- **Whitelist-only by default**: `autoApplyCli` is `false` by default
+- **Prefix matching**: Only commands starting with whitelisted prefixes execute
+- **User prompt for unknowns**: Non-whitelisted commands require explicit user action
+- **Timeout protection**: Commands timeout after 30 seconds
+- **Output truncation**: Output capped at 3KB for AI feedback, 5KB for display
 
 ---
 
