@@ -305,6 +305,11 @@ export function buildSystemPrompt(workspaceInfo?: WorkspaceInfo): string {
     let prompt = getSystemPrompt();
 
     if (workspaceInfo) {
+        // OS-specific command hints
+        const osHints = workspaceInfo.platform === 'windows'
+            ? 'Use PowerShell commands (e.g., mkdir, Copy-Item). Paths use backslash (\\).'
+            : 'Use Unix commands (e.g., mkdir -p, cp). Paths use forward slash (/).';
+        
         prompt += `\n\n## WORKSPACE CONTEXT
 
 **Project:** ${workspaceInfo.projectName || 'Unknown'}
@@ -312,6 +317,9 @@ export function buildSystemPrompt(workspaceInfo?: WorkspaceInfo): string {
 **Open file:** ${workspaceInfo.activeFile || 'None'}
 **Cursor line:** ${workspaceInfo.cursorLine || 'N/A'}
 **Git branch:** ${workspaceInfo.gitBranch || 'N/A'}
+**Platform:** ${workspaceInfo.platform || 'unknown'} (path separator: ${workspaceInfo.pathSeparator || '/'})
+
+⚠️ **OS Note:** ${osHints}
 `;
 
         // Add selected text if present
@@ -358,6 +366,9 @@ export interface WorkspaceInfo {
     devDependencies?: string[];
     diagnostics?: DiagnosticInfo[];
     agentMdContent?: string;
+    // OS/Platform info for correct path separators and commands
+    platform?: 'windows' | 'macos' | 'linux';
+    pathSeparator?: string;
 }
 
 export interface DiagnosticInfo {
@@ -375,10 +386,27 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     const activeEditor = vscode.window.activeTextEditor;
     const rootPath = workspaceFolders?.[0]?.uri.fsPath;
 
+    // Detect OS/platform
+    const osPlatform = process.platform;
+    let platform: 'windows' | 'macos' | 'linux';
+    let pathSeparator: string;
+    if (osPlatform === 'win32') {
+        platform = 'windows';
+        pathSeparator = '\\';
+    } else if (osPlatform === 'darwin') {
+        platform = 'macos';
+        pathSeparator = '/';
+    } else {
+        platform = 'linux';
+        pathSeparator = '/';
+    }
+
     const info: WorkspaceInfo = {
         projectName: workspaceFolders?.[0]?.name,
         rootPath: rootPath,
-        activeFile: activeEditor?.document.uri.fsPath
+        activeFile: activeEditor?.document.uri.fsPath,
+        platform,
+        pathSeparator
     };
 
     // Get selected text and cursor position

@@ -160,6 +160,51 @@ export interface OperationFailure {
     currentHash?: string;       // Hash when operation was attempted
 }
 
+// ============================================================================
+// Session Extension Types (for sessions exceeding 15MB storage limit)
+// ============================================================================
+
+/**
+ * Metadata about a session extension stored in the root document.
+ * Tracks when the split happened and final token counts at time of split.
+ */
+export interface ExtensionMetadata {
+    extensionNum: number;       // 1, 2, 3, etc. (root is always 1)
+    splitAt: string;            // ISO timestamp when extension was created
+    finalTokensIn: number;      // Token count when this extension was split off
+    finalTokensOut: number;
+    finalCost: number;
+    sizeBytes: number;          // Size of this extension document in bytes
+    pairCount: number;          // Number of pairs in this extension
+}
+
+/**
+ * Extension tracking metadata stored only in root document.
+ * The root document (key: {UUID}) acts as the index for all extensions.
+ */
+export interface SessionExtensionInfo {
+    currentExtension: number;   // Which extension is currently active (1 = root only)
+    extensions: ExtensionMetadata[];  // Metadata for all extensions including root
+    totalSizeBytes: number;     // Sum of all extension sizes for quick lookup
+}
+
+/**
+ * Extension document schema. These are stored with keys like {UUID}:2, {UUID}:3, etc.
+ * Extension 1 is always the root document (ChatSessionDocument).
+ */
+export interface SessionExtensionDocument {
+    id: string;                 // Same as key: {UUID}:N
+    docType: 'chat-extension';
+    parentId: string;           // Root session UUID (without :N suffix)
+    extensionNum: number;       // 2, 3, 4, etc.
+    createdAt: string;
+    updatedAt: string;
+    pairs: ChatPair[];          // This extension's portion of the conversation
+    tokensIn: number;           // Tokens in this extension only
+    tokensOut: number;
+    cost: number;               // Cost for this extension only
+}
+
 export interface ChatSessionDocument {
     id: string;
     docType: 'chat';
@@ -181,6 +226,7 @@ export interface ChatSessionDocument {
     modelUsed?: ModelUsageEntry[];  // Aggregate model usage at root level for fast queries
     bugs?: BugReport[];  // Bug reports for malformed responses
     operationFailures?: OperationFailure[];  // Detailed logs of file operation failures
+    extensionInfo?: SessionExtensionInfo;  // Extension tracking for sessions exceeding storage limit
 }
 
 /**
@@ -726,4 +772,451 @@ export async function getOperationFailures(sessionId: string): Promise<Operation
  */
 export function computeFileHash(content: string): string {
     return crypto.createHash('md5').update(content).digest('hex');
+}
+
+// ============================================================================
+// Session Extension Functions
+// ============================================================================
+
+const EXTENSION_SPLIT_THRESHOLD = 0.85; // Split at 85% of max to leave room for metadata
+
+/**
+ * Get the extension document key for a given session and extension number.
+ * Root document (extension 1) uses just the UUID, extensions 2+ use UUID:N format.
+ */
+export function getExtensionKey(sessionId: string, extensionNum: number): string {
+    if (extensionNum === 1) {
+        return sessionId;
+    }
+    return `${sessionId}:${extensionNum}`;
+}
+
+/**
+ * Parse a document key to extract session ID and extension number.
+ */
+export function parseExtensionKey(key: string): { sessionId: string; extensionNum: number } {
+    const parts = key.split(':');
+    if (parts.length === 1) {
+        return { sessionId: key, extensionNum: 1 };
+    }
+    // Handle UUID format with colons: last part after final colon is the extension number
+    const lastPart = parts[parts.length - 1];
+    const extNum = parseInt(lastPart, 10);
+    if (!isNaN(extNum) && extNum > 1) {
+        return { 
+            sessionId: parts.slice(0, -1).join(':'), 
+            extensionNum: extNum 
+        };
+    }
+    return { sessionId: key, extensionNum: 1 };
+}
+
+/**
+ * Check if a session needs to be split into a new extension.
+ * Returns true if the current document size exceeds the split threshold.
+ */
+export function needsExtension(doc: ChatSessionDocument): boolean {
+    const maxSize = getMaxPayloadSize();
+    const currentSize = getDocumentSize(doc);
+    return currentSize > maxSize * EXTENSION_SPLIT_THRESHOLD;
+}
+
+/**
+ * Create a new extension document for a session that's approaching the size limit.
+ * This moves the current pairs to a frozen extension and starts fresh in the root.
+ */
+export async function createSessionExtension(sessionId: string): Promise<SessionExtensionDocument> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const rootDoc = result.content;
+    
+    // Determine the next extension number
+    const currentExtNum = rootDoc.extensionInfo?.currentExtension || 1;
+    const newExtNum = currentExtNum + 1;
+    const extensionKey = getExtensionKey(sessionId, newExtNum);
+    
+    // Calculate current root stats before split
+    const rootSize = getDocumentSize(rootDoc);
+    const rootPairCount = rootDoc.pairs.length;
+    
+    // Create the extension document with current pairs
+    const extensionDoc: SessionExtensionDocument = {
+        id: extensionKey,
+        docType: 'chat-extension',
+        parentId: sessionId,
+        extensionNum: newExtNum,
+        createdAt: now,
+        updatedAt: now,
+        pairs: [...rootDoc.pairs],  // Copy all current pairs
+        tokensIn: rootDoc.tokensIn,
+        tokensOut: rootDoc.tokensOut,
+        cost: rootDoc.cost
+    };
+    
+    // Insert the extension document
+    const insertSuccess = await client.insert(extensionKey, extensionDoc);
+    if (!insertSuccess) {
+        throw new Error(`Failed to create extension document: ${extensionKey}`);
+    }
+    
+    const extDocSize = getDocumentSize(extensionDoc);
+    
+    // Update extension info in root document
+    if (!rootDoc.extensionInfo) {
+        // First extension - also record root as extension 1
+        rootDoc.extensionInfo = {
+            currentExtension: 1,
+            extensions: [{
+                extensionNum: 1,
+                splitAt: now,
+                finalTokensIn: 0,
+                finalTokensOut: 0,
+                finalCost: 0,
+                sizeBytes: 0,
+                pairCount: 0
+            }],
+            totalSizeBytes: 0
+        };
+    }
+    
+    // Freeze the current root state as the previous extension
+    const rootExtMeta = rootDoc.extensionInfo.extensions.find(e => e.extensionNum === currentExtNum);
+    if (rootExtMeta) {
+        rootExtMeta.finalTokensIn = rootDoc.tokensIn;
+        rootExtMeta.finalTokensOut = rootDoc.tokensOut;
+        rootExtMeta.finalCost = rootDoc.cost;
+        rootExtMeta.sizeBytes = rootSize;
+        rootExtMeta.pairCount = rootPairCount;
+        rootExtMeta.splitAt = now;
+    }
+    
+    // Add metadata for new extension
+    rootDoc.extensionInfo.extensions.push({
+        extensionNum: newExtNum,
+        splitAt: now,
+        finalTokensIn: extensionDoc.tokensIn,
+        finalTokensOut: extensionDoc.tokensOut,
+        finalCost: extensionDoc.cost,
+        sizeBytes: extDocSize,
+        pairCount: extensionDoc.pairs.length
+    });
+    
+    // Update root to point to new extension
+    rootDoc.extensionInfo.currentExtension = newExtNum;
+    rootDoc.extensionInfo.totalSizeBytes = rootDoc.extensionInfo.extensions.reduce(
+        (sum, ext) => sum + ext.sizeBytes, 0
+    );
+    
+    // Clear pairs from root - new messages will go to the extension
+    rootDoc.pairs = [];
+    rootDoc.updatedAt = now;
+    
+    // Save updated root document
+    const replaceSuccess = await client.replace(sessionId, rootDoc);
+    if (!replaceSuccess) {
+        // Try to clean up the extension doc we created
+        await client.remove(extensionKey);
+        throw new Error('Failed to update root document after creating extension');
+    }
+    
+    console.log(`Created session extension ${newExtNum} for session ${sessionId}. Moved ${rootPairCount} pairs.`);
+    return extensionDoc;
+}
+
+/**
+ * Get the active extension document for a session.
+ * Returns the root document if no extensions exist, otherwise returns the latest extension.
+ */
+export async function getActiveExtension(sessionId: string): Promise<{
+    doc: ChatSessionDocument | SessionExtensionDocument;
+    isRoot: boolean;
+    extensionNum: number;
+}> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const rootDoc = result.content;
+    
+    // If no extensions, root is active
+    if (!rootDoc.extensionInfo || rootDoc.extensionInfo.currentExtension === 1) {
+        return { doc: rootDoc, isRoot: true, extensionNum: 1 };
+    }
+    
+    // Get the current extension document
+    const extNum = rootDoc.extensionInfo.currentExtension;
+    const extKey = getExtensionKey(sessionId, extNum);
+    const extResult = await client.get<SessionExtensionDocument>(extKey);
+    
+    if (!extResult || !extResult.content) {
+        console.error(`Extension ${extNum} not found for session ${sessionId}, falling back to root`);
+        return { doc: rootDoc, isRoot: true, extensionNum: 1 };
+    }
+    
+    return { doc: extResult.content, isRoot: false, extensionNum: extNum };
+}
+
+/**
+ * Get all pairs from a session, traversing all extensions in order.
+ * This assembles the complete conversation history across all extensions.
+ */
+export async function getAllSessionPairs(sessionId: string): Promise<ChatPair[]> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return [];
+    }
+    
+    const rootDoc = result.content;
+    
+    // If no extensions, just return root pairs
+    if (!rootDoc.extensionInfo || rootDoc.extensionInfo.extensions.length <= 1) {
+        return rootDoc.pairs;
+    }
+    
+    const allPairs: ChatPair[] = [];
+    
+    // Collect pairs from all extensions in order (skip extension 1 which is root)
+    for (const extMeta of rootDoc.extensionInfo.extensions) {
+        if (extMeta.extensionNum === 1) {
+            continue;  // Root's pairs were moved to extensions
+        }
+        
+        const extKey = getExtensionKey(sessionId, extMeta.extensionNum);
+        const extResult = await client.get<SessionExtensionDocument>(extKey);
+        
+        if (extResult?.content) {
+            allPairs.push(...extResult.content.pairs);
+        }
+    }
+    
+    // Add any pairs still in root (for the currently active extension)
+    allPairs.push(...rootDoc.pairs);
+    
+    return allPairs;
+}
+
+/**
+ * Get the complete session including all extension pairs merged.
+ * This is used for loading a session with full history.
+ */
+export async function getSessionWithExtensions(id: string): Promise<ChatSessionDocument | null> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(id);
+    if (!result || !result.content) {
+        console.log('getSessionWithExtensions: No result for', id);
+        return null;
+    }
+    
+    const doc = result.content;
+    
+    // Ensure pairs array exists
+    if (!doc.pairs) {
+        doc.pairs = [];
+    }
+    
+    // If there are extensions, merge all pairs
+    if (doc.extensionInfo && doc.extensionInfo.extensions.length > 1) {
+        const allPairs = await getAllSessionPairs(id);
+        doc.pairs = allPairs;
+        console.log('getSessionWithExtensions: Merged', allPairs.length, 'pairs from', 
+            doc.extensionInfo.extensions.length, 'extensions');
+    }
+    
+    console.log('getSessionWithExtensions: Found session', id, 'with', doc.pairs.length, 'pairs');
+    return doc;
+}
+
+/**
+ * Get total storage size across all extensions for a session.
+ */
+export async function getSessionTotalStorage(sessionId: string): Promise<number> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return 0;
+    }
+    
+    const doc = result.content;
+    
+    // If extensions exist, use cached total
+    if (doc.extensionInfo) {
+        // Recalculate to include current root size
+        const rootSize = getDocumentSize(doc);
+        const extensionSizes = doc.extensionInfo.extensions
+            .filter(e => e.extensionNum !== doc.extensionInfo!.currentExtension)
+            .reduce((sum, e) => sum + e.sizeBytes, 0);
+        return rootSize + extensionSizes;
+    }
+    
+    // No extensions, just return root document size
+    return getDocumentSize(doc);
+}
+
+/**
+ * Append a pair to a session, respecting existing extensions.
+ * This is the extension-aware version of appendPair.
+ * Note: Extensions are only created when user explicitly clicks "Extend" - 
+ * this function does NOT auto-create extensions.
+ */
+export async function appendPairWithExtension(
+    sessionId: string,
+    pair: ChatPair
+): Promise<ChatSessionDocument> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    // Get root document
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const rootDoc = result.content;
+    
+    // Check if we have an active extension
+    if (rootDoc.extensionInfo && rootDoc.extensionInfo.currentExtension > 1) {
+        // Append to the active extension document
+        const extNum = rootDoc.extensionInfo.currentExtension;
+        const extKey = getExtensionKey(sessionId, extNum);
+        const extResult = await client.get<SessionExtensionDocument>(extKey);
+        
+        if (!extResult || !extResult.content) {
+            throw new Error(`Extension ${extNum} not found for session ${sessionId}`);
+        }
+        
+        const extDoc = extResult.content;
+        extDoc.pairs.push(pair);
+        extDoc.updatedAt = now;
+        
+        const extSuccess = await client.replace(extKey, extDoc);
+        if (!extSuccess) {
+            throw new Error('Failed to append pair to extension');
+        }
+        
+        // Update root's updatedAt
+        rootDoc.updatedAt = now;
+        await client.replace(sessionId, rootDoc);
+        
+        console.log('Appended pair to extension', extNum, 'for session:', sessionId);
+        return rootDoc;
+    }
+    
+    // No extensions, append to root as normal
+    if (!rootDoc.pairs) {
+        rootDoc.pairs = [];
+    }
+    rootDoc.pairs.push(pair);
+    rootDoc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, rootDoc);
+    if (!success) {
+        throw new Error('Failed to append pair to session');
+    }
+    
+    console.log('Appended pair to session:', sessionId);
+    return rootDoc;
+}
+
+/**
+ * Update the last pair response in a session, handling extensions.
+ */
+export async function updateLastPairResponseWithExtension(
+    sessionId: string,
+    response: ChatResponse
+): Promise<ChatSessionDocument> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    // Get root document
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const rootDoc = result.content;
+    
+    // Check if we have an active extension
+    if (rootDoc.extensionInfo && rootDoc.extensionInfo.currentExtension > 1) {
+        const extNum = rootDoc.extensionInfo.currentExtension;
+        const extKey = getExtensionKey(sessionId, extNum);
+        const extResult = await client.get<SessionExtensionDocument>(extKey);
+        
+        if (!extResult || !extResult.content) {
+            throw new Error(`Extension ${extNum} not found for session ${sessionId}`);
+        }
+        
+        const extDoc = extResult.content;
+        if (extDoc.pairs.length > 0) {
+            extDoc.pairs[extDoc.pairs.length - 1].response = response;
+            extDoc.updatedAt = now;
+            
+            const extSuccess = await client.replace(extKey, extDoc);
+            if (!extSuccess) {
+                throw new Error('Failed to update extension pair response');
+            }
+        }
+        
+        rootDoc.updatedAt = now;
+        await client.replace(sessionId, rootDoc);
+        
+        console.log('Updated last pair response in extension', extNum);
+        return rootDoc;
+    }
+    
+    // No extensions, update root as normal
+    if (rootDoc.pairs.length > 0) {
+        rootDoc.pairs[rootDoc.pairs.length - 1].response = response;
+    }
+    rootDoc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, rootDoc);
+    if (!success) {
+        throw new Error('Failed to update pair response');
+    }
+    
+    console.log('Updated last pair response for session:', sessionId);
+    return rootDoc;
+}
+
+/**
+ * Delete a session and all its extensions.
+ */
+export async function deleteSessionWithExtensions(sessionId: string): Promise<boolean> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return false;
+    }
+    
+    const rootDoc = result.content;
+    
+    // Delete all extension documents
+    if (rootDoc.extensionInfo) {
+        for (const ext of rootDoc.extensionInfo.extensions) {
+            if (ext.extensionNum > 1) {
+                const extKey = getExtensionKey(sessionId, ext.extensionNum);
+                await client.remove(extKey);
+                console.log('Deleted extension:', extKey);
+            }
+        }
+    }
+    
+    // Delete root document
+    const success = await client.remove(sessionId);
+    console.log('Deleted session:', sessionId);
+    return success;
 }

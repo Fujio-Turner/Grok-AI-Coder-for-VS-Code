@@ -26,7 +26,14 @@ import {
     BugReporter,
     appendOperationFailure,
     computeFileHash,
-    OperationFailure
+    OperationFailure,
+    // Extension-aware functions
+    getSessionWithExtensions,
+    appendPairWithExtension,
+    updateLastPairResponseWithExtension,
+    getSessionTotalStorage,
+    needsExtension,
+    createSessionExtension
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -220,6 +227,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'handoff':
                     this._handleHandoff(message.sessionId, message.todos);
+                    break;
+                case 'extendSession':
+                    this._handleExtendSession(message.sessionId);
                     break;
                 case 'saveTodos':
                     this._saveTodos(message.todos);
@@ -662,7 +672,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleHandoff(sessionId: string, todos: Array<{text: string, completed: boolean}>) {
         try {
-            const oldSession = await getSession(sessionId);
+            const oldSession = await getSessionWithExtensions(sessionId);
             if (!oldSession) {
                 vscode.window.showErrorMessage('Session not found');
                 return;
@@ -730,6 +740,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } catch (error: any) {
             logError('Handoff failed:', error);
             vscode.window.showErrorMessage(`Handoff failed: ${error.message}`);
+        }
+    }
+
+    private async _handleExtendSession(sessionId: string) {
+        try {
+            info('Extending session:', sessionId);
+            
+            // Create extension document to offload current pairs
+            const extension = await createSessionExtension(sessionId);
+            
+            // Get updated session with extension info
+            const session = await getSessionWithExtensions(sessionId);
+            if (!session) {
+                throw new Error('Failed to reload session after extension');
+            }
+            
+            // Get updated storage info
+            const totalStorageBytes = await getSessionTotalStorage(sessionId);
+            
+            // Notify webview of the extension
+            this._postMessage({
+                type: 'sessionExtended',
+                sessionId: session.id,
+                extensionNum: extension.extensionNum,
+                extensionInfo: session.extensionInfo,
+                totalStorageBytes
+            });
+            
+            vscode.window.showInformationMessage(
+                `Session extended! Created extension #${extension.extensionNum}. ` +
+                `${extension.pairs.length} messages archived. Full history preserved.`
+            );
+            
+        } catch (error: any) {
+            logError('Extend session failed:', error);
+            vscode.window.showErrorMessage(`Extend session failed: ${error.message}`);
         }
     }
 
@@ -830,7 +876,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     public async loadSession(sessionId: string) {
         try {
-            const session = await getSession(sessionId);
+            const session = await getSessionWithExtensions(sessionId);
             if (session) {
                 this._currentSessionId = sessionId;
                 setCurrentSession(sessionId);
@@ -839,12 +885,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 // Restore change history from Couchbase
                 await this._restoreChangeHistory(sessionId);
                 
+                // Get actual storage size (including extensions)
+                const totalStorageBytes = await getSessionTotalStorage(sessionId);
+                
                 this._postMessage({
                     type: 'sessionChanged',
                     sessionId: session.id,
                     summary: session.summary,
                     history: session.pairs,
-                    todos: session.todos || []
+                    todos: session.todos || [],
+                    extensionInfo: session.extensionInfo,
+                    totalStorageBytes
                 });
                 
                 // Send the restored changes to the UI
@@ -891,7 +942,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         
         if (savedSessionId) {
             try {
-                const session = await getSession(savedSessionId);
+                const session = await getSessionWithExtensions(savedSessionId);
                 if (session) {
                     this._currentSessionId = savedSessionId;
                     setCurrentSession(savedSessionId);
@@ -900,11 +951,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Restore change history from Couchbase
                     await this._restoreChangeHistory(savedSessionId);
                     
+                    // Get actual storage size (including extensions)
+                    const totalStorageBytes = await getSessionTotalStorage(savedSessionId);
+                    
+                    // Get workspace info for path context
+                    const workspaceInfo = await getWorkspaceInfo();
+                    
                     this._postMessage({
                         type: 'init',
                         sessionId: session.id,
                         history: session.pairs,
-                        todos: session.todos || []
+                        todos: session.todos || [],
+                        extensionInfo: session.extensionInfo,
+                        totalStorageBytes,
+                        workspaceRoot: workspaceInfo.rootPath || '',
+                        platform: workspaceInfo.platform || 'linux'
                     });
                     return;
                 }
@@ -992,10 +1053,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         try {
             info('Saving message to Couchbase...');
-            await appendPair(this._currentSessionId, pair);
+            await appendPairWithExtension(this._currentSessionId, pair);
             info('Message saved to Couchbase');
             
-            const session = await getSession(this._currentSessionId);
+            const session = await getSessionWithExtensions(this._currentSessionId);
             const pairIndex = session ? session.pairs.length - 1 : 0;
             
             this._postMessage({
@@ -1131,7 +1192,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 usage: grokResponse.usage
             };
             try {
-                await updateLastPairResponse(this._currentSessionId!, rawResponse);
+                await updateLastPairResponseWithExtension(this._currentSessionId!, rawResponse);
                 debug('Saved raw response to Couchbase');
             } catch (saveErr) {
                 logError('Failed to save raw response:', saveErr);
@@ -1310,7 +1371,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }
             };
 
-            await updateLastPairResponse(this._currentSessionId, successResponse);
+            await updateLastPairResponseWithExtension(this._currentSessionId, successResponse);
 
             if (grokResponse.usage) {
                 updateUsage(this._currentSessionId, grokResponse.usage, model);
@@ -1531,7 +1592,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Update stored response with diffPreview for history restoration
             if (diffPreview.length > 0) {
                 successResponse.diffPreview = diffPreview;
-                await updateLastPairResponse(this._currentSessionId, successResponse);
+                await updateLastPairResponseWithExtension(this._currentSessionId, successResponse);
             }
 
             this._postMessage({
@@ -1566,11 +1627,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             };
 
             try {
-                await updateLastPairResponse(this._currentSessionId!, errorResponse);
+                await updateLastPairResponseWithExtension(this._currentSessionId!, errorResponse);
                 
                 // Auto-report non-abort errors as bugs
                 if (!isAborted && this._currentSessionId) {
-                    const session = await getSession(this._currentSessionId);
+                    const session = await getSessionWithExtensions(this._currentSessionId);
                     const currentPairIndex = session ? session.pairs.length - 1 : 0;
                     await appendSessionBug(this._currentSessionId, {
                         type: 'Other',
@@ -2117,7 +2178,10 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 #handoff-popup .handoff-btns{display:flex;gap:6px;justify-content:flex-end}
 #handoff-popup button{padding:4px 10px;border:none;border-radius:4px;font-size:11px;cursor:pointer}
 #handoff-popup .handoff-yes{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+#handoff-popup .handoff-extend{background:#2d7d46;color:#fff}
 #handoff-popup .handoff-no{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+#handoff-popup .option-box{margin:6px 0;padding:8px;background:var(--vscode-textBlockQuote-background);border-radius:4px;font-size:10px}
+#handoff-popup .option-box strong{font-size:11px}
 #inp-row{display:flex;gap:6px;align-items:flex-end}
 #msg{flex:1;padding:8px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground);border-radius:6px;resize:none;min-height:36px;max-height:120px;font-family:inherit;font-size:13px;line-height:1.4}
 #send{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-size:13px;font-weight:500}
@@ -2573,7 +2637,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="stats">
     <div id="stats-left"><span id="stats-changes">0 files</span><span class="changes-info"><span class="stat-add">+0</span><span class="stat-rem">-0</span><span class="stat-mod">~0</span></span></div>
-    <div id="stats-right"><span class="cost" id="stats-cost">$0.00</span><span class="pct" id="pct-wrap">○ <span id="stats-pct">0%</span><div id="handoff-popup"><p><strong>🔄 Session Handoff</strong></p><p>Creates a new session with context from this one:</p><ul style="margin:4px 0 8px 16px;padding:0;font-size:10px"><li>Summary of work done</li><li>TODO progress (completed/pending)</li><li>Reference to continue where you left off</li></ul><p style="font-size:10px;color:var(--vscode-descriptionForeground)">Use when nearing token limit or to start fresh with context.</p><div class="handoff-btns"><button class="handoff-no">Cancel</button><button class="handoff-yes">🔄 Hand Off</button></div></div></span></div>
+    <div id="stats-right"><span class="cost" id="stats-cost">$0.00</span><span class="pct" id="pct-wrap">○ <span id="stats-pct">0%</span><div id="handoff-popup"><p><strong>⚠️ Session Limit Approaching</strong></p><div id="handoff-info"><div style="margin:8px 0;padding:8px;background:var(--vscode-textBlockQuote-background);border-radius:4px;font-size:11px"><div><strong>Context:</strong> 0 of 131K (0%)</div><div><strong>Storage:</strong> 0B of 15MB (0%)</div></div></div><div class="option-box"><strong>🔄 Handoff</strong> - New session with AI summary<br/>✓ Faster responses, smaller payload<br/>✗ Some context may be lost in summarization</div><div class="option-box"><strong>📦 Extend</strong> - Keep full history in extension docs<br/>✓ No context loss, complete history preserved<br/>✗ Responses may slow as history grows</div><div class="handoff-btns"><button class="handoff-no">Cancel</button><button class="handoff-extend">📦 Extend</button><button class="handoff-yes">🔄 Handoff</button></div></div></span></div>
 </div>
 <div id="img-preview"></div>
 <div id="inp-row"><button id="attach" title="Attach image">📎</button><textarea id="msg" placeholder="Ask Grok..." rows="1"></textarea><button id="send">Send</button><button id="stop">Stop</button></div>
@@ -2588,6 +2652,27 @@ const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
 let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=true;
+// Track estimated context for next request (sum of all input tokens from history)
+let estimatedContextTokens=0;
+// Track JSON storage size for Couchbase limit (15MB default)
+let estimatedStorageBytes=0;
+const maxStorageMB=15;
+// Track session extension info (for sessions that exceed storage limit)
+let currentExtensionInfo=null;
+// Workspace root path for absolute path tooltips
+let workspaceRoot='';
+let workspacePlatform='';
+// Helper to create tooltip showing absolute path for commands
+function getAbsolutePathTooltip(cmd){
+    if(!workspaceRoot)return cmd;
+    const sep=workspacePlatform==='windows'?'\\\\\\\\':'/';
+    // Replace relative paths with absolute paths for tooltip
+    // Match patterns like: app/..., ./..., src/..., etc.
+    return cmd.replace(/(?:^|\\s)(\\.?\\.?[a-zA-Z_][a-zA-Z0-9_-]*\\/[^\\s]+)/g,function(m,path){
+        const trimmed=path.replace(/^\\.\\//,'');
+        return m.replace(path,workspaceRoot+sep+trimmed);
+    });
+}
 // Model info: context limits and pricing (fallback values, updated from API)
 let modelInfo={
     'grok-4-1-fast-reasoning-latest':{ctx:2000000,inPrice:0.20,outPrice:0.50},
@@ -2935,6 +3020,7 @@ const handoffPopup=document.getElementById('handoff-popup');
 pctWrap.onclick=e=>{e.stopPropagation();handoffPopup.classList.toggle('show');};
 handoffPopup.querySelector('.handoff-no').onclick=e=>{e.stopPropagation();handoffPopup.classList.remove('show');};
 handoffPopup.querySelector('.handoff-yes').onclick=e=>{e.stopPropagation();handoffPopup.classList.remove('show');vs.postMessage({type:'handoff',sessionId:curSessId,todos:currentTodos});};
+handoffPopup.querySelector('.handoff-extend').onclick=e=>{e.stopPropagation();handoffPopup.classList.remove('show');vs.postMessage({type:'extendSession',sessionId:curSessId});};
 document.addEventListener('click',e=>{if(!pctWrap.contains(e.target))handoffPopup.classList.remove('show');});
 
 function updatePctColor(pct){
@@ -3051,19 +3137,26 @@ if(savedState.chatHtml&&savedState.sessionId){
     curSessId=savedState.sessionId;
     totalTokens=savedState.totalTokens||0;
     totalCost=savedState.totalCost||0;
+    estimatedContextTokens=savedState.estimatedContextTokens||0;
+    estimatedStorageBytes=savedState.estimatedStorageBytes||0;
     if(savedState.todos)currentTodos=savedState.todos;
     renderTodos();
     const ctxLimit=getCtxLimit();
-    const pct=Math.min(100,Math.round(totalTokens/ctxLimit*100));
+    const maxStorageBytes=maxStorageMB*1024*1024;
+    const ctxPct=Math.min(100,Math.round(estimatedContextTokens/ctxLimit*100));
+    const storagePct=Math.min(100,Math.round(estimatedStorageBytes/maxStorageBytes*100));
+    const displayPct=Math.max(ctxPct,storagePct);
+    const limitingFactor=storagePct>ctxPct?'storage':'context';
     document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);
-    document.getElementById('stats-pct').textContent=pct+'%';
-    updatePctColor(pct);
+    document.getElementById('stats-pct').textContent=displayPct+'%';
+    updateHandoffInfo(estimatedContextTokens,ctxLimit,estimatedStorageBytes,limitingFactor);
+    updatePctColor(displayPct);
     setTimeout(()=>{chat.scrollTop=chat.scrollHeight;},10);
 }
 
 // Save state for persistence across view switches
 function saveInputState(){vs.setState({...vs.getState(),inputText:msg.value});}
-function saveChatState(){vs.setState({...vs.getState(),chatHtml:chat.innerHTML,sessionId:curSessId,totalTokens,totalCost,todos:currentTodos});}
+function saveChatState(){vs.setState({...vs.getState(),chatHtml:chat.innerHTML,sessionId:curSessId,totalTokens,totalCost,estimatedContextTokens,estimatedStorageBytes,todos:currentTodos});}
 
 // Autocomplete functions - triggers on backtick + 3 chars (e.g. \`04_c)
 function getBacktickWord(){
@@ -3106,7 +3199,72 @@ msg.addEventListener('input',()=>{
     }else{hideAutocomplete();}
 });
 let handoffShownThisSession=false;
-function updStats(usage){if(usage){totalTokens+=usage.totalTokens||0;const p=usage.promptTokens||0,c=usage.completionTokens||0;const pricing=getModelPricing();totalCost+=(p/1e6)*pricing.inPrice+(c/1e6)*pricing.outPrice;}const ctxLimit=getCtxLimit();const pct=Math.min(100,Math.round(totalTokens/ctxLimit*100));document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);document.getElementById('stats-pct').textContent=pct+'%';updatePctColor(pct);if(pct>=75&&!handoffShownThisSession&&!busy){handoffShownThisSession=true;handoffPopup.classList.add('show');}}
+let storageWarningShown=false;
+function updStats(usage){
+    if(usage){
+        totalTokens+=usage.totalTokens||0;
+        const p=usage.promptTokens||0,c=usage.completionTokens||0;
+        const pricing=getModelPricing();
+        totalCost+=(p/1e6)*pricing.inPrice+(c/1e6)*pricing.outPrice;
+        // Update estimated context: promptTokens is what was sent (history + system + user msg)
+        // This grows with each request as we send more history
+        estimatedContextTokens=p;
+        // Estimate storage: ~4 bytes per token as rough JSON size
+        estimatedStorageBytes+=((p+c)*4);
+    }
+    const ctxLimit=getCtxLimit();
+    const maxStorageBytes=maxStorageMB*1024*1024;
+    // Calculate % based on last request's prompt tokens vs model context limit
+    const ctxPct=Math.min(100,Math.round(estimatedContextTokens/ctxLimit*100));
+    const storagePct=Math.min(100,Math.round(estimatedStorageBytes/maxStorageBytes*100));
+    // Display the HIGHER of the two percentages (whichever limit is closer)
+    const displayPct=Math.max(ctxPct,storagePct);
+    const limitingFactor=storagePct>ctxPct?'storage':'context';
+    document.getElementById('stats-cost').textContent='$'+totalCost.toFixed(2);
+    document.getElementById('stats-pct').textContent=displayPct+'%';
+    // Update handoff popup with actual numbers
+    updateHandoffInfo(estimatedContextTokens,ctxLimit,estimatedStorageBytes,limitingFactor);
+    updatePctColor(displayPct);
+    // Trigger handoff popup when EITHER limit reaches 75%
+    if(displayPct>=75&&!handoffShownThisSession&&!busy){
+        handoffShownThisSession=true;
+        handoffPopup.classList.add('show');
+    }
+    // Show urgent warning when storage exceeds 80%
+    if(storagePct>=80&&!storageWarningShown){
+        storageWarningShown=true;
+        const warn=document.createElement('div');
+        warn.className='storage-warning';
+        warn.innerHTML='⚠️ <strong>Storage at '+storagePct+'%</strong> - Consider handing off to avoid data loss';
+        warn.style.cssText='position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#d9534f;color:#fff;padding:8px 16px;border-radius:6px;font-size:12px;z-index:9999;animation:fadeIn .3s';
+        document.body.appendChild(warn);
+        setTimeout(()=>warn.remove(),8000);
+    }
+}
+function formatTokens(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(0)+'K';return n.toString();}
+function formatBytes(b){if(b>=1e6)return(b/1e6).toFixed(1)+'MB';if(b>=1e3)return(b/1e3).toFixed(0)+'KB';return b+'B';}
+function updateHandoffInfo(ctx,limit,storage,limitingFactor){
+    const ctxPct=Math.round(ctx/limit*100);
+    const storagePct=Math.round(storage/(maxStorageMB*1024*1024)*100);
+    const ctxStyle=limitingFactor==='context'?'color:#d9534f;font-weight:600':'';
+    const storageStyle=limitingFactor==='storage'?'color:#d9534f;font-weight:600':'';
+    // Extension info display
+    let extInfo='';
+    if(currentExtensionInfo&&currentExtensionInfo.currentExtension>1){
+        const extCount=currentExtensionInfo.extensions.length;
+        const totalMB=(currentExtensionInfo.totalSizeBytes/(1024*1024)).toFixed(2);
+        extInfo='<div style="margin-top:4px;color:#6a9"><strong>📦 Extensions:</strong> '+extCount+' docs ('+totalMB+' MB total)</div>';
+    }
+    const infoEl=document.getElementById('handoff-info');
+    if(infoEl){
+        infoEl.innerHTML='<div style="margin:8px 0;padding:8px;background:var(--vscode-textBlockQuote-background);border-radius:4px;font-size:11px">'+
+            '<div style="'+ctxStyle+'"><strong>Context:</strong> '+formatTokens(ctx)+' of '+formatTokens(limit)+' ('+ctxPct+'%)</div>'+
+            '<div style="'+storageStyle+'"><strong>Storage:</strong> '+formatBytes(storage)+' of '+maxStorageMB+'MB ('+storagePct+'%)'+(storagePct>=60?' ⚠️':'')+'</div>'+
+            extInfo+
+            (limitingFactor==='storage'?'<div style="margin-top:6px;font-size:10px;color:#d9534f">⚠️ Storage is the limiting factor</div>':'')+
+        '</div>';
+    }
+}
 function doSend(){const t=msg.value.trim();if((t||attachedImages.length)&&!busy){vs.postMessage({type:'sendMessage',text:t,images:attachedImages});msg.value='';msg.style.height='auto';stream='';attachedImages=[];imgPreview.innerHTML='';imgPreview.classList.remove('show');hideAutocomplete();saveInputState();}}
 attachBtn.onclick=()=>fileInput.click();
 fileInput.onchange=async e=>{const files=Array.from(e.target.files||[]);for(const f of files){if(!f.type.startsWith('image/'))continue;const reader=new FileReader();reader.onload=ev=>{const b64=ev.target.result.split(',')[1];attachedImages.push(b64);const thumb=document.createElement('div');thumb.className='img-thumb';thumb.innerHTML='<img src="'+ev.target.result+'"><button class="rm" data-i="'+(attachedImages.length-1)+'">×</button>';thumb.querySelector('.rm').onclick=function(){const i=parseInt(this.dataset.i);attachedImages.splice(i,1);updateImgPreview();};imgPreview.appendChild(thumb);imgPreview.classList.add('show');};reader.readAsDataURL(f);}fileInput.value='';};
@@ -3139,7 +3297,15 @@ window.addEventListener('message',e=>{const m=e.data;
 switch(m.type){
 case'init':case'sessionChanged':
 curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=(m.summary||m.sessionId)+'\\n['+m.sessionId.slice(0,6)+']';
-chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}
+chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);
+// Use actual storage bytes from backend if provided (includes extensions)
+if(typeof m.totalStorageBytes==='number'){estimatedStorageBytes=m.totalStorageBytes;}else{estimatedStorageBytes=0;}
+// Track extension info for display
+if(m.extensionInfo){currentExtensionInfo=m.extensionInfo;}else{currentExtensionInfo=null;}
+// Store workspace path for absolute path tooltips
+if(m.workspaceRoot){workspaceRoot=m.workspaceRoot;}
+if(m.platform){workspacePlatform=m.platform;}
+if(m.history){m.history.forEach((p,i)=>{addPair(p,i,0);if(p.response.usage)updStats(p.response.usage);});}
 // Restore TODOs from session
 if(m.todos&&m.todos.length>0){currentTodos=m.todos;renderTodos();}else{currentTodos=[];renderTodos();}
 hist.classList.remove('show');scrollToBottom();saveChatState();break;
@@ -3186,6 +3352,22 @@ case'fileSearchResults':showAutocomplete(m.files||[]);break;
 case'prefillInput':msg.value=m.text;msg.style.height='auto';msg.style.height=Math.min(msg.scrollHeight,120)+'px';saveInputState();break;
 case'modelInfo':if(m.models){for(const[id,info]of Object.entries(m.models)){modelInfo[id]={ctx:info.contextLength||131072,inPrice:info.inputPrice||0.30,outPrice:info.outputPrice||0.50};}}break;
 case'chartData':renderCharts(m);break;
+case'sessionExtended':
+    // Update extension info and storage after user clicked Extend
+    if(typeof m.totalStorageBytes==='number'){estimatedStorageBytes=m.totalStorageBytes;}
+    if(m.extensionInfo){currentExtensionInfo=m.extensionInfo;}
+    // Recalculate and update display
+    const ctxLimit2=getCtxLimit();
+    const maxStorageBytes2=maxStorageMB*1024*1024;
+    const ctxPct2=Math.min(100,Math.round(estimatedContextTokens/ctxLimit2*100));
+    const storagePct2=Math.min(100,Math.round(estimatedStorageBytes/maxStorageBytes2*100));
+    const displayPct2=Math.max(ctxPct2,storagePct2);
+    const limitingFactor2=storagePct2>ctxPct2?'storage':'context';
+    document.getElementById('stats-pct').textContent=displayPct2+'%';
+    updateHandoffInfo(estimatedContextTokens,ctxLimit2,estimatedStorageBytes,limitingFactor2);
+    updatePctColor(displayPct2);
+    saveChatState();
+    break;
 }});
 function showCmdOutput(cmd,out,isErr){const div=document.createElement('div');div.className='msg a';div.innerHTML='<div class="c"><div class="term-out"><div class="term-hdr"><span class="term-cmd">$ '+esc(cmd)+'</span><span style="color:'+(isErr?'#c44':'#6a9')+'">'+( isErr?'Failed':'Done')+'</span></div><div class="term-body">'+esc(out)+'</div></div></div>';chat.appendChild(div);scrollToBottom();}
 function timeAgo(d){const s=Math.floor((Date.now()-new Date(d))/1e3);if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
@@ -3303,7 +3485,7 @@ const applyBtn=autoApply?'<span class="btn" style="background:var(--vscode-butto
 h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path||'')+'</span>'+applyBtn+'</div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';
 });}
 // Commands
-if(rpCmdCount>0){reparsed.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command||'').replace(/'/g,"\\\\'");h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+esc(cmd.command||'')+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
+if(rpCmdCount>0){reparsed.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command||'').replace(/'/g,"\\\\'");const absPath=getAbsolutePathTooltip(cmd.command||'');const tooltip=absPath!==(cmd.command||'')?' title="'+esc(absPath)+'"':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd"'+tooltip+'>$ '+esc(cmd.command||'')+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
 // Next steps
 if(reparsed.nextSteps&&reparsed.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';reparsed.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
 // What was done summary
@@ -3328,7 +3510,7 @@ const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);
 }
 }
 if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1&&!autoApply){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}else if(s.fileChanges.length>1&&autoApply){h+='<div class="apply-all" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);cursor:default">✓ Applied All '+s.fileChanges.length+' Files</div>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split(/\\r?\\n/).map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}if(line.startsWith(' ')){return '<span>'+esc(line.substring(1))+'</span>';}return '<span>'+esc(line)+'</span>';}).join('\\n'):esc(fc.content);const applyBtn=autoApply?'<span class="btn" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)">Applied ✓</span>':'<button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button>';h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div>'+applyBtn+'</div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
-if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command).replace(/'/g,"\\\\'");h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+esc(cmd.command)+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
+if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command).replace(/'/g,"\\\\'");const absPath=getAbsolutePathTooltip(cmd.command);const tooltip=absPath!==cmd.command?' title="'+esc(absPath)+'"':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd"'+tooltip+'>$ '+esc(cmd.command)+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
 if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
 // Summary section - structured bullet points showing what was done
 const fileCount=s.fileChanges?s.fileChanges.length:0;
@@ -3393,7 +3575,9 @@ t=t.replace(new RegExp(bt+'([^'+bt+'\\\\n]+)'+bt,'g'),function(m,code){
 t=t.replace(/🖥️\\s*%%INLINE(\\d+)%%/g,function(m,idx){
     const code=inlineCodes[parseInt(idx)-1]||'';
     const cmd=code.replace(/<\\/?code>/g,'');
-    return '<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd">$ '+cmd+'</div></div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmd.replace(/'/g,"\\\\'")+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div></div>';
+    const absPath=getAbsolutePathTooltip(cmd);
+    const tooltip=absPath!==cmd?' title="'+esc(absPath)+'"':'';
+    return '<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd"'+tooltip+'>$ '+cmd+'</div></div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmd.replace(/'/g,"\\\\'")+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmd.replace(/'/g,"\\\\'")+'\\')">▶ Run</button></div></div></div>';
 });
 // Markdown tables - greedy match for rows to capture full line
 t=t.replace(/^\\|(.+)\\|\\s*\\n\\|[-:|\\s]+\\|\\s*\\n((?:\\|.+\\|\\s*\\n?)+)/gm,function(m,header,body){
