@@ -34,7 +34,7 @@ ${RESPONSE_JSON_SCHEMA}
 | todos | no | Task list: [{ "text": "step", "completed": false }] |
 | fileChanges | no | Files to create/modify |
 | commands | no | Terminal commands to run |
-| nextSteps | no | Follow-up action suggestions |
+| nextSteps | no | Follow-up action suggestions: [{ "html": "display text", "inputText": "what to send" }] - ordered by priority |
 
 ## FORMATTING RULES
 
@@ -65,7 +65,10 @@ ${RESPONSE_JSON_SCHEMA}
     {"heading": "Critical Issues", "content": "Missing timeout on API calls. Syntax error on line 45.", "codeBlocks": [{"language": "python", "code": "# Wrong\\nresult.content[dict]\\n\\n# Correct\\nresult.content_as[dict]", "caption": "Fix syntax"}]}
   ],
   "todos": [{"text": "Fix syntax error on line 45", "completed": false}, {"text": "Add timeout to API calls", "completed": false}],
-  "nextSteps": ["Apply the syntax fix", "Test with the cluster"]
+  "nextSteps": [
+    {"html": "Apply syntax fix on line 45", "inputText": "apply"},
+    {"html": "Run tests after changes", "inputText": "run tests"}
+  ]
 }
 
 ### File change (new file - full content, isDiff: false):
@@ -207,14 +210,17 @@ Users can attach files using backtick autocomplete:
 If you want to modify a file but it wasn't provided:
 1. DO NOT output generic sample code without file paths
 2. Instead, ask the user to attach the specific file(s) using the backtick feature
-3. Add a nextSteps entry like: "Attach \`templates/index.html\` using backtick autocomplete"
+3. Add a nextSteps entry like: {"html": "Attach templates/index.html", "inputText": "templates/index.html"}
 4. Explain what you'll do once you have the file content
 
 Example response when file is needed:
 {
   "summary": "I can fix the hamburger menu, but need the actual file content first.",
   "sections": [{"heading": "What I'll Do", "content": "Once you share the file, I'll provide a diff with the exact CSS fixes for the dropdown menu."}],
-  "nextSteps": ["Type \`index.html to attach the HTML file", "Type \`style.css to attach the CSS file", "I'll then provide Apply-ready changes"]
+  "nextSteps": [
+    {"html": "Attach index.html (HTML file needed)", "inputText": "index.html"},
+    {"html": "Attach style.css (CSS file needed)", "inputText": "style.css"}
+  ]
 }
 
 **WHEN FILE CONTENT IS PROVIDED:**
@@ -235,7 +241,7 @@ When to use incremental execution:
 - Response would include 3+ fileChanges
 
 How to handle:
-1. First response: Create TODO list with ALL steps, execute ONLY first 1-2 steps, end with nextSteps: ["Say 'continue' to proceed"]
+1. First response: Create TODO list with ALL steps, execute ONLY first 1-2 steps, end with nextSteps: [{"html": "Continue to next step", "inputText": "continue"}]
 2. On "continue": Mark completed steps done, execute next 1-2 steps, repeat until complete
 
 This prevents massive responses that get truncated mid-output.
@@ -281,13 +287,13 @@ Users can attach files using backtick autocomplete:
 
 If you need file content to make changes:
 1. Ask the user to attach files using the backtick feature
-2. Add a nextSteps entry like: "Type \`index.html to attach the file"
+2. Add a nextSteps entry like: {"html": "Attach index.html", "inputText": "index.html"}
 3. Once files are attached, provide exact fileChanges with Apply buttons
 
 ## MULTI-STEP TASK HANDLING
 
 Complex tasks with 3+ steps: Execute ONE STEP AT A TIME.
-- First response: Create TODO list with ALL steps, execute only first 1-2, end with nextSteps: ["Say 'continue' to proceed"]
+- First response: Create TODO list with ALL steps, execute only first 1-2, end with nextSteps: [{"html": "Continue to next step", "inputText": "continue"}]
 - On "continue": Mark completed, execute next 1-2 steps, repeat until done
 `;
     }

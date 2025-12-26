@@ -25,6 +25,7 @@ import {
     BugType,
     BugReporter,
     appendOperationFailure,
+    appendCliExecution,
     computeFileHash,
     OperationFailure,
     // Extension-aware functions
@@ -243,6 +244,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'reportBug':
                     this._reportBug(message.pairIndex, message.bugType, message.description, message.by);
+                    break;
+                case 'bugReport':
+                    // Auto-report from webview (e.g., legacy nextSteps format used)
+                    this._reportBug(-1, message.bugType || 'Other', message.description || 'Unknown issue', 'script');
                     break;
                 case 'regenerateImage':
                     await this._regenerateImage(message.imageId, message.galleryId, message.prompt);
@@ -909,19 +914,105 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const completedCount = todos.filter(t => t.completed).length;
             const pendingCount = todos.length - completedCount;
             
-            const handoffText = [
-                `## Handoff from Session ${sessionId.slice(0, 6)}`,
-                '',
-                `**Summary:** ${oldSession.summary || 'No summary available'}`,
-                '',
-                `**Progress:** ${completedCount}/${todos.length} tasks completed`,
-                pendingCount > 0 ? `**Remaining:** ${pendingCount} task(s) pending` : '',
-                '',
-                '**TODOs:**',
-                todoSummary,
-                '',
-                `**Context:** ${oldSession.pairs.length} message(s) exchanged, ${oldSession.tokensIn + oldSession.tokensOut} tokens used`
-            ].filter(Boolean).join('\n');
+            // Extract files that were modified in this session from changeHistory with details
+            const modifiedFilesWithStats: Array<{path: string, stats: {added: number, removed: number}}> = [];
+            if (oldSession.changeHistory?.history) {
+                const fileMap = new Map<string, {added: number, removed: number}>();
+                for (const changeSet of oldSession.changeHistory.history) {
+                    for (const file of changeSet.files) {
+                        const existing = fileMap.get(file.filePath) || {added: 0, removed: 0};
+                        existing.added += file.stats?.added || 0;
+                        existing.removed += file.stats?.removed || 0;
+                        fileMap.set(file.filePath, existing);
+                    }
+                }
+                for (const [path, stats] of fileMap) {
+                    modifiedFilesWithStats.push({path, stats});
+                }
+            }
+            
+            // Extract files referenced in contextFiles from all pairs
+            const contextFilesSet = new Set<string>();
+            for (const pair of oldSession.pairs) {
+                if (pair.request.contextFiles) {
+                    for (const cf of pair.request.contextFiles) {
+                        if (typeof cf === 'string') {
+                            contextFilesSet.add(cf);
+                        } else if (cf && typeof cf === 'object' && 'path' in cf) {
+                            contextFilesSet.add((cf as any).path);
+                        }
+                    }
+                }
+            }
+            const contextFiles = Array.from(contextFilesSet);
+            
+            // Get the last few conversation exchanges for context (last 3 pairs)
+            const recentContext: string[] = [];
+            const lastPairs = oldSession.pairs.slice(-3);
+            for (const pair of lastPairs) {
+                if (pair.request.text) {
+                    // Truncate long messages
+                    const userMsg = pair.request.text.length > 300 
+                        ? pair.request.text.slice(0, 300) + '...' 
+                        : pair.request.text;
+                    recentContext.push(`User: ${userMsg}`);
+                }
+                if (pair.response.structured?.summary) {
+                    recentContext.push(`AI: ${pair.response.structured.summary}`);
+                }
+            }
+            
+            // Get any bugs/errors that occurred
+            const bugs = (oldSession as any).bugs || [];
+            const recentBugs = bugs.slice(-3).map((b: any) => `- ${b.type}: ${b.description}`).join('\n');
+            
+            // Get CLI executions summary
+            const cliExecutions = (oldSession as any).cliExecutions || [];
+            const failedCli = cliExecutions.filter((c: any) => !c.success).slice(-3);
+            const cliSummary = failedCli.length > 0 
+                ? failedCli.map((c: any) => `- \`${c.command}\`: ${c.error || 'failed'}`).join('\n')
+                : 'None';
+            
+            // Build structured handoff context - comprehensive for AI
+            const handoffText = `## HANDOFF CONTEXT
+
+**Parent Session:** ${sessionId}
+**Project:** ${oldSession.projectName}
+**Total Exchanges:** ${oldSession.pairs.length}
+**Tokens Used:** ${oldSession.tokensIn || 0} in / ${oldSession.tokensOut || 0} out
+
+### SESSION SUMMARY
+${oldSession.summary || 'No summary available'}
+
+### FILES MODIFIED (${modifiedFilesWithStats.length} files)
+${modifiedFilesWithStats.length > 0 
+    ? modifiedFilesWithStats.map(f => `- \`${f.path}\` (+${f.stats.added}/-${f.stats.removed})`).join('\n') 
+    : 'None'}
+
+### FILES REFERENCED (context attached during session)
+${contextFiles.length > 0 ? contextFiles.map(f => `- \`${f}\``).join('\n') : 'None'}
+
+### CURRENT TASKS (continue these - priority order)
+${todos.filter(t => !t.completed).map((t, i) => `${i + 1}. [ ] ${t.text}`).join('\n') || 'All tasks completed'}
+
+### COMPLETED TASKS
+${todos.filter(t => t.completed).map(t => `- [x] ${t.text}`).join('\n') || 'None'}
+
+### RECENT CONVERSATION
+${recentContext.join('\n')}
+
+### RECENT ERRORS/ISSUES
+${recentBugs || 'None'}
+
+### FAILED CLI COMMANDS
+${cliSummary}
+
+### INSTRUCTIONS
+1. Continue working on CURRENT TASKS in priority order
+2. Read the FILES MODIFIED if you need context on what was changed
+3. Read the FILES REFERENCED if you need the source content
+4. Check RECENT ERRORS if there are issues to address
+5. IMPORTANT: When outputting fileChanges, use the EXACT file paths listed above`;
 
             // Create new session with parent reference
             const newSession = await createSession(sessionId);
@@ -943,15 +1034,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             });
 
             // Pre-fill the input with handoff context so user can see and edit it
-            const pendingTodos = todos.filter(t => !t.completed).map(t => `- ${t.text}`).join('\n');
-            const prefillText = [
-                `[Handoff from session @${sessionId.slice(0, 6)}]`,
-                '',
-                `Previous work: ${oldSession.summary || 'No summary'}`,
-                pendingTodos ? `\nPending tasks:\n${pendingTodos}` : '',
-                '',
-                'Please continue where we left off.'
-            ].filter(Boolean).join('\n');
+            const pendingTasks = todos.filter(t => !t.completed);
+            const prefillText = pendingTasks.length > 0
+                ? `Continue with: ${pendingTasks.map(t => t.text).join(', ')}`
+                : `Continue from session @${sessionId.slice(0, 8)} - ${oldSession.summary || 'previous work'}`;
             
             this._postMessage({
                 type: 'prefillInput',
@@ -1324,9 +1410,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
             request.model = model;
 
-            // Agent workflow: analyze if files are needed and load them
+            // Auto-attach modified files on "continue" messages
+            // This ensures AI has current file state for accurate diffs
             let finalMessageText = messageText;
-            if (!hasImages) {
+            const isContinueMessage = /^continue$/i.test(messageText.trim());
+            if (isContinueMessage && this._currentSessionId) {
+                try {
+                    const tracker = getChangeTracker();
+                    const modifiedFiles = tracker.getModifiedFilePaths();
+                    
+                    if (modifiedFiles.length > 0) {
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔄 Auto-attaching modified files for context...\n' });
+                        
+                        const fileContents: string[] = [];
+                        for (const filePath of modifiedFiles.slice(0, 5)) { // Limit to 5 most recent
+                            try {
+                                const content = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
+                                const textContent = Buffer.from(content).toString('utf8');
+                                const fileName = filePath.split('/').pop() || filePath;
+                                fileContents.push(`📄 ${fileName}:\n\`\`\`\n${textContent}\n\`\`\``);
+                                info(`Auto-attached: ${fileName}`);
+                            } catch (readErr) {
+                                debug(`Failed to read ${filePath}:`, readErr);
+                            }
+                        }
+                        
+                        if (fileContents.length > 0) {
+                            finalMessageText = `${messageText}\n\n**Current state of modified files:**\n${fileContents.join('\n\n')}`;
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} modified file(s)\n\n` });
+                        }
+                    }
+                } catch (attachErr) {
+                    debug('Auto-attach error (continuing):', attachErr);
+                }
+            }
+
+            // Agent workflow: analyze if files are needed and load them
+            if (!hasImages && !isContinueMessage) {
                 try {
                     this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔍 Analyzing request...\n' });
                     
@@ -1511,6 +1631,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         info(`Used model cleanup to fix ${cleanupType}`);
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n🔧 ${cleanupType} cleaned up\n` });
                         
+                        // Track JSON cleanup as a soft bug - AI response required remediation
+                        try {
+                            await appendSessionBug(this._currentSessionId!, {
+                                type: 'JSON',
+                                pairIndex,
+                                by: 'script',
+                                description: `Auto-detected: Response required ${cleanupType} cleanup - initial parse failed, AI remediation succeeded`
+                            });
+                            debug('Auto-reported JSON cleanup bug for pair:', pairIndex);
+                        } catch (bugErr) {
+                            debug('Failed to auto-report JSON cleanup bug:', bugErr);
+                        }
+                        
                         // Record cleanup step metrics if model was used
                         if (cleanupResult.cleanupMetrics) {
                             recordStep(
@@ -1658,6 +1791,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             let edits: ProposedEdit[] = [];
             const blockedChanges: string[] = [];
             const suspiciousChanges: string[] = [];
+            
+            // CRITICAL: Block ALL file changes if response was truncated
+            const wasTruncated = 
+                (structured.summary && structured.summary.toLowerCase().includes('truncated')) ||
+                (grokResponse.text && grokResponse.text.length < 200 && structured.fileChanges && structured.fileChanges.length > 0) ||
+                (grokResponse.text && !grokResponse.text.trim().endsWith('}') && structured.fileChanges && structured.fileChanges.length > 0);
+            
+            if (wasTruncated && structured.fileChanges && structured.fileChanges.length > 0) {
+                const truncationWarning = `🚫 BLOCKED: ${structured.fileChanges.length} file change(s) from truncated response. ` +
+                    `The response was cut off mid-stream. NO changes have been applied to protect your files.`;
+                vscode.window.showErrorMessage(truncationWarning);
+                this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n\n${truncationWarning}\n` });
+                logError('BLOCKED all file changes due to truncation:', structured.fileChanges.map(fc => fc.path).join(', '));
+                
+                // Clear the file changes so they don't get applied
+                structured.fileChanges = [];
+            }
             
             if (structured.fileChanges && structured.fileChanges.length > 0) {
                 const editPromises = structured.fileChanges.map(async (fc, idx) => {
@@ -2159,7 +2309,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const whitelist = config.get<string[]>('cliWhitelist', []);
         const cmdLower = command.trim().toLowerCase();
         
-        return whitelist.some(prefix => cmdLower.startsWith(prefix.toLowerCase()));
+        // Filter out comment lines (section headers like "# [Linux/Mac]")
+        const activeCommands = whitelist.filter(prefix => !prefix.trim().startsWith('#'));
+        
+        return activeCommands.some(prefix => cmdLower.startsWith(prefix.toLowerCase()));
     }
 
     /**
@@ -2181,7 +2334,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
             if (this._isCommandWhitelisted(command)) {
                 info(`Auto-executing whitelisted command: ${command}`);
-                await this.runTerminalCommand(command);
+                await this.runTerminalCommand(command, { wasAutoExecuted: true, wasWhitelisted: true });
             } else {
                 // Command not whitelisted - show prompt to user
                 const action = await vscode.window.showWarningMessage(
@@ -2192,7 +2345,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 );
                 
                 if (action === 'Run Once') {
-                    await this.runTerminalCommand(command);
+                    await this.runTerminalCommand(command, { wasAutoExecuted: true, wasWhitelisted: false });
                 } else if (action === 'Add to Whitelist & Run') {
                     // Add command prefix to whitelist
                     const whitelist = config.get<string[]>('cliWhitelist', []);
@@ -2202,37 +2355,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         await config.update('cliWhitelist', whitelist, vscode.ConfigurationTarget.Global);
                         info(`Added "${cmdPrefix}" to CLI whitelist`);
                     }
-                    await this.runTerminalCommand(command);
+                    await this.runTerminalCommand(command, { wasAutoExecuted: true, wasWhitelisted: true });
                 }
                 // 'Skip' or dismiss - do nothing
             }
         }
     }
 
-    public async runTerminalCommand(command: string) {
+    public async runTerminalCommand(command: string, options?: { wasAutoExecuted?: boolean; wasWhitelisted?: boolean }) {
         if (!command || command.trim().length === 0) {
             return;
         }
 
         const workspaceFolders = vscode.workspace.workspaceFolders;
         const cwd = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const startTime = Date.now();
 
         info('Running terminal command:', command);
+
+        // Get current pair index for tracking
+        let pairIndex = 0;
+        if (this._currentSessionId) {
+            try {
+                const session = await getSessionWithExtensions(this._currentSessionId);
+                pairIndex = session ? Math.max(0, session.pairs.length - 1) : 0;
+            } catch { /* ignore */ }
+        }
 
         try {
             const { exec } = require('child_process');
             
-            const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-                exec(command, { cwd, maxBuffer: 1024 * 1024, timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
+            const result = await new Promise<{ stdout: string; stderr: string; exitCode?: number }>((resolve, reject) => {
+                const proc = exec(command, { cwd, maxBuffer: 1024 * 1024, timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
                     if (error && !stdout && !stderr) {
                         reject(error);
                     } else {
-                        resolve({ stdout: stdout || '', stderr: stderr || '' });
+                        resolve({ stdout: stdout || '', stderr: stderr || '', exitCode: error?.code });
                     }
                 });
             });
 
+            const durationMs = Date.now() - startTime;
             const output = (result.stdout + result.stderr).trim();
+            
+            // Track CLI execution in Couchbase
+            if (this._currentSessionId) {
+                appendCliExecution(this._currentSessionId, {
+                    pairIndex,
+                    command,
+                    cwd,
+                    success: true,
+                    exitCode: result.exitCode || 0,
+                    durationMs,
+                    stdout: result.stdout?.slice(0, 1000),
+                    stderr: result.stderr?.slice(0, 1000),
+                    wasAutoExecuted: options?.wasAutoExecuted || false,
+                    wasWhitelisted: options?.wasWhitelisted || false
+                }).catch(err => debug('Failed to log CLI execution:', err));
+            }
             
             this._postMessage({
                 type: 'commandOutput',
@@ -2247,8 +2427,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.sendMessage(feedbackMsg);
 
         } catch (error: any) {
+            const durationMs = Date.now() - startTime;
             logError('Command failed:', error);
             const errorOutput = `Error: ${error.message}`;
+            
+            // Track CLI failure in Couchbase
+            if (this._currentSessionId) {
+                appendCliExecution(this._currentSessionId, {
+                    pairIndex,
+                    command,
+                    cwd,
+                    success: false,
+                    exitCode: error.code,
+                    durationMs,
+                    error: error.message,
+                    wasAutoExecuted: options?.wasAutoExecuted || false,
+                    wasWhitelisted: options?.wasWhitelisted || false
+                }).catch(err => debug('Failed to log CLI execution:', err));
+            }
+            
             this._postMessage({
                 type: 'commandOutput',
                 command,
@@ -4319,8 +4516,8 @@ h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path||'')+'</span>
 });}
 // Commands
 if(rpCmdCount>0){reparsed.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command||'').replace(/'/g,"\\\\'");const absPath=getAbsolutePathTooltip(cmd.command||'');const tooltip=absPath!==(cmd.command||'')?' title="'+esc(absPath)+'"':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd"'+tooltip+'>$ '+esc(cmd.command||'')+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
-// Next steps
-if(reparsed.nextSteps&&reparsed.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';reparsed.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
+// Next steps - supports both string and {html,inputText} formats
+if(reparsed.nextSteps&&reparsed.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';reparsed.nextSteps.forEach(step=>{let html,input;if(typeof step==='object'&&step.html&&step.inputText){html=step.html;input=step.inputText;}else if(typeof step==='string'){html=step;input=step;vs.postMessage({type:'bugReport',bugType:'JSON',description:'Auto-detected: nextSteps used legacy string format instead of {html,inputText}'});}else{return;}const safeInput=btoa(encodeURIComponent(input));h+='<button class="next-step-btn" data-step="'+safeInput+'">'+esc(html)+'</button>';});h+='</div></div>';}
 // What was done summary
 if(rpFileCount>0||rpCmdCount>0){
 h+='<div class="response-summary"><div class="response-summary-header"><span class="response-summary-title">📝 What was done</span><a href="#" class="nav-link" onclick="this.closest(\\'.msg\\').scrollIntoView({behavior:\\'smooth\\'});return false;">See details ↑</a></div>';
@@ -4344,7 +4541,7 @@ const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);
 }
 if(s.fileChanges&&s.fileChanges.length>0){if(s.fileChanges.length>1&&!autoApply){h+='<button class="apply-all" onclick="applyAll()">✅ Apply All '+s.fileChanges.length+' Files</button>';}else if(s.fileChanges.length>1&&autoApply){h+='<div class="apply-all" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);cursor:default">✓ Applied All '+s.fileChanges.length+' Files</div>';}const previewMap={};if(diffPreview){diffPreview.forEach(dp=>{previewMap[dp.file]=dp.stats;});}s.fileChanges.forEach(fc=>{const filename=fc.path.split('/').pop()||fc.path;const stats=previewMap[filename]||previewMap[fc.path]||{added:0,removed:0,modified:0};const statsHtml='<span class="stat-add">+'+stats.added+'</span> <span class="stat-rem">-'+stats.removed+'</span>'+(stats.modified>0?' <span class="stat-mod">~'+stats.modified+'</span>':'');const codeContent=fc.isDiff?fc.content.split(/\\r?\\n/).map(line=>{if(line.startsWith('+')){return '<span class="diff-add">'+esc(line.substring(1))+'</span>';}if(line.startsWith('-')){return '<span class="diff-rem">'+esc(line.substring(1))+'</span>';}if(line.startsWith(' ')){return '<span>'+esc(line.substring(1))+'</span>';}return '<span>'+esc(line)+'</span>';}).join('\\n'):esc(fc.content);const applyBtn=autoApply?'<span class="btn" style="background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)">Applied ✓</span>':'<button class="btn btn-ok" onclick="applyFile(\\''+esc(fc.path)+'\\')">Apply</button>';h+='<div class="diff"><div class="diff-h"><span>📄 '+esc(fc.path)+'</span><div class="diff-stats">'+statsHtml+'</div>'+applyBtn+'</div><div class="diff-c"><pre><code>'+codeContent+'</code></pre></div></div>';});}
 if(s.commands&&s.commands.length>0){s.commands.forEach(cmd=>{const desc=cmd.description?'<div class="term-desc">'+esc(cmd.description)+'</div>':'';const cmdEsc=esc(cmd.command).replace(/'/g,"\\\\'");const absPath=getAbsolutePathTooltip(cmd.command);const tooltip=absPath!==cmd.command?' title="'+esc(absPath)+'"':'';h+='<div class="term-out"><div class="term-hdr"><div class="term-content"><div class="term-cmd"'+tooltip+'>$ '+esc(cmd.command)+'</div>'+desc+'</div><div class="term-btns"><button class="term-copy" onclick="copyCmd(this,\\''+cmdEsc+'\\')">📋</button><button class="term-run" onclick="runCmd(\\''+cmdEsc+'\\')" >▶ Run</button></div></div></div>';});}
-if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{const safeStep=btoa(encodeURIComponent(step));h+='<button class="next-step-btn" data-step="'+safeStep+'">'+esc(step)+'</button>';});h+='</div></div>';}
+if(s.nextSteps&&s.nextSteps.length>0){h+='<div class="next-steps"><div class="next-steps-hdr">💡 Suggested Next Steps</div><div class="next-steps-btns">';s.nextSteps.forEach(step=>{let html,input;if(typeof step==='object'&&step.html&&step.inputText){html=step.html;input=step.inputText;}else if(typeof step==='string'){html=step;input=step;vs.postMessage({type:'bugReport',bugType:'JSON',description:'Auto-detected: nextSteps used legacy string format instead of {html,inputText}'});}else{return;}const safeInput=btoa(encodeURIComponent(input));h+='<button class="next-step-btn" data-step="'+safeInput+'">'+esc(html)+'</button>';});h+='</div></div>';}
 // Summary section - structured bullet points showing what was done
 const fileCount=s.fileChanges?s.fileChanges.length:0;
 const cmdCount=s.commands?s.commands.length:0;
@@ -4484,12 +4681,13 @@ let current=parseInt(countEl.textContent)||0;
 current=Math.max(0,current-count);
 if(current===0){item.classList.remove('pending');item.classList.add('done');item.innerHTML='✓ '+actionType.charAt(0).toUpperCase()+actionType.slice(1)+' complete';}
 else{countEl.textContent=current;}}});}
-function sendNextStep(step){msg.value=step;doSend();}
+function extractActionFromStep(step){const m=step.match(/^\\[([^\\]]+)\\]\\s*(.*)$/i);if(m){const a=m[1].toLowerCase(),r=m[2];if(a==='attach'){const f=r.match(/\`([^\`]+)\`/);if(f)return f[1];}if(a==='continue')return'continue';if(a==='apply')return'apply';if(a==='run')return'run';if(a==='test')return'test';if(a==='wait')return null;return a;}const l=step.toLowerCase();if(l.includes("'continue'")||l.includes('continue'))return'continue';return step;}
+function sendNextStep(inputText){if(!inputText||inputText==='null')return;msg.value=inputText;doSend();}
 document.addEventListener('click',e=>{
     const btn=e.target.closest('.next-step-btn');
     if(btn&&btn.dataset.step){
-        const step=decodeURIComponent(atob(btn.dataset.step));
-        sendNextStep(step);
+        const inputText=decodeURIComponent(atob(btn.dataset.step));
+        sendNextStep(inputText);
     }
 });
 function updUI(){stop.classList.toggle('vis',busy);send.style.display=busy?'none':'block';msg.disabled=busy;if(!busy)msg.focus();}

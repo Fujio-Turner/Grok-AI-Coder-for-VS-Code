@@ -312,6 +312,57 @@ export async function revertEdits(editGroupId: string): Promise<void> {
     }
 }
 
+/**
+ * Fallback revert using stored oldContent from changeSet.
+ * Use this when editSnapshots are not available (e.g., after extension reload).
+ */
+export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath: string; oldContent: string; isNewFile: boolean }> }): Promise<boolean> {
+    const workspaceEdit = new vscode.WorkspaceEdit();
+    let filesReverted = 0;
+
+    for (const fileChange of changeSet.files) {
+        try {
+            const uri = vscode.Uri.file(fileChange.filePath);
+            
+            if (fileChange.isNewFile) {
+                // File was created - delete it
+                workspaceEdit.deleteFile(uri, { ignoreIfNotExists: true });
+            } else {
+                // Restore original content
+                const doc = await vscode.workspace.openTextDocument(uri);
+                const fullRange = new vscode.Range(
+                    doc.positionAt(0),
+                    doc.positionAt(doc.getText().length)
+                );
+                workspaceEdit.replace(uri, fullRange, fileChange.oldContent);
+            }
+            filesReverted++;
+        } catch (error) {
+            console.error('Failed to revert file directly:', fileChange.filePath, error);
+        }
+    }
+
+    const success = await vscode.workspace.applyEdit(workspaceEdit);
+    
+    if (success) {
+        // Save all modified files
+        for (const fileChange of changeSet.files) {
+            if (!fileChange.isNewFile) {
+                try {
+                    const uri = vscode.Uri.file(fileChange.filePath);
+                    const doc = await vscode.workspace.openTextDocument(uri);
+                    await doc.save();
+                } catch (saveErr) {
+                    console.error('Failed to save reverted file:', fileChange.filePath, saveErr);
+                }
+            }
+        }
+        console.log(`[Grok] Direct revert: ${filesReverted} file(s) restored`);
+    }
+    
+    return success;
+}
+
 export async function revertToChangeSet(targetChangeSetId: string): Promise<boolean> {
     const history = changeTracker.getHistory();
     const targetIndex = history.findIndex(cs => cs.id === targetChangeSetId);
@@ -328,7 +379,20 @@ export async function revertToChangeSet(targetChangeSetId: string): Promise<bool
                 try {
                     await revertEdits(editGroupId);
                 } catch (error) {
-                    console.error('Failed to revert change set:', cs.id, error);
+                    console.error('Failed to revert change set via editGroup:', cs.id, error);
+                    // Fallback: use stored oldContent directly
+                    console.log('Attempting direct revert using stored oldContent...');
+                    const success = await revertChangeSetDirect(cs);
+                    if (success) {
+                        changeTracker.markReverted(cs.id);
+                    }
+                }
+            } else {
+                // No editGroup mapping - use direct revert
+                console.log('No editGroup mapping, using direct revert for:', cs.id);
+                const success = await revertChangeSetDirect(cs);
+                if (success) {
+                    changeTracker.markReverted(cs.id);
                 }
             }
         }

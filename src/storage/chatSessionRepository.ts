@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import { getCouchbaseClient } from './couchbaseClient';
 import { GrokUsage } from '../api/grokClient';
+import { NextStepItem } from '../prompts/responseSchema';
 
 const MAX_PAYLOAD_SIZE_MB = 15; // Conservative limit (Couchbase max is 20MB)
 
@@ -61,7 +62,7 @@ export interface ChatResponse {
         fileChanges?: Array<{ path: string; content: string; language?: string; isDiff?: boolean; lineRange?: { start: number; end: number } }>;
         commands?: Array<{ command: string; description?: string }>;
         codeBlocks?: Array<{ language?: string; code: string; caption?: string }>;
-        nextSteps?: string[];
+        nextSteps?: NextStepItem[];
     };
 }
 
@@ -127,6 +128,19 @@ export interface BugReport {
     description: string;     // Description of the bug
     timestamp: string;       // When it was reported
     resolved?: boolean;      // Whether bug has been addressed
+    // Debug context for AI analysis
+    debugContext?: {
+        sourceLocation?: string;      // e.g., "ChatViewProvider.ts:1495"
+        functionName?: string;        // e.g., "sendMessage"
+        rawResponseLength?: number;   // Length of AI response that caused issue
+        rawResponsePreview?: string;  // First 500 chars of problematic response
+        apiError?: {                  // If API returned error
+            status?: number;          // HTTP status code
+            statusText?: string;
+            errorBody?: string;       // First 1000 chars of error response
+        };
+        stackTrace?: string;          // Error stack if available
+    };
 }
 
 // Operation failure tracking for debugging file edit issues
@@ -135,7 +149,7 @@ export interface OperationFailure {
     timestamp: string;
     pairIndex: number;
     filePath: string;
-    operationType: 'lineOperation' | 'diff' | 'fullReplace';
+    operationType: 'lineOperation' | 'diff' | 'fullReplace' | 'apiError' | 'parseError';
     error: string;
     // Snapshot of file state at time of failure
     fileSnapshot?: {
@@ -143,6 +157,7 @@ export interface OperationFailure {
         lineCount: number;
         sizeBytes: number;
         capturedAt: string;     // When snapshot was taken
+        contentPreview?: string; // First/last 200 chars for context
     };
     // The operation that failed
     failedOperation?: {
@@ -158,6 +173,49 @@ export interface OperationFailure {
     fileModifiedDuringProcessing?: boolean;
     originalHash?: string;      // Hash when AI started processing
     currentHash?: string;       // Hash when operation was attempted
+    // Debug context for AI analysis
+    debugContext?: {
+        sourceLocation?: string;      // e.g., "ChatViewProvider.ts:1721"
+        functionName?: string;        // e.g., "applyFileChanges"
+        rawAiResponse?: string;       // First 1000 chars of AI response
+        userPrompt?: string;          // First 500 chars of user's request
+        apiError?: {
+            status?: number;
+            statusText?: string;
+            errorBody?: string;
+        };
+        stackTrace?: string;
+        // For file corruption debugging
+        beforeContent?: string;       // File content before change (first 500 chars)
+        afterContent?: string;        // What we tried to write (first 500 chars)
+        diffPreview?: string;         // Unified diff preview
+    };
+}
+
+/**
+ * CLI command execution record - tracks both successes and failures
+ */
+export interface CliExecution {
+    id: string;
+    timestamp: string;
+    pairIndex: number;
+    command: string;
+    cwd: string;
+    success: boolean;
+    exitCode?: number;
+    durationMs: number;
+    // Output (truncated)
+    stdout?: string;  // First 1000 chars
+    stderr?: string;  // First 1000 chars
+    error?: string;   // Error message if failed
+    // Execution context
+    wasAutoExecuted: boolean;  // True if auto-executed, false if manual
+    wasWhitelisted: boolean;   // True if command was in whitelist
+    // AI analysis result (if AI was asked to analyze)
+    aiAnalysis?: {
+        hadErrors: boolean;
+        errorSummary?: string;
+    };
 }
 
 // ============================================================================
@@ -226,6 +284,7 @@ export interface ChatSessionDocument {
     modelUsed?: ModelUsageEntry[];  // Aggregate model usage at root level for fast queries
     bugs?: BugReport[];  // Bug reports for malformed responses
     operationFailures?: OperationFailure[];  // Detailed logs of file operation failures
+    cliExecutions?: CliExecution[];  // CLI command executions (successes and failures)
     extensionInfo?: SessionExtensionInfo;  // Extension tracking for sessions exceeding storage limit
 }
 
@@ -765,6 +824,60 @@ export async function appendOperationFailure(
 export async function getOperationFailures(sessionId: string): Promise<OperationFailure[]> {
     const session = await getSession(sessionId);
     return session?.operationFailures || [];
+}
+
+/**
+ * Append a CLI execution record to a session
+ */
+export async function appendCliExecution(
+    sessionId: string,
+    execution: Omit<CliExecution, 'id' | 'timestamp'>
+): Promise<CliExecution> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize cliExecutions array if not present
+    if (!doc.cliExecutions) {
+        doc.cliExecutions = [];
+    }
+    
+    const fullExecution: CliExecution = {
+        id: uuidv4(),
+        ...execution,
+        timestamp: now
+    };
+    
+    // Keep only last 100 executions to prevent unbounded growth
+    if (doc.cliExecutions.length >= 100) {
+        doc.cliExecutions = doc.cliExecutions.slice(-99);
+    }
+    
+    doc.cliExecutions.push(fullExecution);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append CLI execution');
+    }
+    
+    const status = execution.success ? '✓' : '✗';
+    console.log(`Logged CLI execution to session: ${sessionId} - ${status} ${execution.command.slice(0, 50)}`);
+    return fullExecution;
+}
+
+/**
+ * Get all CLI executions for a session
+ */
+export async function getCliExecutions(sessionId: string): Promise<CliExecution[]> {
+    const session = await getSession(sessionId);
+    return session?.cliExecutions || [];
 }
 
 /**

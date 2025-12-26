@@ -220,6 +220,29 @@ class ChangeTracker {
         return this.changeHistory.filter(c => c.sessionId === sessionId);
     }
 
+    /**
+     * Get unique file paths that have been modified in this session
+     * Returns most recently modified files first
+     */
+    getModifiedFilePaths(): string[] {
+        const fileMap = new Map<string, Date>();
+        
+        // Collect all file paths with their most recent modification time
+        for (const changeSet of this.changeHistory) {
+            for (const file of changeSet.files) {
+                const existing = fileMap.get(file.filePath);
+                if (!existing || changeSet.timestamp > existing) {
+                    fileMap.set(file.filePath, changeSet.timestamp);
+                }
+            }
+        }
+        
+        // Sort by most recent first
+        return Array.from(fileMap.entries())
+            .sort((a, b) => b[1].getTime() - a[1].getTime())
+            .map(([path]) => path);
+    }
+
     clear(): void {
         this.changeHistory = [];
         this.currentPosition = -1;

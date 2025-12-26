@@ -34,6 +34,14 @@ export interface TerminalCommand {
     description?: string;
 }
 
+export interface NextStep {
+    html: string;       // Display text shown on the button
+    inputText: string;  // Text to insert into input when clicked
+}
+
+// Union type for backward compatibility - can be string or structured
+export type NextStepItem = string | NextStep;
+
 export interface CodeBlock {
     language: string;
     code: string;
@@ -53,7 +61,7 @@ export interface GrokStructuredResponse {
     codeBlocks?: CodeBlock[];
     fileChanges?: FileChange[];
     commands?: TerminalCommand[];
-    nextSteps?: string[];
+    nextSteps?: NextStepItem[];  // Can be string[] or NextStep[] (or mixed)
     // Legacy field - kept for backward compatibility
     message?: string;
 }
@@ -83,7 +91,10 @@ export const RESPONSE_JSON_SCHEMA = `{
   "commands": [
     { "command": "npm test", "description": "Run tests" }
   ],
-  "nextSteps": ["First action", "Second action"]
+  "nextSteps": [
+    { "html": "Continue to next step", "inputText": "continue" },
+    { "html": "Attach the config file", "inputText": "config.json" }
+  ]
 }`;
 
 /**
@@ -207,12 +218,27 @@ export function validateResponse(parsed: unknown): GrokStructuredResponse | null
         );
     }
 
-    // Validate optional nextSteps
+    // Validate optional nextSteps - supports both string[] and NextStep[] formats
     if (obj.nextSteps !== undefined) {
         if (!Array.isArray(obj.nextSteps)) {
             return null;
         }
-        response.nextSteps = obj.nextSteps.filter((s): s is string => typeof s === 'string');
+        response.nextSteps = obj.nextSteps
+            .map((s): NextStepItem | null => {
+                // String format (legacy)
+                if (typeof s === 'string') {
+                    return s;
+                }
+                // Object format (preferred)
+                if (typeof s === 'object' && s !== null) {
+                    const step = s as Record<string, unknown>;
+                    if (typeof step.html === 'string' && typeof step.inputText === 'string') {
+                        return { html: step.html, inputText: step.inputText };
+                    }
+                }
+                return null;
+            })
+            .filter((s): s is NextStepItem => s !== null);
     }
 
     return response;

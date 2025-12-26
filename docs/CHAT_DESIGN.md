@@ -261,6 +261,32 @@ This enables workflows like:
 4. AI: Analyzes output, suggests next fix
 5. Repeat until build passes
 
+### CLI Summary Panel
+
+A sticky panel appears at the bottom during batch command execution:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🖥️ CLI Execution           ✓ 3  ✗ 1    4/8           [✕]     │
+├─────────────────────────────────────────────────────────────────┤
+│  ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (50%)             │
+├─────────────────────────────────────────────────────────────────┤
+│  ✓ mkdir -p app/assets/css                                     │
+│  ✓ curl -o file.png https://...         HTTP 200 OK            │
+│  ✓ curl -o logo.svg https://...         HTTP 200 OK            │
+│  ✗ curl -o missing.png https://...      404 Not Found          │
+├─────────────────────────────────────────────────────────────────┤
+│  Next: `python app.py`, `npm run build`                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Features:**
+- Progress bar fills as commands complete
+- Turns red if any command fails
+- Shows each command with ✓/✗ status and output preview
+- Shows remaining commands queue
+- Closeable when done - no scrolling needed
+
 ### Security Considerations
 
 - **Whitelist-only by default**: `autoApplyCli` is `false` by default
@@ -268,6 +294,104 @@ This enables workflows like:
 - **User prompt for unknowns**: Non-whitelisted commands require explicit user action
 - **Timeout protection**: Commands timeout after 30 seconds
 - **Output truncation**: Output capped at 3KB for AI feedback, 5KB for display
+- **Dangerous commands excluded**: `rm` is NOT in the default whitelist
+
+---
+
+## File Change Safety & Rollback
+
+### Truncation Protection
+
+The extension **blocks ALL file changes** from truncated responses to prevent file corruption:
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Truncation Detection"]
+        A[AI Response] --> B{Response complete?}
+        B -->|Yes| C[Parse & Validate]
+        B -->|No| D[Truncation Detected]
+    end
+    
+    subgraph Blocking["🚫 Protection"]
+        D --> E[Block ALL file changes]
+        E --> F[Show error message]
+        F --> G[Log to Couchbase]
+        G --> H[User must retry]
+    end
+    
+    subgraph Apply["✓ Safe to Apply"]
+        C --> I{Valid changes?}
+        I -->|Yes| J[Apply with rollback backup]
+        I -->|No| K[Block suspicious changes]
+    end
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Blocking fill:#3a1a1a,stroke:#c44,color:#fff
+    style Apply fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+**Truncation is detected when:**
+- Summary contains "truncated"
+- Response text < 200 chars but has file changes
+- Response doesn't end with `}` (incomplete JSON)
+
+**When detected:**
+```
+🚫 BLOCKED: 3 file change(s) from truncated response.
+The response was cut off mid-stream. NO changes have been applied.
+```
+
+### Rollback System
+
+Every file change is tracked with full content snapshots for reliable rollback:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Change History                                    [◀ Rewind]   │
+├─────────────────────────────────────────────────────────────────┤
+│  ● Change #3 - 2 files (+45 -12) - $0.02 - 3s ago              │
+│  ○ Change #2 - 1 file (+10 -3) - $0.01 - 5m ago                │
+│  ○ Change #1 - 3 files (+120 -0) - $0.03 - 10m ago             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Two-tier rollback:**
+1. **Primary (fast)**: In-memory snapshots during session
+2. **Fallback (persistent)**: Stored `oldContent` in Couchbase
+
+The fallback ensures rollback works even after:
+- Extension reload
+- VS Code restart
+- Session switch
+
+### Change History Data (Couchbase)
+
+```json
+{
+  "changeHistory": {
+    "history": [
+      {
+        "id": "cs-1703123456789",
+        "sessionId": "session-uuid",
+        "timestamp": "2025-12-25T08:00:00.000Z",
+        "files": [
+          {
+            "filePath": "/path/to/file.ts",
+            "fileName": "file.ts",
+            "oldContent": "// original content...",
+            "newContent": "// modified content...",
+            "stats": { "added": 10, "removed": 3, "modified": 2 },
+            "isNewFile": false
+          }
+        ],
+        "totalStats": { "added": 10, "removed": 3, "modified": 2 },
+        "applied": true
+      }
+    ],
+    "position": 0
+  }
+}
+```
 
 ---
 
@@ -277,7 +401,7 @@ This enables workflows like:
 
 Complex tasks that require 3+ file changes or span multiple concerns (frontend, backend, config, docs) can cause the AI to generate massive responses that get truncated mid-output. This results in:
 - Incomplete JSON that fails to parse
-- Partial file changes that corrupt files
+- Partial file changes that corrupt files (now blocked!)
 - Lost work that must be regenerated
 
 ### Solution: Incremental Execution

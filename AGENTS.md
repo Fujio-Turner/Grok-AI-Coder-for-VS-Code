@@ -5,6 +5,15 @@ A VS Code extension integrating xAI's Grok API with Couchbase persistence for AI
 **Repository:** https://github.com/Fujio-Turner/Grok-AI-Coder-for-VS-Code
 
 
+
+## TOON format
+
+Token-Oriented Object Notation (TOON) is a line-oriented, indentation-based text format that encodes the JSON data model with explicit structure and minimal quoting. Arrays declare their length and an optional field list once; rows use a single active delimiter (comma, tab, or pipe). Objects use indentation instead of braces; strings are quoted only when required. This specification defines TOON’s concrete syntax, canonical number formatting, delimiter scoping, and strict‑mode validation, and sets conformance requirements for encoders, decoders, and validators. TOON provides a compact, deterministic representation of structured data and is particularly efficient for arrays of uniform objects.
+
+https://github.com/toon-format/spec/blob/main/SPEC.md
+
+currently AI in returned back malformed TOON data sometime if asked to respond back as TOON so the default respones is JSON.
+
 ## How This extention Chat works with AI to understand your code and updated it as needed
 
 /docs/CHAT_DESIGN.md
@@ -176,3 +185,160 @@ The status dot in the header shows connection health:
 - 🔴 **Red** - Both services disconnected
 
 Click the status dot to manually test connections.
+
+---
+
+## Bug & Error Tracking System
+
+The extension automatically tracks bugs and errors to Couchbase for debugging and analytics. Use this system for any new error conditions.
+
+### Bug Types
+
+Defined in `src/storage/chatSessionRepository.ts`:
+
+```typescript
+export type BugType = 'HTML' | 'CSS' | 'JSON' | 'JS' | 'TypeScript' | 'Markdown' | 'SQL' | 'Other';
+```
+
+### How to Report a Bug Programmatically
+
+Use `appendSessionBug()` from `chatSessionRepository.ts`:
+
+```typescript
+import { appendSessionBug } from '../storage/chatSessionRepository';
+
+// Report a bug from script/code (not user-reported)
+await appendSessionBug(sessionId, {
+    type: 'JSON',           // BugType - categorizes the bug
+    pairIndex: 5,           // Which message pair triggered this
+    by: 'script',           // 'script' for auto-detected, 'user' for user-reported
+    description: 'Auto-detected: Response required JSON cleanup - initial parse failed'
+});
+```
+
+### When to Track Bugs
+
+Track as bugs any operation where the AI/API did not behave as expected:
+
+| Scenario | Type | Description Pattern |
+|----------|------|---------------------|
+| Response truncated | `Other` | `Auto-detected: Response was truncated - X file change(s) recovered` |
+| JSON parse failed, AI cleanup succeeded | `JSON` | `Auto-detected: Response required JSON cleanup - initial parse failed, AI remediation succeeded` |
+| JSON parse failed completely | `JSON` | `Auto-detected: Response parsing failed - {error message}` |
+| File operation failed | `Other` | `Auto-detected: File operation failed - {operation} on {path}` |
+| API error | `Other` | `Auto-detected: API error - {status} {message}` |
+
+### Bug Schema (Couchbase)
+
+Bugs are stored in the session document's `bugs[]` array:
+
+```json
+{
+  "bugs": [
+    {
+      "type": "JSON",
+      "pairIndex": 3,
+      "timestamp": "2025-12-26T10:30:00.000Z",
+      "description": "Auto-detected: Response required JSON cleanup",
+      "reportedBy": "script",
+      "debugContext": { ... }  // Optional: additional context for debugging
+    }
+  ]
+}
+```
+
+### Viewing Bugs
+
+Use the Error Dashboard (`tools/error_dashboard.py`) to view and analyze bugs:
+
+```bash
+cd tools
+pip install -r requirements.txt
+python error_dashboard.py
+# Open http://localhost:5050
+```
+
+### Dashboard Categories
+
+The dashboard auto-categorizes bugs based on description keywords:
+
+| Category | Detection Logic |
+|----------|-----------------|
+| `cli` | Type is "cli" (CLI command execution failure) |
+| `truncation` | Description contains "truncat" |
+| `json` | Description contains "json" OR `bugType === 'JSON'` |
+| `api` | Description contains "api error" or "fetch failed" |
+| `file` | Type is "failure" OR description contains "line" or "diff" |
+| `other` | Everything else |
+
+### Best Practices
+
+1. **Always use `by: 'script'`** for auto-detected bugs (vs `by: 'user'` for user-reported)
+2. **Prefix descriptions with `Auto-detected:`** for programmatic bug reports
+3. **Include context** in the description (what failed, what was recovered)
+4. **Use appropriate BugType** - helps with filtering and analytics
+5. **Wrap in try/catch** - bug reporting should never crash the main flow:
+
+```typescript
+try {
+    await appendSessionBug(sessionId, { ... });
+    debug('Auto-reported bug for pair:', pairIndex);
+} catch (bugErr) {
+    debug('Failed to auto-report bug:', bugErr);
+}
+```
+
+---
+
+## CLI Execution Tracking
+
+CLI commands (both successes and failures) are tracked in `session.cliExecutions[]` for analytics and debugging.
+
+### CLI Execution Schema
+
+```typescript
+interface CliExecution {
+    id: string;
+    timestamp: string;
+    pairIndex: number;
+    command: string;
+    cwd: string;
+    success: boolean;
+    exitCode?: number;
+    durationMs: number;
+    stdout?: string;  // First 1000 chars
+    stderr?: string;  // First 1000 chars
+    error?: string;   // Error message if failed
+    wasAutoExecuted: boolean;  // True if auto-executed by AI
+    wasWhitelisted: boolean;   // True if command was in whitelist
+}
+```
+
+### How to Track CLI Execution
+
+Use `appendCliExecution()` from `chatSessionRepository.ts`:
+
+```typescript
+import { appendCliExecution } from '../storage/chatSessionRepository';
+
+await appendCliExecution(sessionId, {
+    pairIndex: 5,
+    command: 'npm run build',
+    cwd: '/path/to/project',
+    success: false,
+    exitCode: 1,
+    durationMs: 2500,
+    error: 'Build failed',
+    stderr: 'error TS2322: Type...',
+    wasAutoExecuted: true,
+    wasWhitelisted: true
+});
+```
+
+### Dashboard View
+
+CLI failures appear in the Error Dashboard with:
+- Purple badge for CLI type
+- 🤖 icon for auto-executed commands
+- 👤 icon for manually-executed commands
+- Filter by "CLI failures only" in the Type dropdown
