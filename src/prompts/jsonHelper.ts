@@ -342,10 +342,97 @@ export function recoverTruncatedFileChanges(text: string): { path: string; conte
 }
 
 /**
+ * Recover all useful fields from a truncated JSON response.
+ * Extracts summary, todos, nextSteps, commands, and fileChanges.
+ */
+export function recoverTruncatedResponse(text: string): {
+    summary?: string;
+    todos?: { text: string; completed: boolean }[];
+    nextSteps?: Array<{ html: string; inputText: string } | string>;
+    commands?: { command: string; description?: string }[];
+    fileChanges?: { path: string; content: string; language?: string; isDiff?: boolean }[];
+} {
+    const result: ReturnType<typeof recoverTruncatedResponse> = {};
+    
+    // Extract summary - look for "summary": "..." pattern
+    const summaryMatch = text.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (summaryMatch) {
+        result.summary = summaryMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        debug('Recovered summary from truncated response');
+    }
+    
+    // Extract todos array - look for complete todo objects
+    const todoPattern = /\{\s*"text"\s*:\s*"([^"]+)"\s*,\s*"completed"\s*:\s*(true|false)\s*\}/g;
+    const todos: { text: string; completed: boolean }[] = [];
+    let todoMatch;
+    while ((todoMatch = todoPattern.exec(text)) !== null) {
+        todos.push({
+            text: todoMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+            completed: todoMatch[2] === 'true'
+        });
+    }
+    if (todos.length > 0) {
+        result.todos = todos;
+        debug(`Recovered ${todos.length} todos from truncated response`);
+    }
+    
+    // Extract nextSteps - look for complete nextStep objects (new structured format)
+    const nextStepPattern = /\{\s*"html"\s*:\s*"([^"]+)"\s*,\s*"inputText"\s*:\s*"([^"]+)"\s*\}/g;
+    const nextSteps: Array<{ html: string; inputText: string }> = [];
+    let nextStepMatch;
+    while ((nextStepMatch = nextStepPattern.exec(text)) !== null) {
+        nextSteps.push({
+            html: nextStepMatch[1].replace(/\\"/g, '"'),
+            inputText: nextStepMatch[2].replace(/\\"/g, '"')
+        });
+    }
+    if (nextSteps.length > 0) {
+        result.nextSteps = nextSteps;
+        debug(`Recovered ${nextSteps.length} nextSteps from truncated response`);
+    }
+    
+    // Extract commands - look for complete command objects
+    const commandPattern = /\{\s*"command"\s*:\s*"([^"]+)"(?:\s*,\s*"description"\s*:\s*"([^"]*)")?\s*\}/g;
+    const commands: { command: string; description?: string }[] = [];
+    let commandMatch;
+    while ((commandMatch = commandPattern.exec(text)) !== null) {
+        commands.push({
+            command: commandMatch[1].replace(/\\"/g, '"'),
+            description: commandMatch[2]?.replace(/\\"/g, '"')
+        });
+    }
+    if (commands.length > 0) {
+        result.commands = commands;
+        debug(`Recovered ${commands.length} commands from truncated response`);
+    }
+    
+    // Extract fileChanges using existing function
+    const fileChanges = recoverTruncatedFileChanges(text);
+    if (fileChanges.length > 0) {
+        result.fileChanges = fileChanges;
+    }
+    
+    return result;
+}
+
+export interface SafeParseResult {
+    parsed: unknown;
+    wasRepaired: boolean;
+    truncatedFileChanges?: { path: string; content: string; language?: string; isDiff?: boolean }[];
+    recoveryInfo?: {
+        fileCount: number;
+        todoCount: number;
+        nextStepCount: number;
+        commandCount: number;
+        hadOriginalSummary: boolean;
+    };
+}
+
+/**
  * Safely parse JSON with validation, extraction, and repair.
  * Returns parsed object or null if all attempts fail.
  */
-export function safeParseJson(text: string): { parsed: unknown; wasRepaired: boolean; truncatedFileChanges?: { path: string; content: string; language?: string; isDiff?: boolean }[] } | null {
+export function safeParseJson(text: string): SafeParseResult | null {
     // Step 1: Check if it's an HTTP error
     if (isHttpError(text)) {
         debug('Response appears to be an HTTP error, not JSON');
@@ -385,18 +472,46 @@ export function safeParseJson(text: string): { parsed: unknown; wasRepaired: boo
         return { parsed: repairedOriginalResult.parsed, wasRepaired: true };
     }
     
-    // Step 6: If all else fails, try to recover any complete fileChanges from truncated response
-    const truncatedFileChanges = recoverTruncatedFileChanges(text);
-    if (truncatedFileChanges.length > 0) {
-        debug(`Recovered ${truncatedFileChanges.length} fileChanges from truncated response`);
-        // Return a minimal valid response with just the recovered fileChanges
+    // Step 6: If all else fails, try to recover ALL useful fields from truncated response
+    const recovered = recoverTruncatedResponse(text);
+    const hasRecoveredContent = recovered.fileChanges?.length || recovered.todos?.length || 
+                                recovered.nextSteps?.length || recovered.commands?.length || recovered.summary;
+    
+    if (hasRecoveredContent) {
+        const counts = [
+            recovered.fileChanges?.length ? `${recovered.fileChanges.length} files` : '',
+            recovered.todos?.length ? `${recovered.todos.length} todos` : '',
+            recovered.nextSteps?.length ? `${recovered.nextSteps.length} next steps` : '',
+            recovered.commands?.length ? `${recovered.commands.length} commands` : ''
+        ].filter(Boolean).join(', ');
+        debug(`Recovered from truncated response: ${counts}`);
+        
+        // Build a complete response with all recovered fields
+        const parsedResponse: Record<string, unknown> = {};
+        
+        // Use original summary if recovered, otherwise indicate truncation
+        if (recovered.summary) {
+            parsedResponse.summary = recovered.summary + ' ⚠️ (response was truncated)';
+        } else {
+            parsedResponse.summary = 'Response was truncated - partial content recovered';
+        }
+        
+        if (recovered.todos?.length) parsedResponse.todos = recovered.todos;
+        if (recovered.nextSteps?.length) parsedResponse.nextSteps = recovered.nextSteps;
+        if (recovered.commands?.length) parsedResponse.commands = recovered.commands;
+        if (recovered.fileChanges?.length) parsedResponse.fileChanges = recovered.fileChanges;
+        
         return { 
-            parsed: { 
-                summary: 'Response was truncated - partial file changes recovered',
-                fileChanges: truncatedFileChanges 
-            }, 
+            parsed: parsedResponse, 
             wasRepaired: true,
-            truncatedFileChanges
+            truncatedFileChanges: recovered.fileChanges,
+            recoveryInfo: {
+                fileCount: recovered.fileChanges?.length || 0,
+                todoCount: recovered.todos?.length || 0,
+                nextStepCount: recovered.nextSteps?.length || 0,
+                commandCount: recovered.commands?.length || 0,
+                hadOriginalSummary: !!recovered.summary
+            }
         };
     }
     

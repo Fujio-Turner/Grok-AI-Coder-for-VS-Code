@@ -425,6 +425,12 @@
           "description": "Timeout in seconds for Grok API requests (5 minutes default for complex responses)",
           "order": 26
         },
+        "grok.maxOutputTokens": {
+          "type": "number",
+          "default": 16384,
+          "description": "Maximum output tokens for AI responses (higher = longer responses but less truncation)",
+          "order": 27
+        },
         "grok.requestFormat": {
           "type": "string",
           "default": "json",
@@ -437,7 +443,7 @@
             "TOON - Use Token-Oriented Object Notation to reduce token usage by 30-60%"
           ],
           "description": "Format for API request payloads",
-          "order": 27
+          "order": 28
         },
         "grok.responseFormat": {
           "type": "string",
@@ -451,7 +457,7 @@
             "TOON - AI responds with TOON format (fewer tokens, less reliable)"
           ],
           "description": "Format for AI responses",
-          "order": 28
+          "order": 29
         }
       }
     },

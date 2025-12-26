@@ -277,6 +277,14 @@ export interface ParseWithCleanupResult {
     usedCleanup: boolean;
     wasTruncated?: boolean;
     truncatedFileChangesCount?: number;
+    // Detailed recovery info for user feedback
+    recoveryInfo?: {
+        fileCount: number;
+        todoCount: number;
+        nextStepCount: number;
+        commandCount: number;
+        hadOriginalSummary: boolean;
+    };
     cleanupMetrics?: {
         timeMs: number;
         tokensIn: number;
@@ -354,7 +362,8 @@ export async function parseWithCleanup(
                 structured: validated, 
                 usedCleanup: false,
                 wasTruncated,
-                truncatedFileChangesCount: regexResult.truncatedFileChanges?.length
+                truncatedFileChangesCount: regexResult.truncatedFileChanges?.length,
+                recoveryInfo: regexResult.recoveryInfo
             };
         }
     }

@@ -88,6 +88,9 @@ export async function sendChatCompletion(
         ? AbortSignal.any([signal, timeoutSignal])
         : timeoutSignal;
 
+    // Get max output tokens from config (default 16384 to prevent truncation)
+    const maxOutputTokens = config.get<number>('maxOutputTokens') || 16384;
+    
     const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -97,6 +100,7 @@ export async function sendChatCompletion(
         body: JSON.stringify({
             model,
             messages: optimizedMessages.map(m => ({ role: m.role, content: m.content })),
+            max_tokens: maxOutputTokens,
             stream: !!onChunk,
             stream_options: onChunk ? { include_usage: true } : undefined
         }),

@@ -249,6 +249,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Auto-report from webview (e.g., legacy nextSteps format used)
                     this._reportBug(-1, message.bugType || 'Other', message.description || 'Unknown issue', 'script');
                     break;
+                case 'retryLastRequest':
+                    await this.retryLastRequest();
+                    break;
                 case 'regenerateImage':
                     await this._regenerateImage(message.imageId, message.galleryId, message.prompt);
                     break;
@@ -1020,6 +1023,27 @@ ${cliSummary}
             // Update old session with handoff info
             await updateSessionHandoff(sessionId, handoffText, newSession.id);
             
+            // CRITICAL: Transfer change history to child session for rollback continuity
+            // The child session should be able to revert changes made in the parent
+            if (oldSession.changeHistory?.history && oldSession.changeHistory.history.length > 0) {
+                const tracker = getChangeTracker();
+                // Update session IDs in the history to point to new session
+                // but keep the actual file changes so they can be reverted
+                const transferredHistory = {
+                    history: oldSession.changeHistory.history.map(cs => ({
+                        ...cs,
+                        sessionId: newSession.id, // Update to new session
+                        // Keep original ID so we can track lineage
+                        parentChangeSetId: cs.id
+                    })),
+                    position: oldSession.changeHistory.position
+                };
+                tracker.fromSerializable(transferredHistory);
+                // Persist to new session
+                await updateSessionChangeHistory(newSession.id, transferredHistory as ChangeHistoryData);
+                info(`Transferred ${transferredHistory.history.length} change sets to child session`);
+            }
+            
             // Switch to new session
             this._currentSessionId = newSession.id;
             setCurrentSession(newSession.id);
@@ -1603,11 +1627,21 @@ ${cliSummary}
                 if (cleanupResult.structured) {
                     usedCleanup = cleanupResult.usedCleanup;
                     
-                    // Warn if response was truncated
+                    // Warn if response was truncated but show what was recovered
                     if (cleanupResult.wasTruncated) {
-                        const recoveredCount = cleanupResult.truncatedFileChangesCount || 0;
-                        const warningMsg = `⚠️ Response was truncated! Only ${recoveredCount} file change(s) were recovered. Consider breaking the task into smaller steps.`;
-                        vscode.window.showWarningMessage(warningMsg);
+                        const ri = cleanupResult.recoveryInfo;
+                        const recoveredParts: string[] = [];
+                        if (ri?.todoCount) recoveredParts.push(`${ri.todoCount} todo(s)`);
+                        if (ri?.fileCount) recoveredParts.push(`${ri.fileCount} file change(s)`);
+                        if (ri?.nextStepCount) recoveredParts.push(`${ri.nextStepCount} next step(s)`);
+                        if (ri?.commandCount) recoveredParts.push(`${ri.commandCount} command(s)`);
+                        
+                        const recoveredText = recoveredParts.length > 0 
+                            ? `Recovered: ${recoveredParts.join(', ')}.` 
+                            : 'No content could be recovered.';
+                        
+                        const warningMsg = `⚠️ AI response was malformed, but recovery succeeded!\n${recoveredText}`;
+                        vscode.window.showWarningMessage(`Response had errors but recovery succeeded: ${recoveredParts.join(', ')}`);
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n${warningMsg}\n` });
                         
                         // Auto-report truncation as a bug
@@ -1616,7 +1650,7 @@ ${cliSummary}
                                 type: 'Other',
                                 pairIndex,
                                 by: 'script',
-                                description: `Auto-detected: Response was truncated - ${recoveredCount} file change(s) recovered from incomplete response`
+                                description: `Auto-detected: Response was truncated - recovered ${recoveredParts.join(', ') || 'nothing'}`
                             });
                             debug('Auto-reported truncation bug for pair:', pairIndex);
                         } catch (bugErr) {
@@ -1898,6 +1932,32 @@ ${cliSummary}
                             const originalContent = doc.getText();
                             newText = applySimpleDiff(originalContent, fc.content);
                             debug(`Applied diff to ${fc.path}: ${fc.content.split('\\n').length} diff lines -> ${newText.split('\\n').length} result lines`);
+                            
+                            // Validate diff actually produced changes - if not, the diff was likely malformed
+                            if (newText === originalContent) {
+                                // Check if diff content looks malformed (lines without proper +/- separation)
+                                const diffLines = fc.content.split('\n');
+                                const malformedLines = diffLines.filter(l => 
+                                    l.includes('-') && l.includes('+') && 
+                                    !l.startsWith('-') && !l.startsWith('+') && !l.startsWith(' ')
+                                );
+                                if (malformedLines.length > 0 || !diffLines.some(l => l.startsWith('+') || l.startsWith('-'))) {
+                                    blockedChanges.push(`${fc.path}: Malformed diff - could not parse changes`);
+                                    logError(`BLOCKED: Malformed diff for ${fc.path} - diff content appears corrupted or truncated`);
+                                    
+                                    // Auto-report bug for malformed diff
+                                    if (this._currentSessionId) {
+                                        appendSessionBug(this._currentSessionId, {
+                                            type: 'Other',
+                                            pairIndex,
+                                            by: 'script',
+                                            description: `Auto-detected: Malformed diff for ${fc.path} - content was corrupted/truncated`,
+                                            debugContext: { rawResponsePreview: fc.content.slice(0, 500) }
+                                        }).catch(err => debug('Failed to report malformed diff bug:', err));
+                                    }
+                                    return null; // Skip this edit
+                                }
+                            }
                         } catch (err) {
                             // File doesn't exist, use content as-is (strip +/- prefixes)
                             newText = fc.content.split('\n')
@@ -2874,6 +2934,15 @@ pre code{background:none;padding:0}
 .bug-modal-cancel{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
 .bug-modal-submit{background:var(--vscode-testing-iconFailed);color:#fff}
 .summary{font-size:13px;font-weight:500;color:var(--vscode-foreground);margin:0 0 16px 0;line-height:1.6;padding:10px 12px;background:var(--vscode-textBlockQuote-background);border-radius:6px;border-left:3px solid var(--vscode-textLink-foreground)}
+.recovery-banner{margin:0 0 12px 0;padding:10px 12px;background:rgba(255,180,0,.12);border-radius:6px;border-left:3px solid #ffb400;font-size:12px;line-height:1.5}
+.recovery-banner .recovery-title{font-weight:600;color:#ffb400;display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.recovery-banner .recovery-details{color:var(--vscode-foreground);font-size:11px}
+.recovery-banner .recovery-actions{display:flex;gap:8px;margin-top:10px}
+.recovery-btn{padding:6px 12px;border:none;border-radius:4px;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:4px}
+.recovery-btn.retry{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+.recovery-btn.retry:hover{opacity:.9}
+.recovery-btn.continue{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+.recovery-btn.continue:hover{opacity:.9}
 .section{margin-bottom:20px;padding:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:8px}
 .section h3{font-size:13px;font-weight:600;color:var(--vscode-textLink-foreground);margin:0 0 10px 0;padding-bottom:6px;border-bottom:1px solid var(--vscode-panel-border);display:flex;align-items:center;gap:6px}
 .section h3::before{content:'';display:inline-block;width:4px;height:14px;background:var(--vscode-textLink-foreground);border-radius:2px}
@@ -2895,6 +2964,20 @@ pre code{background:none;padding:0}
 .next-steps-btns{display:flex;flex-wrap:wrap;gap:6px}
 .next-step-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:12px;font-size:11px;cursor:pointer;transition:all .15s}
 .next-step-btn:hover{opacity:.85}
+/* Sticky Summary Bar - shows at bottom when summary/nextSteps are out of view */
+#sticky-summary{position:fixed;bottom:auto;left:0;right:0;background:var(--vscode-editorWidget-background);border-top:1px solid var(--vscode-panel-border);border-bottom:1px solid var(--vscode-panel-border);padding:8px 12px;display:none;flex-direction:column;gap:6px;z-index:100;box-shadow:0 -4px 12px rgba(0,0,0,.2);animation:slideUp .2s ease}
+#sticky-summary.show{display:flex}
+@keyframes slideUp{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
+.sticky-summary-row{display:flex;align-items:center;gap:8px}
+.sticky-summary-text{flex:1;font-size:11px;color:var(--vscode-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sticky-summary-icon{font-size:12px}
+.sticky-scroll-btn{background:var(--vscode-textLink-foreground);color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:10px;cursor:pointer;white-space:nowrap}
+.sticky-scroll-btn:hover{opacity:.9}
+.sticky-next-steps{display:flex;flex-wrap:wrap;gap:4px}
+.sticky-next-btn{padding:4px 10px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:8px;font-size:10px;cursor:pointer}
+.sticky-next-btn:hover{opacity:.85}
+.sticky-dismiss{background:none;border:none;cursor:pointer;color:var(--vscode-descriptionForeground);font-size:14px;padding:2px 4px}
+.sticky-dismiss:hover{color:var(--vscode-foreground)}
 /* Checklists */
 .checklist{list-style:none;display:flex;align-items:flex-start;gap:6px;margin:4px 0}
 .checklist .check-box{color:var(--vscode-descriptionForeground);font-size:14px}
@@ -3427,6 +3510,17 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="chat"></div>
 
+<!-- Sticky Summary Bar - appears when response summary is out of view -->
+<div id="sticky-summary">
+    <div class="sticky-summary-row">
+        <span class="sticky-summary-icon">✓</span>
+        <span class="sticky-summary-text" id="sticky-summary-text"></span>
+        <button class="sticky-scroll-btn" onclick="scrollToLatestResponse()">See details ↑</button>
+        <button class="sticky-dismiss" onclick="dismissStickySummary()" title="Dismiss">✕</button>
+    </div>
+    <div class="sticky-next-steps" id="sticky-next-steps"></div>
+</div>
+
 <!-- CLI Execution Summary Panel -->
 <div id="cli-summary">
     <div class="cli-sum-hdr">
@@ -3520,6 +3614,8 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 const vs=acquireVsCodeApi(),chat=document.getElementById('chat'),msg=document.getElementById('msg'),send=document.getElementById('send'),stop=document.getElementById('stop'),sessEl=document.getElementById('sess'),sessTxt=document.getElementById('sess-text'),hist=document.getElementById('hist'),attachBtn=document.getElementById('attach'),fileInput=document.getElementById('file-input'),imgPreview=document.getElementById('img-preview'),statsEl=document.getElementById('stats');
 const changesPanel=document.getElementById('changes-panel'),changesList=document.getElementById('changes-list'),changesClose=document.getElementById('changes-close');
 const todoBar=document.getElementById('todo-bar'),todoToggle=document.getElementById('todo-toggle'),todoCount=document.getElementById('todo-count'),todoList=document.getElementById('todo-list');
+const stickySummary=document.getElementById('sticky-summary'),stickySummaryText=document.getElementById('sticky-summary-text'),stickyNextSteps=document.getElementById('sticky-next-steps');
+let lastResponseSummary='',lastResponseNextSteps=[],stickySummaryDismissed=false;
 const autoBtn=document.getElementById('auto-btn');
 const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
@@ -4277,11 +4373,69 @@ document.getElementById('new').onclick=()=>{hist.classList.remove('show');totalT
 sessEl.onclick=()=>{if(hist.classList.contains('show')){hist.classList.remove('show');}else{vs.postMessage({type:'getHistory'});hist.classList.add('show');}};
 document.addEventListener('click',e=>{if(!sessEl.contains(e.target)&&!hist.contains(e.target))hist.classList.remove('show');});
 function scrollToBottom(){setTimeout(()=>{chat.scrollTop=chat.scrollHeight;},50);}
+// Sticky summary bar - shows when latest response's summary/nextSteps are out of view
+function updateStickySummary(){
+    if(stickySummaryDismissed||!lastResponseSummary){hideStickySummary();return;}
+    const lastMsg=chat.querySelector('.msg.a:last-of-type');
+    if(!lastMsg){hideStickySummary();return;}
+    const summaryEl=lastMsg.querySelector('.summary')||lastMsg.querySelector('.done');
+    if(!summaryEl){hideStickySummary();return;}
+    const rect=summaryEl.getBoundingClientRect();
+    const chatRect=chat.getBoundingClientRect();
+    // Show sticky if summary is scrolled above the visible area
+    if(rect.bottom<chatRect.top||rect.top>chatRect.bottom){
+        showStickySummary();
+    }else{
+        hideStickySummary();
+    }
+}
+function showStickySummary(){
+    if(!lastResponseSummary||stickySummaryDismissed)return;
+    stickySummaryText.textContent=lastResponseSummary.length>100?lastResponseSummary.slice(0,100)+'...':lastResponseSummary;
+    // Render next steps
+    let nsHtml='';
+    if(lastResponseNextSteps&&lastResponseNextSteps.length>0){
+        lastResponseNextSteps.slice(0,3).forEach(step=>{
+            let html,input;
+            if(typeof step==='object'&&step.html&&step.inputText){html=step.html;input=step.inputText;}
+            else if(typeof step==='string'){html=step;input=step;}
+            else return;
+            const safeInput=btoa(encodeURIComponent(input));
+            nsHtml+='<button class="sticky-next-btn" data-step="'+safeInput+'">'+esc(html.length>30?html.slice(0,30)+'...':html)+'</button>';
+        });
+    }
+    stickyNextSteps.innerHTML=nsHtml;
+    // Position sticky summary just above the input area
+    const inpRect=document.getElementById('inp').getBoundingClientRect();
+    stickySummary.style.bottom=(window.innerHeight-inpRect.top)+'px';
+    stickySummary.classList.add('show');
+}
+function hideStickySummary(){stickySummary.classList.remove('show');}
+function dismissStickySummary(){stickySummaryDismissed=true;hideStickySummary();}
+function scrollToLatestResponse(){
+    const lastMsg=chat.querySelector('.msg.a:last-of-type');
+    if(lastMsg){lastMsg.scrollIntoView({behavior:'smooth',block:'start'});}
+    hideStickySummary();
+}
+// Add scroll listener for sticky summary
+chat.addEventListener('scroll',updateStickySummary);
+// Handle clicks on sticky next step buttons
+stickyNextSteps.addEventListener('click',e=>{
+    const btn=e.target.closest('.sticky-next-btn');
+    if(btn&&btn.dataset.step){
+        const txt=decodeURIComponent(atob(btn.dataset.step));
+        msg.value=txt;
+        msg.focus();
+        hideStickySummary();
+    }
+});
 window.addEventListener('message',e=>{const m=e.data;
 switch(m.type){
 case'init':case'sessionChanged':
 curSessId=m.sessionId;sessTxt.textContent=m.summary||('Session: '+m.sessionId.slice(0,8));sessTxt.title=(m.summary||m.sessionId)+'\\n['+m.sessionId.slice(0,6)+']';
 chat.innerHTML='';totalTokens=0;totalCost=0;handoffShownThisSession=false;updatePctColor(0);
+// Clear sticky summary on session change
+lastResponseSummary='';lastResponseNextSteps=[];stickySummaryDismissed=false;hideStickySummary();
 // Use actual storage bytes from backend if provided (includes extensions)
 if(typeof m.totalStorageBytes==='number'){estimatedStorageBytes=m.totalStorageBytes;}else{estimatedStorageBytes=0;}
 // Track extension info for display
@@ -4298,7 +4452,7 @@ hist.innerHTML='';m.sessions.forEach(s=>{const d=document.createElement('div');d
 const sum=document.createElement('div');sum.className='hist-sum';sum.textContent=s.summary||'New chat';sum.title=s.summary||'';
 const meta=document.createElement('div');meta.className='hist-meta';meta.textContent=timeAgo(s.updatedAt)+(s.pairCount?' · '+s.pairCount+' msgs':'');
 d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'loadSession',sessionId:s.id});};hist.appendChild(d);});break;
-case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();scrollToBottom();break;
+case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();hideStickySummary();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
 if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';let content='<div class="msg-actions">'+bugBtn+'</div>';if(m.imageGalleryHtml){content+=m.imageGalleryHtml;}else{content+=fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup);}curDiv.querySelector('.c').innerHTML=content;if(m.response?.usage)updStats(m.response.usage);}
@@ -4311,6 +4465,11 @@ if(todos.length>0){currentTodos=todos;renderTodos();}
 const hasFileChanges=(m.diffPreview&&m.diffPreview.length>0)||(m.structured&&m.structured.fileChanges&&m.structured.fileChanges.length>0);
 console.log('[Grok] Auto-apply check: autoApply='+autoApply+', autoApplyFiles='+autoApplyFiles+', diffPreview='+JSON.stringify(m.diffPreview)+', fileChanges='+(m.structured?.fileChanges?.length||0));
 if(autoApply&&autoApplyFiles&&hasFileChanges){console.log('[Grok] Triggering auto-apply');vs.postMessage({type:'applyEdits',editId:'all'});}
+// Store summary and nextSteps for sticky bar
+lastResponseSummary=m.structured?.summary||'';
+lastResponseNextSteps=m.structured?.nextSteps||[];
+stickySummaryDismissed=false;
+updateStickySummary();
 busy=0;curDiv=null;stream='';updUI();scrollToBottom();saveChatState();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';const errInfo=categorizeError(m.message);curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div>'+(errInfo.suggestion?'<div class="error-suggestion">💡 '+esc(errInfo.suggestion)+'</div>':'')+'<div class="error-btns"><button class="btn btn-s" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button><button class="btn btn-s btn-diag" onclick="diagnoseError(\\''+esc(m.message.replace(/'/g,"\\\\'")||'')+'\\')">🔍 Diagnose</button></div>';}busy=0;curDiv=null;stream='';updUI();break;
@@ -4476,7 +4635,21 @@ function fmtFinalStructured(s,u,diffPreview,usedCleanup){
 if(!s||(!s.summary&&!s.message)){return fmtFinal('',u,diffPreview);}
 const msgId='msg-'+Date.now();
 let h='<div id="'+msgId+'-top"></div>';
-if(s.summary&&!s.summary.trim().startsWith('{')&&s.summary.length>5){h+='<p class="summary">'+esc(s.summary)+'</p>';}
+// Check if this is a recovered response (summary contains truncation warning)
+const isRecovered=s.summary&&(s.summary.includes('⚠️')||s.summary.includes('truncated'));
+if(isRecovered){
+    // Count what was recovered
+    const recoveredItems=[];
+    if(s.todos&&s.todos.length>0)recoveredItems.push(s.todos.length+' todo(s)');
+    if(s.fileChanges&&s.fileChanges.length>0)recoveredItems.push(s.fileChanges.length+' file(s)');
+    if(s.nextSteps&&s.nextSteps.length>0)recoveredItems.push(s.nextSteps.length+' next step(s)');
+    if(s.commands&&s.commands.length>0)recoveredItems.push(s.commands.length+' command(s)');
+    const recoveredText=recoveredItems.length>0?recoveredItems.join(', '):'partial content';
+    h+='<div class="recovery-banner"><div class="recovery-title">⚠️ AI response had errors - Recovery succeeded!</div><div class="recovery-details">Recovered: '+recoveredText+'. The content below may be incomplete.</div><div class="recovery-actions"><button class="recovery-btn retry" onclick="retryLastRequest()" title="Retry the request to get a complete response">🔄 Retry</button><button class="recovery-btn continue" onclick="this.closest(\\'.recovery-banner\\').style.display=\\'none\\'" title="Accept the recovered content and continue">✓ Continue</button></div></div>';
+    // Show clean summary without the warning marker
+    const cleanSummary=(s.summary||'').replace(/\\s*⚠️.*$/,'').replace(/\\s*\\(response was truncated\\)/gi,'').trim();
+    if(cleanSummary&&!cleanSummary.startsWith('{')&&cleanSummary.length>5){h+='<p class="summary">'+esc(cleanSummary)+'</p>';}
+}else if(s.summary&&!s.summary.trim().startsWith('{')&&s.summary.length>5){h+='<p class="summary">'+esc(s.summary)+'</p>';}
 if(s.sections&&s.sections.length>0){s.sections.forEach(sec=>{h+='<div class="section"><h3>'+esc(sec.heading)+'</h3>';const content=(sec.content||'').replace(/\\\\n/g,'\\n');h+=fmtMd(content);if(sec.codeBlocks&&sec.codeBlocks.length>0){sec.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}h+='</div>';});}
 if(s.codeBlocks&&s.codeBlocks.length>0){s.codeBlocks.forEach(cb=>{if(cb.caption){h+='<div class="code-caption">'+esc(cb.caption)+'</div>';}h+='<pre><code>'+escCode(cb.code)+'</code></pre>';});}
 if((!s.sections||s.sections.length===0)&&s.message){
@@ -4653,6 +4826,7 @@ function esc(t){const d=document.createElement('div');d.textContent=t||'';return
 function escCode(t){const d=document.createElement('div');d.textContent=(t||'').replace(/\\\\n/g,'\\n');return d.innerHTML;}
 function applyFile(f){vs.postMessage({type:'applyEdits',editId:f});}
 function applyAll(){vs.postMessage({type:'applyEdits',editId:'all'});}
+function retryLastRequest(){vs.postMessage({type:'retryLastRequest'});}
 function runCmd(c){vs.postMessage({type:'runCommand',command:c});}
 function copyCmd(btn,c){navigator.clipboard.writeText(c).then(()=>{btn.textContent='✓ Copied';btn.classList.add('copied');setTimeout(()=>{btn.textContent='📋 Copy';btn.classList.remove('copied');},2000);});}
 function scrollToEl(id){const el=document.getElementById(id);if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}}

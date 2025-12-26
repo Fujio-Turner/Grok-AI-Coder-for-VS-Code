@@ -79,6 +79,7 @@ flowchart TD
 - Tries `parseResponse()` (regex-based JSON repair)
 - If fails + cleanup enabled → `cleanJsonWithModel()` (AI fixes JSON)
 - Extracts: `summary`, `sections`, `todos`, `fileChanges`, `commands`, `nextSteps`
+- **If parsing fails with partial recovery** → Shows Recovery Banner with Retry/Continue buttons
 
 ### 7. **Save Structured Response**
 - Updates Couchbase with full `structured` data
@@ -97,13 +98,80 @@ flowchart TD
   - Code blocks with syntax highlighting
   - File changes with Apply buttons
   - Commands with Run buttons
-  - Next Steps buttons
+  - Next Steps buttons (structured format: `{html, inputText}`)
   - "What was done" summary
   - Status bar with action buttons + token count:
     - **✓ Done** (green) - All actions complete
     - **⏳ Pending** (amber) - File changes or CLI commands still need action
 - Caches HTML in webview state
 - Scrolls to bottom
+- **Activates Sticky Summary Bar** if summary/nextSteps scroll out of view
+
+---
+
+## Sticky Summary Bar
+
+When AI responses are long and the user scrolls down, the summary and next-step buttons can scroll out of view. The **Sticky Summary Bar** ensures users always know what happened and can take action.
+
+### How It Works
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Visibility Detection"]
+        A[Response Complete] --> B[Store summary + nextSteps]
+        B --> C[User Scrolls]
+        C --> D{Summary visible<br/>in viewport?}
+    end
+    
+    subgraph Sticky["📌 Sticky Bar"]
+        D -->|No| E[Show sticky bar at bottom]
+        D -->|Yes| F[Hide sticky bar]
+        E --> G[Truncated summary text]
+        E --> H[Next step buttons - max 3]
+        E --> I[See details ↑ button]
+        E --> J[Dismiss ✕ button]
+    end
+    
+    subgraph Actions["⚡ User Actions"]
+        H --> K[Click next step → fills input]
+        I --> L[Scrolls to response]
+        J --> M[Hides bar permanently]
+    end
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Sticky fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Actions fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### UI Layout
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Chat Messages                           │
+│                              ...                                │
+│                    (summary scrolled away)                      │
+├─────────────────────────────────────────────────────────────────┤
+│  ✓ Added type hints to fibonacci function...  [See details ↑] ✕│
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  Continue... │  │  Run tests   │  │  Apply fix   │          │
+│  └──────────────┘  └──────────────┘  └──────────────┘          │
+└─────────────────────────────────────────────────────────────────┘
+│                        Input Area                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Behavior
+
+| Trigger | Result |
+|---------|--------|
+| Response completes | Summary + nextSteps stored |
+| User scrolls summary out of view | Sticky bar appears with slide-up animation |
+| User scrolls summary back into view | Sticky bar hides |
+| Click next step button | Fills input with `inputText`, hides bar |
+| Click "See details ↑" | Smooth scrolls to response, hides bar |
+| Click dismiss (✕) | Hides bar permanently for this response |
+| New message sent | Clears sticky state |
+| Session change | Clears sticky state |
 
 ---
 
@@ -395,6 +463,173 @@ The fallback ensures rollback works even after:
 
 ---
 
+## Session Handoff
+
+When a session approaches context or storage limits, users can **handoff** to a new session. The handoff preserves critical context and enables rollback continuity.
+
+### Handoff Flow
+
+```mermaid
+flowchart TD
+    subgraph Trigger["⚠️ Limit Detection"]
+        A[Session approaches 85%<br/>context or storage limit] --> B[Show handoff popup]
+        B --> C{User choice}
+    end
+    
+    subgraph Options["📋 User Options"]
+        C -->|Handoff| D[Create child session]
+        C -->|Extend| E[Create extension document]
+        C -->|Cancel| F[Continue in current session]
+    end
+    
+    subgraph Handoff["🔄 Handoff Process"]
+        D --> G[Generate handoff context]
+        G --> H[Transfer change history]
+        H --> I[Create new session with parent reference]
+        I --> J[Prefill input with pending tasks]
+    end
+    
+    subgraph Context["📄 Handoff Context Includes"]
+        K[Files modified with +/- stats]
+        L[Files referenced as context]
+        M[Recent conversation - last 3 pairs]
+        N[Recent errors/bugs]
+        O[Failed CLI commands]
+        P[Pending TODOs - priority ordered]
+    end
+    
+    G --> K
+    G --> L
+    G --> M
+    G --> N
+    G --> O
+    G --> P
+    
+    style Trigger fill:#3a2a1a,stroke:#dcdcaa,color:#fff
+    style Options fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Handoff fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Context fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### Change History Transfer
+
+**Critical Feature**: When handing off to a child session, the change history is transferred so rollback works across sessions.
+
+```mermaid
+flowchart LR
+    subgraph Parent["Parent Session"]
+        A[changeHistory with 5 change sets]
+    end
+    
+    subgraph Transfer["Transfer Process"]
+        B[Copy all change sets]
+        C[Update sessionId references]
+        D[Preserve parentChangeSetId]
+        E[Restore in-memory tracker]
+        F[Persist to Couchbase]
+    end
+    
+    subgraph Child["Child Session"]
+        G[changeHistory with 5 inherited sets]
+        H[Can revert parent's changes]
+        I[New changes append to history]
+    end
+    
+    A --> B --> C --> D --> E --> F --> G
+    G --> H
+    G --> I
+    
+    style Parent fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Transfer fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+    style Child fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+### Handoff Context Format
+
+The handoff message sent to the new session includes:
+
+```markdown
+## HANDOFF CONTEXT
+
+**Parent Session:** {sessionId}
+**Project:** {projectName}
+**Total Exchanges:** {pairCount}
+**Tokens Used:** {tokensIn} in / {tokensOut} out
+
+### SESSION SUMMARY
+{summary from parent session}
+
+### FILES MODIFIED (X files)
+- `src/utils.ts` (+45/-12)
+- `src/config.json` (+10/-0)
+
+### FILES REFERENCED (context attached during session)
+- `README.md`
+- `package.json`
+
+### CURRENT TASKS (continue these - priority order)
+1. [ ] Add type hints to fibonacci
+2. [ ] Add type hints to reverse_string
+3. [ ] Run final tests
+
+### COMPLETED TASKS
+- [x] Add type hints to calculate_area
+- [x] Add type hints to is_prime
+
+### RECENT CONVERSATION
+User: Add type hints to all functions
+AI: Added type hints to calculate_area, continuing with is_prime...
+
+### RECENT ERRORS/ISSUES
+- JSON: Auto-detected: Response required JSON cleanup
+
+### FAILED CLI COMMANDS
+- `python test.py`: pyenv: python: command not found
+
+### INSTRUCTIONS
+1. Continue working on CURRENT TASKS in priority order
+2. Read the FILES MODIFIED if you need context on what was changed
+3. Read the FILES REFERENCED if you need the source content
+4. Check RECENT ERRORS if there are issues to address
+5. IMPORTANT: When outputting fileChanges, use the EXACT file paths listed above
+```
+
+### Session Document Schema (with handoff)
+
+```json
+{
+  "id": "child-session-uuid",
+  "docType": "chat",
+  "parentSessionId": "parent-session-uuid",
+  "changeHistory": {
+    "history": [
+      {
+        "id": "cs-123",
+        "sessionId": "child-session-uuid",
+        "parentChangeSetId": "cs-123",
+        "files": [...],
+        "applied": true
+      }
+    ],
+    "position": 4
+  }
+}
+```
+
+### Handoff vs Extend
+
+| Feature | Handoff | Extend |
+|---------|---------|--------|
+| **New session created** | ✓ Yes | ✗ No |
+| **Context preserved** | Summary only | Full history |
+| **Change history** | Transferred | Stays in place |
+| **Rollback works** | ✓ Full continuity | ✓ Full continuity |
+| **Response speed** | Faster (smaller context) | May slow as history grows |
+| **Storage** | New document | Extension documents |
+| **When to use** | Long-running tasks, fresh start | Need complete history |
+
+---
+
 ## Multi-Step Task Handling
 
 ### Problem: Response Truncation
@@ -427,8 +662,31 @@ The system prompt now instructs the AI to execute complex tasks **one step at a 
 1. **Detection**: AI recognizes tasks with 3+ steps, 3+ files, or multiple concerns
 2. **Planning**: Creates TODO list with ALL steps upfront
 3. **Execution**: Completes only first 1-2 steps per response
-4. **Continuation**: Adds `nextSteps: ["Say 'continue' to proceed"]`
+4. **Continuation**: Adds structured nextSteps: `[{"html": "Continue to next step", "inputText": "continue"}]`
 5. **Iteration**: On "continue", marks steps complete, executes next batch
+
+### nextSteps Format (Structured)
+
+The `nextSteps` field uses a structured format for better UX:
+
+```json
+"nextSteps": [
+  {"html": "Continue to next step", "inputText": "continue"},
+  {"html": "Run tests to verify", "inputText": "run tests"},
+  {"html": "Apply fix to line 45", "inputText": "apply"}
+]
+```
+
+| Field | Purpose |
+|-------|---------|
+| `html` | Display text shown on the button (can include emoji) |
+| `inputText` | Text inserted into input when clicked |
+
+**Benefits**:
+- Clear separation between display and action
+- Buttons can show friendly text ("Continue to next step")
+- Input receives concise action ("continue")
+- Legacy string format still supported but triggers bug report
 
 ### Why This Matters: Course Correction
 
@@ -455,11 +713,11 @@ This incremental approach is valuable beyond just preventing truncation:
     {"text": "Update Docker configuration", "completed": false}
   ],
   "fileChanges": [{"path": "app/config.sample.json", ...}],
-  "nextSteps": ["Say 'continue' to proceed with Mac deployment"]
+  "nextSteps": [{"html": "Continue to Mac deployment", "inputText": "continue"}]
 }
 ```
 
-**User**: "continue"
+**User**: clicks "Continue to Mac deployment" button → input receives "continue"
 
 **Response 2**:
 ```json
@@ -472,7 +730,7 @@ This incremental approach is valuable beyond just preventing truncation:
     {"text": "Update Docker configuration", "completed": false}
   ],
   "fileChanges": [{"path": "docs/mac-deploy.md", ...}],
-  "nextSteps": ["Say 'continue' to proceed with Windows deployment"]
+  "nextSteps": [{"html": "Continue to Windows deployment", "inputText": "continue"}]
 }
 ```
 
@@ -482,6 +740,127 @@ When truncation is detected (incomplete JSON with recoverable file changes):
 1. Warning shown to user: "Response was truncated!"
 2. Automatic bug report created with `type: 'Other'`, `by: 'script'`
 3. Bug stored in session's `bugs[]` array in Couchbase
+
+---
+
+## Response Recovery Flow
+
+When an AI response has errors (truncation, malformed JSON, or parsing failures), the system attempts recovery and presents users with clear action options.
+
+### Recovery Banner
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Error Detection"]
+        A[AI Response] --> B{Parse succeeded?}
+        B -->|Yes| C[Normal rendering]
+        B -->|No| D[Attempt recovery]
+    end
+    
+    subgraph Recovery["🔧 Recovery Process"]
+        D --> E[Extract valid fields]
+        E --> F{Any content<br/>recovered?}
+        F -->|Yes| G[Show Recovery Banner]
+        F -->|No| H[Show Error Message]
+    end
+    
+    subgraph UserAction["⚡ User Actions"]
+        G --> I[🔄 Retry Button]
+        G --> J[✓ Continue Button]
+        I --> K[Reprocess original request]
+        J --> L[Accept recovered content]
+        H --> M[Retry button only]
+    end
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Recovery fill:#3a2a1a,stroke:#ffb400,color:#fff
+    style UserAction fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+### UI Layout
+
+When recovery succeeds, users see:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ⚠️ AI response had errors - Recovery succeeded!                 │
+│                                                                 │
+│ Recovered: 8 todo(s), 1 next step(s), 1 command(s).            │
+│ The content below may be incomplete.                            │
+│                                                                 │
+│ ┌──────────────┐  ┌──────────────┐                              │
+│ │  🔄 Retry    │  │  ✓ Continue  │                              │
+│ └──────────────┘  └──────────────┘                              │
+└─────────────────────────────────────────────────────────────────┘
+│                                                                 │
+│ Added type hints docstring to factorial function...             │
+│                                                                 │
+│ $ python docs/handoff_test.py                     [▶ Run]       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Action Buttons
+
+| Button | Action | When to Use |
+|--------|--------|-------------|
+| **🔄 Retry** | Reprocesses the original request | When you need a complete response (file changes were corrupted) |
+| **✓ Continue** | Dismisses the warning, accepts recovered content | When the recovered summary/TODOs/commands are sufficient |
+
+### What Gets Recovered
+
+The recovery system attempts to extract:
+
+| Field | Recovery Method |
+|-------|-----------------|
+| `summary` | Regex extraction from JSON fragments |
+| `todos` | Pattern matching for TODO arrays |
+| `fileChanges` | Complete file change objects before truncation point |
+| `commands` | CLI command arrays |
+| `nextSteps` | Next step button arrays |
+| `sections` | Content sections with headings |
+
+### Malformed Diff Detection
+
+When file changes have malformed diffs (e.g., from mid-response truncation):
+
+```mermaid
+flowchart TD
+    A[Apply Diff] --> B{Diff produced<br/>actual changes?}
+    B -->|Yes| C[Apply changes normally]
+    B -->|No| D{Diff looks<br/>malformed?}
+    D -->|Yes| E[Block change]
+    D -->|No| F[Skip - no changes needed]
+    E --> G[Show warning]
+    E --> H[Auto-report bug]
+    
+    style D fill:#7c3aed,stroke:#fff,color:#fff
+    style E fill:#3a1a1a,stroke:#c44,color:#fff
+```
+
+**Malformed diffs are detected when:**
+- Lines contain both `-` and `+` concatenated together (e.g., `-old line+new line`)
+- Diff application produces no changes but diff content exists
+- Lines don't follow proper unified diff format
+
+**Example of corrupted diff (from truncation):**
+```diff
+# BAD - lines merged together
+-def fibonacci(nn+def fibonacci(n: int) -> int:
+
+# GOOD - proper format
+-def fibonacci(n):
++def fibonacci(n: int) -> int:
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.maxOutputTokens` | `16384` | Maximum output tokens (higher = less truncation) |
+| `grok.apiTimeout` | `300` | Request timeout in seconds |
+
+Increasing `maxOutputTokens` reduces truncation frequency for complex responses.
 
 ---
 
