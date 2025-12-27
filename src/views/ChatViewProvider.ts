@@ -5570,7 +5570,7 @@ if(rpFilesPending){rpActionBtns+='<button class="done-action done-pending" oncli
 if(rpCmdCount>0){rpActionBtns+='<button class="done-action done-pending" onclick="runAllCmds()">Run '+rpCmdCount+' cmd'+(rpCmdCount>1?'s':'')+'</button>';}
 h+='<div class="done"><span class="done-check">✓</span><span class="done-txt">Done</span><span class="done-actions">'+rpActionBtns+'</span></div>';
 // TODOs
-if(reparsed.todos&&reparsed.todos.length>0){currentTodos=reparsed.todos.map(t=>({text:t.text,done:t.completed}));renderTodos();}
+if(reparsed.todos&&reparsed.todos.length>0){currentTodos=reparsed.todos.map(t=>({text:t.text,completed:t.completed}));renderTodos();}
 }catch(e){console.log('[Grok] Re-parse failed:',e);h+='<p class="summary">Response parsing failed. Try again or enable JSON cleanup in settings.</p>';}
 }else{
 const msg=(s.message||'').replace(/\\\\n/g,'\\n');h+=fmtMd(msg);
