@@ -61,22 +61,43 @@ flowchart TD
 - **Saves to Couchbase** with `status: 'pending'`
 - Sends `newMessagePair` → webview renders user bubble + spinner
 
-### 3. **Agent Workflow** (if no images)
-- Analyzes request for file/URL references
-- Loads matching files into context
-- Shows progress: "🔍 Analyzing..." → "📂 Loaded X files"
+### 3. **Agent Workflow - Three-Pass System** (if no images)
+
+The agent uses a three-pass workflow to intelligently load files before the main API call:
+
+**Pass 1: Planning** (`createPlan`)
+- Fast model (`grok-3-mini`) analyzes the request
+- Creates a plan with TODOs and actions (file patterns, URLs)
+- Example: User says "review email.py" → Plan includes `{"type": "file", "pattern": "**/email*.py"}`
+
+**Pass 2: Execution** (`executeActions`)
+- Runs `vscode.workspace.findFiles()` for each file pattern
+- Reads file contents via `vscode.workspace.openTextDocument()`
+- **Computes MD5 hash** for each file (for verification later)
+- Fetches any URLs mentioned in the plan
+- Reports failed searches explicitly (so AI doesn't hallucinate)
+
+**Pass 3: Augmented Message** (`buildAugmentedMessage`)
+- Combines original message + loaded files + plan
+- Each file includes its MD5 hash: `### file.py [MD5: 9a906fd...]`
+- Failed searches are noted: `⚠️ FILE SEARCH FAILED - DO NOT PRETEND YOU HAVE ACCESS`
+- This augmented message is sent to Pass 4
+
+Shows progress: "🧠 Planning..." → "🔍 Searching..." → "✅ Loaded X files"
 
 ### 4. **Main API Call**
 - Builds messages array (system prompt + history + user message)
 - Calls `sendChatCompletion()` with streaming
 - Each chunk → `updateResponseChunk` → webview shows partial text
+- **If `useStructuredOutputs` enabled**: API guarantees valid JSON response (no parsing errors possible)
 
 ### 5. **SAVE EARLY** (new!)
 - Immediately saves raw response text to Couchbase
 - Prevents data loss if parsing crashes
 
 ### 6. **Parse Response**
-- Tries `parseResponse()` (regex-based JSON repair)
+- **If Structured Outputs enabled**: Response is already guaranteed valid JSON - direct parse
+- Otherwise: Tries `parseResponse()` (regex-based JSON repair)
 - If fails + cleanup enabled → `cleanJsonWithModel()` (AI fixes JSON)
 - Extracts: `summary`, `sections`, `todos`, `fileChanges`, `commands`, `nextSteps`
 - **If parsing fails with partial recovery** → Shows Recovery Banner with Retry/Continue buttons
@@ -368,6 +389,176 @@ A sticky panel appears at the bottom during batch command execution:
 
 ## File Change Safety & Rollback
 
+### MD5 Hash Verification (File Integrity)
+
+The AI **cannot read files from disk**. It only sees files that are:
+1. Attached to the conversation by the user
+2. Loaded by the agent workflow (Pass 2)
+
+To prevent the AI from hallucinating file content, we use **MD5 hash verification**:
+
+```mermaid
+flowchart TD
+    subgraph Pass2["⚙️ Pass 2: File Loading"]
+        A[findAndReadFiles pattern] --> B{Files found?}
+        B -->|Yes| C[Read file content]
+        C --> D[Compute MD5 hash]
+        D --> E[Store content + hash]
+    end
+    
+    subgraph Augment["📝 Augmented Message"]
+        E --> F["Include hash in message:<br/>### file.py [MD5: 9a906fd...]"]
+        F --> G[Tell AI: 'Include this hash<br/>in fileHashes when modifying']
+    end
+    
+    subgraph Pass3["🤖 Pass 3: AI Response"]
+        G --> H[AI includes fileHashes:<br/>{'file.py': '9a906fd...'}]
+    end
+    
+    subgraph Verify["✓ Verification"]
+        H --> I[Extension reads current file]
+        I --> J[Compute current MD5]
+        J --> K{Hashes match?}
+        K -->|Yes| L[Apply lineOperations]
+        K -->|No| M[BLOCK - file changed<br/>or AI hallucinated]
+    end
+    
+    subgraph Failed["🚫 Failed Search"]
+        B -->|No| N["Add to augmented message:<br/>⚠️ FILE SEARCH FAILED"]
+        N --> O[AI told: 'Do NOT pretend<br/>you have access']
+    end
+    
+    style Pass2 fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Verify fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Failed fill:#3a1a1a,stroke:#c44,color:#fff
+```
+
+**How it works:**
+
+| Step | Location | Action |
+|------|----------|--------|
+| 1. File Read | `workspaceFiles.ts` | Compute MD5 when reading file |
+| 2. Augment | `agentOrchestrator.ts` | Include `[MD5: hash]` with each file |
+| 3. AI Response | AI returns | Echo hash in `fileHashes` field |
+| 4. Verify | `ChatViewProvider.ts` | Compare provided hash with current file |
+| 5. Apply/Block | `ChatViewProvider.ts` | Apply if match, BLOCK if mismatch |
+
+**Error scenarios:**
+
+| Scenario | Result |
+|----------|--------|
+| AI provides correct hash | ✅ Operations applied |
+| AI provides wrong hash | ❌ BLOCKED - "Hash mismatch" |
+| AI provides no hash | ❌ BLOCKED - "No hash provided" |
+| File changed after AI read it | ❌ BLOCKED - "Hash mismatch" |
+| File search returned no results | AI told to ask user to attach file |
+
+**Response schema includes `fileHashes`:**
+```json
+{
+  "summary": "Modified the greeting function.",
+  "fileHashes": {
+    "docs/rollback_test.py": "9a906fd5909d29c5f1d228db1eaa90c4"
+  },
+  "fileChanges": [{
+    "path": "docs/rollback_test.py",
+    "lineOperations": [...]
+  }]
+}
+```
+
+### Pair File History (Multi-Turn File Tracking)
+
+When the AI modifies a file and the user says "continue", the AI often uses **stale content from earlier in the conversation**, causing hash mismatches. The **Pair File History** system tracks all file operations per conversation turn so the AI knows when to re-read files.
+
+```mermaid
+flowchart TD
+    subgraph Turn1["🔵 Turn 1: First Read"]
+        A[User: 'modify utils.py'] --> B[Auto-attach file]
+        B --> C[Compute MD5: abc123]
+        C --> D[Track: READ utils.py abc123]
+        D --> E[AI provides lineOperations]
+        E --> F[User clicks Apply]
+        F --> G[File changes on disk]
+        G --> H[Track: UPDATE utils.py def456]
+    end
+    
+    subgraph Turn2["🟡 Turn 2: Continue"]
+        I[User: 'continue'] --> J[Load pairFileHistory]
+        J --> K{Was file modified<br/>in previous turn?}
+        K -->|Yes| L[Auto-attach with NEW MD5]
+        K -->|No| M[Use cached content]
+        L --> N[Track: READ utils.py def456]
+        N --> O[AI uses correct content]
+    end
+    
+    subgraph Problem["❌ Without Tracking"]
+        P[User: 'continue'] --> Q[AI uses OLD content<br/>from Turn 1]
+        Q --> R[AI provides hash abc123]
+        R --> S[Actual file hash: def456]
+        S --> T[HASH MISMATCH - BLOCKED]
+    end
+    
+    style Turn1 fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Turn2 fill:#3a3a1a,stroke:#dea54e,color:#fff
+    style Problem fill:#3a1a1a,stroke:#c44,color:#fff
+```
+
+**Couchbase Storage:**
+
+```json
+{
+  "pairFileHistory": [
+    [
+      {"file": "/path/utils.py", "md5": "abc123", "op": "read", "dt": 1703123456789, "size": 2500}
+    ],
+    [
+      {"file": "/path/utils.py", "md5": "abc123", "op": "update", "dt": 1703123500000, "size": 2800}
+    ],
+    [
+      {"file": "/path/utils.py", "md5": "def456", "op": "read", "dt": 1703123600000, "size": 2800}
+    ]
+  ]
+}
+```
+
+**Operation Types:**
+
+| Operation | When Tracked | Purpose |
+|-----------|--------------|---------|
+| `read` | Auto-attach reads file | AI saw this content |
+| `update` | User applies file changes | File is now different |
+| `create` | User applies new file | File now exists |
+| `delete` | User deletes file | File no longer exists |
+
+**System Prompt Injection:**
+
+The file history is summarized and injected into the system prompt:
+
+```
+## FILE OPERATION HISTORY (Recent)
+These are files you have read or modified. Re-read files before modifying to get current MD5.
+
+Turn 0:
+  📖 read: /path/utils.py (md5: abc123...)
+Turn 1:
+  ✏️ update: /path/utils.py (md5: def456...)
+Turn 2:
+  📖 read: /path/utils.py (md5: def456...)
+```
+
+**AI Instruction Added:**
+
+The system prompt now includes a critical section instructing the AI:
+
+> **CRITICAL: ALWAYS RE-READ FILES BEFORE MODIFYING**
+> 
+> File content changes between conversation turns. When you previously modified a file and the user says "continue":
+> 1. DO NOT use cached/remembered file content from earlier
+> 2. DO NOT compute MD5 from old content - the file has been updated!
+> 3. ASK for the file to be re-attached so you can see its CURRENT state
+> 4. Check the FILE OPERATION HISTORY section
+
 ### Truncation Protection
 
 The extension **blocks ALL file changes** from truncated responses to prevent file corruption:
@@ -432,6 +623,24 @@ The fallback ensures rollback works even after:
 - VS Code restart
 - Session switch
 
+**Rollback error handling:**
+
+When rollback is attempted, the system detects if changes were never actually applied:
+
+| Scenario | Behavior |
+|----------|----------|
+| `oldContent === newContent` | Change was never applied (lineOperations failed) |
+| `applied: false` | Nothing to revert |
+| Hash mismatch blocked the change | Nothing to revert |
+
+If rollback encounters failed changes, the user sees:
+```
+⚠️ 2 change(s) failed to apply originally (AI hallucinated file content). 
+These cannot be rolled back.
+```
+
+This prevents confusion when users try to rollback changes that were blocked by validation.
+
 ### Change History Data (Couchbase)
 
 ```json
@@ -460,6 +669,210 @@ The fallback ensures rollback works even after:
   }
 }
 ```
+
+---
+
+## xAI Files API Integration (Experimental)
+
+### Overview
+
+The xAI Files API enables uploading files to xAI's servers, where the AI uses a server-side `document_search` tool to intelligently search and reason over file contents. This is an alternative to embedding file content directly in prompts.
+
+### Comparison: Embedded vs Files API
+
+| Aspect | Current (Embedded) | Files API |
+|--------|-------------------|-----------|
+| **Hallucination** | MD5 hash verification needed | Server-side search - AI reads *actual* content |
+| **Token Usage** | Full file in prompt | Efficient server-side processing |
+| **Large Files** | Truncation risk | 48MB limit, handled efficiently |
+| **Multi-turn** | Re-attach each turn | Files persist across conversation |
+| **Search** | AI sees all or nothing | AI can search multiple times |
+| **Cost** | Tokens only | Tokens + $10/1K document_search calls |
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.useFilesApi` | `false` | Enable Files API (experimental) |
+| `grok.autoUploadFiles` | `true` | Auto-upload files from agent workflow |
+| `grok.maxUploadSize` | 10MB | Maximum file size to upload |
+| `grok.cleanupFilesOnSessionEnd` | `true` | Enable cleanup logic when session ends |
+| `grok.fileTtlHours` | 24 | Hours to keep files before cleanup |
+
+### File Lifecycle & TTL
+
+Files uploaded to xAI persist indefinitely until explicitly deleted. The extension provides TTL-based cleanup:
+
+```mermaid
+flowchart TD
+    subgraph Upload["📤 File Upload"]
+        A[Agent workflow identifies files] --> B[Upload to xAI Files API]
+        B --> C[Get file_id]
+        C --> D[Store record in session]
+    end
+    
+    subgraph Chat["💬 Chat with Files"]
+        D --> E[Include file_id in message]
+        E --> F[AI uses document_search tool]
+        F --> G[Server-side file access]
+    end
+    
+    subgraph Cleanup["🧹 TTL Cleanup"]
+        H[Session switch] --> I{fileTtlHours?}
+        I -->|0| J[Delete immediately]
+        I -->|>0| K[Set expiresAt timestamp]
+        I -->|-1| L[Never auto-delete]
+        K --> M[Global cleanup on next session load]
+        M --> N[Delete expired files from xAI]
+    end
+    
+    subgraph Rehydrate["♻️ Rehydration"]
+        O[Return to old session] --> P{File expired?}
+        P -->|Yes| Q[Re-upload from local path]
+        P -->|No| R[Use existing file_id]
+    end
+    
+    style Upload fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Chat fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Cleanup fill:#3a1a1a,stroke:#c44,color:#fff
+    style Rehydrate fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+```
+
+### TTL Behavior
+
+| `fileTtlHours` | Behavior |
+|----------------|----------|
+| `0` | Delete immediately on session switch (legacy) |
+| `24` (default) | Mark with 24h expiration, cleanup on next session load |
+| `-1` | Never auto-delete (manual cleanup only) |
+
+### Uploaded File Record (Couchbase)
+
+```json
+{
+  "uploadedFiles": [
+    {
+      "fileId": "file-abc123",
+      "localPath": "/path/to/file.ts",
+      "filename": "file.ts",
+      "size": 2048,
+      "uploadedAt": "2025-12-26T10:00:00.000Z",
+      "hash": "9a906fd5909d29c5f1d228db1eaa90c4",
+      "expiresAt": "2025-12-27T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+### API Functions
+
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `uploadFile()` | fileUploader.ts | Upload file to xAI |
+| `deleteFile()` | fileUploader.ts | Delete file from xAI |
+| `rehydrateFile()` | fileUploader.ts | Re-upload if file expired |
+| `fileExists()` | fileUploader.ts | Check if file_id still valid |
+| `setFileTtl()` | chatSessionRepository.ts | Set expiration time |
+| `getExpiredFilesGlobal()` | chatSessionRepository.ts | Query all sessions for expired files |
+| `needsRehydration()` | chatSessionRepository.ts | Check if file needs re-upload |
+
+### Model Requirements
+
+Files API requires **agentic-capable models**:
+- ✅ `grok-4`
+- ✅ `grok-4-fast`
+- ❌ `grok-3-mini` (doesn't support agentic tools)
+
+---
+
+## Structured Outputs (Guaranteed JSON)
+
+### The Problem: Malformed JSON
+
+AI responses are requested as JSON, but sometimes the AI returns malformed JSON:
+- Missing quotes, brackets, or commas
+- Truncated responses
+- Concatenated fields
+- Invalid escape sequences
+
+This requires complex parsing, AI-based cleanup, and causes bugs.
+
+### The Solution: xAI Structured Outputs API
+
+The [xAI Structured Outputs API](https://docs.x.ai/docs/guides/structured-outputs) uses the `response_format` parameter to **guarantee** responses match a JSON schema. The API enforces the schema server-side.
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.useStructuredOutputs` | `false` | Enable API-enforced JSON schema (recommended) |
+
+### How It Works
+
+```mermaid
+flowchart LR
+    subgraph Current["Current Flow"]
+        A1[AI generates text] --> B1[Hope it's valid JSON]
+        B1 --> C1{Parse OK?}
+        C1 -->|No| D1[Regex repair]
+        D1 --> E1{Still fails?}
+        E1 -->|Yes| F1[AI cleanup call]
+    end
+    
+    subgraph Structured["Structured Outputs"]
+        A2[API receives schema] --> B2[AI constrained to schema]
+        B2 --> C2[Response GUARANTEED valid]
+        C2 --> D2[Direct JSON.parse - always works]
+    end
+    
+    style Current fill:#3a1a1a,stroke:#c44,color:#fff
+    style Structured fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+### Benefits
+
+| Aspect | Without Structured Outputs | With Structured Outputs |
+|--------|---------------------------|------------------------|
+| **Parse failures** | Common - requires repair | Impossible - guaranteed valid |
+| **AI cleanup calls** | Needed on ~5% of responses | Never needed |
+| **Response latency** | Variable (cleanup adds time) | Consistent |
+| **Truncation handling** | Complex detection needed | API handles it |
+| **Token cost** | Higher (cleanup uses tokens) | Lower |
+
+### Schema Definition
+
+The schema is defined in `src/prompts/responseSchema.ts` as `STRUCTURED_OUTPUT_SCHEMA`:
+
+```typescript
+{
+    type: "json_schema",
+    json_schema: {
+        name: "grok_response",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                summary: { type: "string" },
+                sections: { type: "array", items: {...} },
+                todos: { type: "array", items: {...} },
+                fileChanges: { type: "array", items: {...} },
+                commands: { type: "array", items: {...} },
+                nextSteps: { type: "array", items: {...} },
+                fileHashes: { type: "object", additionalProperties: {...} }
+            },
+            required: ["summary"],
+            additionalProperties: false
+        }
+    }
+}
+```
+
+### Model Requirements
+
+Structured Outputs requires models **grok-2-1212 or later**:
+- ✅ `grok-4`, `grok-4-fast`
+- ✅ `grok-3`, `grok-3-mini`
+- ❌ `grok-2` (older than 1212)
 
 ---
 
@@ -496,6 +909,7 @@ flowchart TD
         N[Recent errors/bugs]
         O[Failed CLI commands]
         P[Pending TODOs - priority ordered]
+        Q[Actual file contents - auto-loaded]
     end
     
     G --> K
@@ -592,6 +1006,41 @@ AI: Added type hints to calculate_area, continuing with is_prime...
 3. Read the FILES REFERENCED if you need the source content
 4. Check RECENT ERRORS if there are issues to address
 5. IMPORTANT: When outputting fileChanges, use the EXACT file paths listed above
+```
+
+### Auto-Loading File Contents
+
+When the first message is sent in a handoff child session, the system automatically:
+
+1. **Loads modified files** from the parent session's change history
+2. **Includes actual content** in the system prompt (up to 5 files, 8KB each)
+3. **AI sees current file state** without requiring manual attachment
+
+This ensures the AI can make precise edits without asking "please attach the file".
+
+```mermaid
+flowchart LR
+    subgraph Parent["Parent Session"]
+        A[changeHistory.files]
+    end
+    
+    subgraph Load["Auto-Load on First Message"]
+        B[Extract unique file paths]
+        C[Read current file content]
+        D[Truncate if > 8KB]
+    end
+    
+    subgraph Child["Child Session System Prompt"]
+        E[Handoff context text]
+        F[+ Current file contents]
+    end
+    
+    A --> B --> C --> D --> F
+    E --> F
+    
+    style Parent fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Load fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+    style Child fill:#1a3a1a,stroke:#4ec9b0,color:#fff
 ```
 
 ### Session Document Schema (with handoff)
@@ -1376,3 +1825,169 @@ Generated images are stored in the chat pair's response:
 Image generation uses a flat per-image pricing model:
 - ~$0.07 per image (as of 2024)
 - Displayed in the token/cost bar after generation
+
+---
+
+## Debugging & Audit Features
+
+### Audit Generation (Debug Full AI Responses)
+
+When debugging hash mismatches or AI behavior issues, it's helpful to see the **complete, unprocessed AI generation**. The Audit Generation feature saves every AI response to a separate Couchbase document for analysis.
+
+```mermaid
+flowchart TD
+    subgraph Config["⚙️ Configuration"]
+        A[grok.auditGeneration = true] --> B[Enable audit mode]
+    end
+    
+    subgraph Capture["📝 Capture Flow"]
+        C[AI Response Complete] --> D{Audit enabled?}
+        D -->|No| E[Normal flow only]
+        D -->|Yes| F[Save to debug:sessionId]
+        F --> G[Store full generation text]
+        G --> H[Store system prompt preview]
+        H --> I[Store model + finishReason]
+    end
+    
+    subgraph Storage["💾 Storage"]
+        J[Main session: sessionId<br/>Parsed response]
+        K[Audit doc: debug:sessionId<br/>Raw generation text]
+    end
+    
+    subgraph Dashboard["🔍 Error Dashboard"]
+        L[Open session] --> M[Click 'Audit' tab]
+        M --> N[View full AI generation]
+        N --> O[Compare to parsed response]
+        O --> P[Find parsing issues]
+    end
+    
+    F --> K
+    style Config fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Capture fill:#2a2a1a,stroke:#dea54e,color:#fff
+    style Dashboard fill:#1a3a3a,stroke:#4ea5c9,color:#fff
+```
+
+**Configuration:**
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.auditGeneration` | `false` | Save full AI generations to separate debug document |
+
+**Couchbase Document Structure:**
+
+Main session document (key: `{sessionId}`):
+```json
+{
+  "id": "abc-123",
+  "docType": "chat",
+  "auditGenerating": true,
+  "pairs": [...]
+}
+```
+
+Audit document (key: `debug:{sessionId}`):
+```json
+{
+  "id": "debug:abc-123",
+  "docType": "chatAudit",
+  "sessionId": "abc-123",
+  "projectId": "project-uuid",
+  "createdAt": "2025-12-27T10:00:00.000Z",
+  "updatedAt": "2025-12-27T10:05:00.000Z",
+  "pairs": [
+    {
+      "pairIndex": 0,
+      "timestamp": "2025-12-27T10:01:00.000Z",
+      "userMessage": "modify the greet function to return Bonjour...",
+      "fullGeneration": "{\"summary\":\"Applying the change...\",\"fileHashes\":{...}...}",
+      "systemPromptPreview": "You are Grok, an AI coding assistant...",
+      "model": "grok-4",
+      "finishReason": "stop",
+      "tokensIn": 6704,
+      "tokensOut": 287
+    },
+    {
+      "pairIndex": 1,
+      "timestamp": "2025-12-27T10:03:00.000Z",
+      "userMessage": "continue",
+      "fullGeneration": "{\"summary\":\"Applying the second change...\",\"fileHashes\":{...}...}",
+      "systemPromptPreview": "You are Grok...\n## FILE OPERATION HISTORY...",
+      "model": "grok-4",
+      "finishReason": "stop",
+      "tokensIn": 6785,
+      "tokensOut": 296
+    }
+  ]
+}
+```
+
+**Error Dashboard - Audit Tab:**
+
+When viewing a session in the Error Dashboard, the new "🔍 Audit" tab shows:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🔍 Generation Audit                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Full AI generations captured for debugging.                    │
+│  Document: debug:abc-123                                        │
+│  Entries: 2 | Created: 2025-12-27                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Pair #1 👈 This pair | grok-4 | stop                    │   │
+│  │ 6785 in / 296 out                                       │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ User Message                                             │   │
+│  │ ┌───────────────────────────────────────────────────┐   │   │
+│  │ │ continue                                           │   │   │
+│  │ └───────────────────────────────────────────────────┘   │   │
+│  │                                                         │   │
+│  │ Full AI Generation                                      │   │
+│  │ ┌───────────────────────────────────────────────────┐   │   │
+│  │ │ {"summary":"Applying the second change...","file   │   │   │
+│  │ │ Hashes":{"docs/rollback_test.py":"a8827c08d889... │   │   │
+│  │ └───────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Pair #0 | grok-4 | stop                                 │   │
+│  │ ...                                                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**When Audit is NOT Enabled:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🔍 Generation Audit                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  ❌ No audit document found.                                    │
+│                                                                 │
+│  To enable audit generation:                                    │
+│  1. Open VS Code settings                                       │
+│  2. Search for "grok.auditGeneration"                           │
+│  3. Enable the checkbox                                         │
+│                                                                 │
+│  Future generations will be saved to debug:abc-123              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Use Cases:**
+
+| Scenario | What Audit Reveals |
+|----------|-------------------|
+| Hash mismatch error | See exact `fileHashes` AI provided vs what was expected |
+| JSON parsing failed | See raw unprocessed text before cleanup attempted |
+| Wrong line numbers | Check if AI had correct file content (systemPromptPreview) |
+| Truncation suspected | Check `finishReason` - "length" = truncated |
+| AI hallucinated content | Compare `fullGeneration` to what files were actually attached |
+
+**Size Management:**
+
+Audit documents are limited to ~18MB. When approaching the limit:
+1. Oldest entries are trimmed automatically
+2. A log message indicates trimming occurred
+3. Most recent entries are always preserved

@@ -251,6 +251,7 @@ export async function executeActions(
     const startTime = Date.now();
     const results: ActionResult[] = [];
     const filesContent = new Map<string, string>();
+    const fileHashes = new Map<string, string>();
     const urlsContent = new Map<string, string>();
 
     for (const action of plan.actions) {
@@ -259,7 +260,7 @@ export async function executeActions(
             
             onProgress?.({
                 type: 'file-start',
-                message: `📂 Searching for ${fileAction.pattern}...`,
+                message: `🔍 Searching: \`${fileAction.pattern}\``,
                 details: { path: fileAction.pattern }
             });
 
@@ -268,19 +269,22 @@ export async function executeActions(
                 
                 if (files.length > 0) {
                     const totalLines = files.reduce((sum, f) => sum + f.lineCount, 0);
-                    const fileNames = files.map(f => f.name).join(', ');
+                    const fileNames = files.map(f => f.name);
                     
                     files.forEach(f => {
                         filesContent.set(f.path, f.content);
+                        fileHashes.set(f.path, f.md5Hash);
                     });
 
+                    // Show each file found on its own line for better visibility
+                    const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
                     onProgress?.({
                         type: 'file-done',
-                        message: `✅ Loaded ${files.length} file(s): ${fileNames} (${totalLines} lines)`,
+                        message: `✅ Found ${files.length} file(s) (${totalLines} lines)\n${fileList}`,
                         details: { 
                             path: fileAction.pattern,
                             lines: totalLines,
-                            files: files.map(f => f.name)
+                            files: fileNames
                         }
                     });
 
@@ -289,7 +293,7 @@ export async function executeActions(
                         try {
                             onProgress?.({
                                 type: 'file-start',
-                                message: `🔗 Following imports in ${file.name}...`,
+                                message: `🔗 Analyzing imports: ${file.name}`,
                                 details: { path: file.path }
                             });
                             
@@ -299,10 +303,11 @@ export async function executeActions(
                                 (msg) => onProgress?.({ type: 'file-start', message: msg, details: {} })
                             );
                             
-                            // Add imported files to context
+                            // Add imported files to context (with hashes)
                             for (const [importPath, importFile] of importResult.files) {
                                 if (!filesContent.has(importPath)) {
                                     filesContent.set(importPath, importFile.content);
+                                    fileHashes.set(importPath, importFile.md5Hash);
                                 }
                             }
                             
@@ -314,10 +319,14 @@ export async function executeActions(
                             }
                             
                             if (importResult.files.size > 0 || importResult.external.size > 0) {
+                                const importedNames = Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p);
+                                const importList = importedNames.length > 0 
+                                    ? '\n' + importedNames.slice(0, 5).map(f => `   └─ ${f}`).join('\n') + (importedNames.length > 5 ? `\n   └─ ...and ${importedNames.length - 5} more` : '')
+                                    : '';
                                 onProgress?.({
                                     type: 'file-done',
-                                    message: `🔗 Found ${importResult.files.size} imported files, ${importResult.external.size} external docs (depth ${importResult.depth})`,
-                                    details: { files: Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p) }
+                                    message: `✅ Found ${importResult.files.size} import(s), ${importResult.external.size} external doc(s)${importList}`,
+                                    details: { files: importedNames }
                                 });
                             }
                         } catch (importErr: any) {
@@ -362,9 +371,18 @@ export async function executeActions(
             
             info(`Executing URL action: ${urlAction.url}`);
             
+            // Extract a readable URL label
+            let urlLabel = urlAction.url;
+            try {
+                const parsedUrl = new URL(urlAction.url);
+                const pathParts = parsedUrl.pathname.split('/').filter(p => p);
+                const fileName = pathParts[pathParts.length - 1] || parsedUrl.hostname;
+                urlLabel = `${parsedUrl.hostname}/${fileName}`;
+            } catch { /* keep full URL */ }
+            
             onProgress?.({
                 type: 'url-start',
-                message: `🌐 Fetching ${urlAction.url}...`,
+                message: `🌐 Fetching: ${urlLabel}`,
                 details: { url: urlAction.url }
             });
 
@@ -378,7 +396,7 @@ export async function executeActions(
                     const sizeKB = Math.round((fetchResult.bytes || 0) / 1024);
                     onProgress?.({
                         type: 'url-done',
-                        message: `✅ Fetched ${new URL(urlAction.url).hostname} (${sizeKB}KB)`,
+                        message: `✅ Fetched ${urlLabel} (${sizeKB}KB)`,
                         details: { url: urlAction.url, bytes: fetchResult.bytes }
                     });
 
@@ -418,7 +436,7 @@ export async function executeActions(
     }
 
     return { 
-        execution: { plan, results, filesContent, urlsContent },
+        execution: { plan, results, filesContent, fileHashes, urlsContent },
         timeMs: Date.now() - startTime
     };
 }
@@ -441,12 +459,40 @@ export function buildAugmentedMessage(
         });
     }
 
+    // CRITICAL: Report failed file searches so AI doesn't hallucinate
+    const failedFileActions = execution.results.filter(r => 
+        !r.success && r.action.type === 'file'
+    );
+    if (failedFileActions.length > 0) {
+        augmented += '\n\n---\n**⚠️ FILE SEARCH FAILED - DO NOT PRETEND YOU HAVE ACCESS:**\n';
+        for (const result of failedFileActions) {
+            const fileAction = result.action as FileAction;
+            augmented += `- Pattern \`${fileAction.pattern}\` returned NO FILES\n`;
+        }
+        augmented += '\n**You CANNOT see these files. Ask the user to attach them or provide the correct path.**\n';
+    }
+
     // Add file contents
     if (execution.filesContent.size > 0) {
-        augmented += '\n\n---\n**Files from workspace:**\n';
-        for (const [path, content] of execution.filesContent) {
-            augmented += `\n### ${path}\n\`\`\`\n${content}\n\`\`\`\n`;
+        augmented += '\n\n---\n**Files from workspace (with MD5 hashes - use these in fileHashes when modifying):**\n';
+        for (const [filePath, content] of execution.filesContent) {
+            const hash = execution.fileHashes.get(filePath) || 'UNKNOWN';
+            augmented += `\n### ${filePath} [MD5: ${hash}]\n\`\`\`\n${content}\n\`\`\`\n`;
         }
+        augmented += '\n**IMPORTANT: When using lineOperations on these files, include the MD5 hash in your fileHashes response field.**\n';
+    }
+
+    // CRITICAL: Report failed URL fetches so AI doesn't hallucinate
+    const failedUrlActions = execution.results.filter(r => 
+        !r.success && r.action.type === 'url'
+    );
+    if (failedUrlActions.length > 0) {
+        augmented += '\n\n---\n**⚠️ URL FETCH FAILED - DO NOT PRETEND YOU HAVE THIS CONTENT:**\n';
+        for (const result of failedUrlActions) {
+            const urlAction = result.action as UrlAction;
+            augmented += `- URL \`${urlAction.url}\` FAILED: ${result.error}\n`;
+        }
+        augmented += '\n**You CANNOT see this content. Tell the user the fetch failed.**\n';
     }
 
     // Add URL contents
@@ -541,6 +587,7 @@ export async function runAgentWorkflow(
         if (result.success && result.action.type === 'file' && result.metadata?.files) {
             for (const filePath of result.metadata.files) {
                 const content = execution.filesContent.get(filePath);
+                const hash = execution.fileHashes.get(filePath);
                 if (content) {
                     filesLoaded.push({
                         path: filePath,
@@ -548,7 +595,8 @@ export async function runAgentWorkflow(
                         name: filePath.split('/').pop() || filePath,
                         content,
                         language: filePath.split('.').pop() || 'text',
-                        lineCount: content.split('\n').length
+                        lineCount: content.split('\n').length,
+                        md5Hash: hash || ''
                     });
                 }
             }
@@ -576,6 +624,251 @@ export async function runAgentWorkflow(
             execute: { timeMs: executeResult.timeMs }
         }
     };
+}
+
+// ============================================================================
+// Files API Workflow - Upload files to xAI instead of embedding
+// ============================================================================
+
+import { uploadFile, UploadedFile, FileUploadResult } from '../api/fileUploader';
+import { 
+    addUploadedFile, 
+    findUploadedFile, 
+    getUploadedFiles,
+    UploadedFileRecord 
+} from '../storage/chatSessionRepository';
+import { computeMd5Hash } from './workspaceFiles';
+
+export interface FilesApiWorkflowResult {
+    /** File IDs to attach to the message (for document_search) */
+    fileIds: string[];
+    /** Files that were uploaded this turn */
+    newlyUploaded: UploadedFile[];
+    /** Files that were already uploaded (reused) */
+    reused: string[];
+    /** Plan from Pass 1 */
+    plan?: AgentPlan;
+    /** URL content (still embedded as text) */
+    urlContent: Map<string, string>;
+    stepMetrics: {
+        planning: { timeMs: number; tokensIn: number; tokensOut: number };
+        execute: { timeMs: number };
+    };
+}
+
+/**
+ * Run agent workflow using xAI Files API.
+ * 
+ * Instead of embedding file content in the prompt, files are uploaded to xAI
+ * and referenced by file_id. The AI uses document_search tool to access them.
+ * 
+ * Benefits:
+ * - Files persist across conversation turns
+ * - AI can search files multiple times with different queries
+ * - Reduced token usage (file content not in prompt)
+ * - No hallucination - AI searches actual uploaded content
+ */
+export async function runFilesApiWorkflow(
+    userMessage: string,
+    apiKey: string,
+    fastModel: string,
+    sessionId: string,
+    onProgress?: (message: string) => void
+): Promise<FilesApiWorkflowResult> {
+    const startTime = Date.now();
+    
+    // Convert string progress to ProgressUpdate for internal use
+    const progressHandler = (update: ProgressUpdate) => {
+        onProgress?.(update.message);
+    };
+
+    // Pass 1: Create plan (same as before)
+    onProgress?.('🧠 Planning...');
+    const planResult = await createPlan(userMessage, apiKey, fastModel, progressHandler);
+    const plan = planResult.plan;
+    
+    const fileIds: string[] = [];
+    const newlyUploaded: UploadedFile[] = [];
+    const reused: string[] = [];
+    const urlContent = new Map<string, string>();
+    
+    if (plan.actions.length === 0) {
+        debug('No actions in plan, proceeding directly');
+        
+        // Still include any previously uploaded files from this session
+        const existingFiles = await getUploadedFiles(sessionId);
+        for (const file of existingFiles) {
+            fileIds.push(file.fileId);
+            reused.push(file.localPath);
+        }
+        
+        return {
+            fileIds,
+            newlyUploaded,
+            reused,
+            plan,
+            urlContent,
+            stepMetrics: {
+                planning: { timeMs: planResult.timeMs, tokensIn: planResult.tokensIn, tokensOut: planResult.tokensOut },
+                execute: { timeMs: 0 }
+            }
+        };
+    }
+
+    info(`Plan created: ${plan.todos.length} todos, ${plan.actions.length} actions`);
+
+    // Pass 2: Execute actions - upload files instead of embedding
+    const executeStart = Date.now();
+    
+    // Process file actions
+    const fileActions = plan.actions.filter((a): a is FileAction => a.type === 'file');
+    
+    for (const fileAction of fileActions) {
+        onProgress?.(`🔍 Finding: ${fileAction.pattern}`);
+        
+        const files = await findAndReadFiles(fileAction.pattern, 10);
+        
+        if (files.length === 0) {
+            onProgress?.(`⚠️ No files found: ${fileAction.pattern}`);
+            continue;
+        }
+        
+        for (const file of files) {
+            const hash = computeMd5Hash(file.content);
+            
+            // Check if already uploaded with same hash
+            const existingId = await findUploadedFile(sessionId, file.path, hash);
+            if (existingId) {
+                info(`Reusing uploaded file: ${file.name} -> ${existingId}`);
+                fileIds.push(existingId);
+                reused.push(file.path);
+                continue;
+            }
+            
+            // Upload new file
+            onProgress?.(`📤 Uploading: ${file.name}`);
+            
+            const result = await uploadFile(file.path, apiKey);
+            
+            if (result.success && result.file) {
+                fileIds.push(result.file.id);
+                newlyUploaded.push(result.file);
+                
+                // Track in session
+                await addUploadedFile(sessionId, {
+                    fileId: result.file.id,
+                    localPath: file.path,
+                    filename: file.name,
+                    size: result.file.size,
+                    hash
+                });
+                
+                onProgress?.(`✅ Uploaded: ${file.name}`);
+            } else {
+                onProgress?.(`❌ Upload failed: ${file.name} - ${result.error}`);
+            }
+        }
+    }
+    
+    // Process URL actions (still fetch and embed for now)
+    const urlActions = plan.actions.filter((a): a is UrlAction => a.type === 'url');
+    
+    for (const urlAction of urlActions) {
+        let urlLabel = urlAction.url;
+        try {
+            const u = new URL(urlAction.url);
+            urlLabel = u.hostname + u.pathname.substring(0, 30);
+        } catch { /* keep full URL */ }
+        
+        onProgress?.(`🌐 Fetching: ${urlLabel}`);
+        
+        try {
+            const result = await fetchUrl(urlAction.url);
+            if (result.success && result.content) {
+                urlContent.set(urlAction.url, result.content);
+                onProgress?.(`✅ Fetched: ${urlLabel}`);
+            } else {
+                onProgress?.(`⚠️ Failed: ${urlLabel}`);
+            }
+        } catch (err: any) {
+            onProgress?.(`❌ Error: ${urlLabel}`);
+        }
+    }
+    
+    const executeTime = Date.now() - executeStart;
+    
+    // Include previously uploaded files that weren't in this plan
+    const existingFiles = await getUploadedFiles(sessionId);
+    for (const file of existingFiles) {
+        if (!fileIds.includes(file.fileId)) {
+            fileIds.push(file.fileId);
+            reused.push(file.localPath);
+        }
+    }
+    
+    if (newlyUploaded.length > 0 || reused.length > 0) {
+        onProgress?.(`✅ Ready: ${newlyUploaded.length} uploaded, ${reused.length} reused`);
+    }
+
+    return {
+        fileIds,
+        newlyUploaded,
+        reused,
+        plan,
+        urlContent,
+        stepMetrics: {
+            planning: { timeMs: planResult.timeMs, tokensIn: planResult.tokensIn, tokensOut: planResult.tokensOut },
+            execute: { timeMs: executeTime }
+        }
+    };
+}
+
+/**
+ * Build message text for Files API workflow.
+ * 
+ * Unlike buildAugmentedMessage, this does NOT embed file content.
+ * Files are attached via file_id and AI uses document_search.
+ * 
+ * We still include:
+ * - Plan/TODOs
+ * - URL content (since URLs aren't uploaded as files)
+ * - Instructions for the AI
+ */
+export function buildFilesApiMessage(
+    originalMessage: string,
+    plan: AgentPlan,
+    urlContent: Map<string, string>,
+    fileCount: number
+): string {
+    let message = originalMessage;
+
+    // Add plan context
+    if (plan.todos.length > 0) {
+        message += '\n\n---\n**Current Plan (you may refine this):**\n';
+        plan.todos.forEach(t => {
+            message += `${t.order}. ${t.text}\n`;
+        });
+    }
+
+    // Add URL contents (these are still embedded)
+    if (urlContent.size > 0) {
+        message += '\n\n---\n**Content fetched from URLs:**\n';
+        for (const [url, content] of urlContent) {
+            const truncated = content.length > 10000 
+                ? content.substring(0, 10000) + '\n\n[Content truncated...]'
+                : content;
+            message += `\n### ${url}\n\`\`\`\n${truncated}\n\`\`\`\n`;
+        }
+    }
+
+    // Add instructions about file access
+    if (fileCount > 0) {
+        message += `\n\n---\n**📁 ${fileCount} file(s) attached via document_search.**\n`;
+        message += 'You can search these files to find relevant content. The files are available for your analysis.\n';
+        message += 'When modifying files, you can see their current content through document_search.\n';
+    }
+
+    return message;
 }
 
 // Re-export for backward compatibility

@@ -43,6 +43,64 @@ export function resolveFilePathToUri(rawPath: string): vscode.Uri | undefined {
     return undefined;
 }
 
+/**
+ * Async version of resolveFilePathToUri with file search fallback.
+ * If the direct path doesn't exist, searches the workspace for the filename.
+ */
+export async function resolveFilePathToUriWithSearch(rawPath: string): Promise<vscode.Uri | undefined> {
+    // First try direct resolution
+    const directUri = resolveFilePathToUri(rawPath);
+    
+    if (directUri) {
+        // Check if file exists at direct path
+        try {
+            await vscode.workspace.fs.stat(directUri);
+            return directUri; // File exists
+        } catch {
+            // File doesn't exist at direct path - try searching
+        }
+    }
+    
+    // Extract just the filename for searching
+    const filename = path.basename(rawPath);
+    if (!filename) {
+        return directUri; // Return the direct URI even if file doesn't exist (for new files)
+    }
+    
+    // Search workspace for the file
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return directUri;
+    }
+    
+    try {
+        const pattern = new vscode.RelativePattern(workspaceFolders[0], `**/${filename}`);
+        const files = await vscode.workspace.findFiles(pattern, '**/node_modules/**', 5);
+        
+        if (files.length === 1) {
+            console.log(`[Grok] File path "${rawPath}" not found directly, using search result: ${files[0].fsPath}`);
+            return files[0];
+        } else if (files.length > 1) {
+            // Multiple matches - prefer one with matching directory structure
+            const normalizedPath = rawPath.replace(/\\/g, '/');
+            for (const file of files) {
+                if (file.fsPath.replace(/\\/g, '/').endsWith(normalizedPath)) {
+                    console.log(`[Grok] File path "${rawPath}" matched: ${file.fsPath}`);
+                    return file;
+                }
+            }
+            // Still ambiguous - log warning and use first match
+            console.warn(`[Grok] Multiple files match "${rawPath}", using first: ${files[0].fsPath}`);
+            return files[0];
+        }
+    } catch (err) {
+        console.warn(`[Grok] File search failed for "${rawPath}":`, err);
+    }
+    
+    // Return direct URI for new file creation
+    return directUri;
+}
+
 export interface ProposedEdit {
     id: string;
     fileUri: vscode.Uri;
@@ -60,6 +118,10 @@ export interface ApplyResult {
     success: boolean;
     changeSet?: ChangeSet;
     error?: string;
+    /** Files where diff application failed (oldContent === newContent) */
+    failedDiffs?: string[];
+    /** True if NO actual changes were made - rollback impossible */
+    noActualChanges?: boolean;
 }
 
 const editSnapshots: Map<string, FileSnapshot[]> = new Map();
@@ -260,18 +322,44 @@ export async function applyEdits(
         }
     }
 
+    // SAFETY CHECK: Detect if any changes produced identical old/new content
+    // This indicates a diff application failure - rollback won't work!
+    const identicalChanges = fileChanges.filter(fc => fc.oldContent === fc.newContent && !fc.isNewFile);
+    if (identicalChanges.length > 0) {
+        console.warn(`[Grok] WARNING: ${identicalChanges.length} file(s) have identical old/new content - diff may have failed to apply!`);
+        for (const fc of identicalChanges) {
+            console.warn(`  - ${fc.filePath}: oldContent === newContent (${fc.oldContent.length} chars)`);
+        }
+    }
+    
+    // Check if NO actual changes were made (all files identical)
+    const actualChanges = fileChanges.filter(fc => fc.oldContent !== fc.newContent || fc.isNewFile);
+    if (actualChanges.length === 0 && fileChanges.length > 0) {
+        console.error('[Grok] CRITICAL: No actual file changes detected! Diff application completely failed.');
+        console.error('[Grok] This means rollback will NOT be possible for these "changes".');
+    }
+
+    // Create the changeSet with applied: true directly to avoid race condition
+    // where the persist happens before markApplied can set it to true
     const changeSet = changeTracker.addChangeSet(
         sessionId || 'unknown',
         fileChanges,
         cost,
         tokensUsed,
-        `Applied ${edits.length} file(s)`
+        `Applied ${edits.length} file(s)${identicalChanges.length > 0 ? ` (${identicalChanges.length} failed)` : ''}`,
+        true // applied = true
     );
     
-    changeTracker.markApplied(changeSet.id);
     changeSetToEditGroup.set(changeSet.id, editGroupId);
+    
+    const noActualChanges = actualChanges.length === 0 && fileChanges.length > 0;
 
-    return { success: true, changeSet };
+    return { 
+        success: true, 
+        changeSet,
+        failedDiffs: identicalChanges.map(fc => fc.filePath),
+        noActualChanges
+    };
 }
 
 export async function revertEdits(editGroupId: string): Promise<void> {
@@ -316,9 +404,12 @@ export async function revertEdits(editGroupId: string): Promise<void> {
  * Fallback revert using stored oldContent from changeSet.
  * Use this when editSnapshots are not available (e.g., after extension reload).
  */
-export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath: string; oldContent: string; isNewFile: boolean }> }): Promise<boolean> {
+export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath: string; oldContent: string; newContent?: string; isNewFile: boolean }> }): Promise<boolean> {
     const workspaceEdit = new vscode.WorkspaceEdit();
     let filesReverted = 0;
+    let filesSkipped = 0;
+
+    console.log(`[Grok] Direct revert starting for ${changeSet.files.length} file(s)`);
 
     for (const fileChange of changeSet.files) {
         try {
@@ -326,20 +417,46 @@ export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath
             
             if (fileChange.isNewFile) {
                 // File was created - delete it
+                console.log(`[Grok] Deleting new file: ${fileChange.filePath}`);
                 workspaceEdit.deleteFile(uri, { ignoreIfNotExists: true });
+                filesReverted++;
             } else {
-                // Restore original content
-                const doc = await vscode.workspace.openTextDocument(uri);
-                const fullRange = new vscode.Range(
-                    doc.positionAt(0),
-                    doc.positionAt(doc.getText().length)
-                );
-                workspaceEdit.replace(uri, fullRange, fileChange.oldContent);
+                // Verify the file exists and check if revert is needed
+                try {
+                    const doc = await vscode.workspace.openTextDocument(uri);
+                    const currentContent = doc.getText();
+                    
+                    // Skip if already at old content (already reverted or never changed)
+                    if (currentContent === fileChange.oldContent) {
+                        console.log(`[Grok] Skipping ${fileChange.filePath} - already at original content`);
+                        filesSkipped++;
+                        continue;
+                    }
+                    
+                    // Verify we're reverting expected content (optional but helpful for debugging)
+                    if (fileChange.newContent && currentContent !== fileChange.newContent) {
+                        console.warn(`[Grok] Warning: ${fileChange.filePath} content differs from expected newContent - reverting anyway`);
+                    }
+                    
+                    console.log(`[Grok] Restoring ${fileChange.filePath} to original content (${fileChange.oldContent.length} chars)`);
+                    const fullRange = new vscode.Range(
+                        doc.positionAt(0),
+                        doc.positionAt(currentContent.length)
+                    );
+                    workspaceEdit.replace(uri, fullRange, fileChange.oldContent);
+                    filesReverted++;
+                } catch (docErr) {
+                    console.error(`[Grok] Failed to open file for revert: ${fileChange.filePath}`, docErr);
+                }
             }
-            filesReverted++;
         } catch (error) {
-            console.error('Failed to revert file directly:', fileChange.filePath, error);
+            console.error('[Grok] Failed to revert file directly:', fileChange.filePath, error);
         }
+    }
+
+    if (filesReverted === 0) {
+        console.log(`[Grok] No files to revert (${filesSkipped} already at original)`);
+        return true; // Consider success if nothing to do
     }
 
     const success = await vscode.workspace.applyEdit(workspaceEdit);
@@ -353,11 +470,13 @@ export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath
                     const doc = await vscode.workspace.openTextDocument(uri);
                     await doc.save();
                 } catch (saveErr) {
-                    console.error('Failed to save reverted file:', fileChange.filePath, saveErr);
+                    console.error('[Grok] Failed to save reverted file:', fileChange.filePath, saveErr);
                 }
             }
         }
-        console.log(`[Grok] Direct revert: ${filesReverted} file(s) restored`);
+        console.log(`[Grok] Direct revert complete: ${filesReverted} file(s) restored, ${filesSkipped} skipped`);
+    } else {
+        console.error(`[Grok] Direct revert failed: workspace edit not applied`);
     }
     
     return success;
@@ -367,33 +486,72 @@ export async function revertToChangeSet(targetChangeSetId: string): Promise<bool
     const history = changeTracker.getHistory();
     const targetIndex = history.findIndex(cs => cs.id === targetChangeSetId);
     
+    console.log(`[Grok] revertToChangeSet called: targetId=${targetChangeSetId}, targetIndex=${targetIndex}, historyLength=${history.length}`);
+    
     if (targetIndex === -1) {
+        console.error(`[Grok] Target changeset not found in history: ${targetChangeSetId}`);
         return false;
     }
 
+    // Collect all changesets that need reverting
+    const toRevert: Array<{ cs: typeof history[0], reason?: string }> = [];
+    
     for (let i = history.length - 1; i > targetIndex; i--) {
         const cs = history[i];
-        if (cs.applied) {
-            const editGroupId = changeSetToEditGroup.get(cs.id);
-            if (editGroupId) {
-                try {
-                    await revertEdits(editGroupId);
-                } catch (error) {
-                    console.error('Failed to revert change set via editGroup:', cs.id, error);
-                    // Fallback: use stored oldContent directly
-                    console.log('Attempting direct revert using stored oldContent...');
-                    const success = await revertChangeSetDirect(cs);
-                    if (success) {
-                        changeTracker.markReverted(cs.id);
-                    }
-                }
-            } else {
-                // No editGroup mapping - use direct revert
-                console.log('No editGroup mapping, using direct revert for:', cs.id);
+        
+        // Check if this changeset has actual changes to revert
+        const hasActualChanges = cs.files.some(f => f.oldContent !== f.newContent || f.isNewFile);
+        
+        if (!hasActualChanges) {
+            console.warn(`[Grok] Skipping changeset ${cs.id} - no actual changes were made (line operations may have failed)`);
+            toRevert.push({ cs, reason: 'no_actual_changes' });
+            continue;
+        }
+        
+        // Always include changesets with actual changes - the `applied` flag may be out of sync
+        // with reality. We'll verify the actual file content when reverting.
+        console.log(`[Grok] Adding changeset ${cs.id} to revert list (applied=${cs.applied}, files=${cs.files.length})`);
+        toRevert.push({ cs });
+    }
+    
+    console.log(`[Grok] Collected ${toRevert.length} changeset(s) to revert`);
+    
+    // Count how many have issues
+    const problematic = toRevert.filter(r => r.reason === 'no_actual_changes');
+    if (problematic.length > 0) {
+        console.warn(`[Grok] ${problematic.length} changeset(s) have no actual changes - rollback may be incomplete`);
+        vscode.window.showWarningMessage(
+            `⚠️ ${problematic.length} change(s) failed to apply originally (AI hallucinated file content). These cannot be rolled back.`
+        );
+    }
+    
+    // Revert the ones that have actual changes
+    for (const { cs, reason } of toRevert) {
+        if (reason === 'no_actual_changes') {
+            // Mark as reverted even though nothing to do
+            changeTracker.markReverted(cs.id);
+            continue;
+        }
+        
+        const editGroupId = changeSetToEditGroup.get(cs.id);
+        if (editGroupId) {
+            try {
+                await revertEdits(editGroupId);
+            } catch (error) {
+                console.error('Failed to revert change set via editGroup:', cs.id, error);
+                // Fallback: use stored oldContent directly
+                console.log('Attempting direct revert using stored oldContent...');
                 const success = await revertChangeSetDirect(cs);
                 if (success) {
                     changeTracker.markReverted(cs.id);
                 }
+            }
+        } else {
+            // No editGroup mapping - use direct revert
+            console.log('No editGroup mapping, using direct revert for:', cs.id);
+            const success = await revertChangeSetDirect(cs);
+            if (success) {
+                changeTracker.markReverted(cs.id);
             }
         }
     }
@@ -590,6 +748,11 @@ export function applyUnifiedDiff(originalContent: string, diffContent: string): 
 /**
  * Simple diff application: remove lines starting with -, add lines starting with +
  * Used when no hunk headers are present.
+ * 
+ * IMPORTANT: This function must handle multiple diff formats:
+ * 1. Pure +/- diffs (no context lines)
+ * 2. Unified diffs with @@ hunk headers
+ * 3. Diffs with context lines (space prefix) but no @@ headers
  */
 export function applySimpleDiff(originalContent: string, diffContent: string): string {
     const diffLines = diffContent.split('\n');
@@ -599,6 +762,24 @@ export function applySimpleDiff(originalContent: string, diffContent: string): s
     if (!diffContent || diffContent.trim() === '') {
         console.warn('[Grok] Empty diff content, returning original');
         return originalContent;
+    }
+    
+    // Count different line types
+    const addLines = diffLines.filter(l => l.startsWith('+'));
+    const removeLines = diffLines.filter(l => l.startsWith('-'));
+    const contextLines = diffLines.filter(l => l.startsWith(' '));
+    const hasHunkHeaders = diffLines.some(l => l.startsWith('@@'));
+    
+    // CRITICAL: If this is supposed to be a diff but has NO diff markers,
+    // return original unchanged to prevent file corruption
+    if (addLines.length === 0 && removeLines.length === 0 && !hasHunkHeaders) {
+        console.warn('[Grok] BLOCKED: Diff content has no +/- markers - would corrupt file. Content preview:', diffContent.slice(0, 200));
+        return originalContent;
+    }
+    
+    // If we have @@ headers, use unified diff parser
+    if (hasHunkHeaders) {
+        return applyUnifiedDiff(originalContent, diffContent);
     }
     
     // Check if this is a simple +/- diff without context
@@ -616,13 +797,117 @@ export function applySimpleDiff(originalContent: string, diffContent: string): s
         }
         
         // Validate result isn't empty when there was content
-        if (resultLines.length === 0 && diffLines.some(l => l.startsWith('+'))) {
+        if (resultLines.length === 0 && addLines.length > 0) {
             console.warn('[Grok] Diff produced empty result, checking for issues');
         }
         
         return resultLines.join('\n');
     }
     
-    // Has context lines - need smarter application
-    return applyUnifiedDiff(originalContent, diffContent);
+    // Has context lines but no @@ headers - try to apply intelligently
+    // This handles AI-generated diffs that include context without proper headers
+    console.log(`[Grok] Applying diff with context lines: +${addLines.length} -${removeLines.length} context:${contextLines.length}`);
+    
+    const originalLines = originalContent.split('\n');
+    
+    // Strategy: Find where the diff should apply by matching context lines
+    // Then apply the +/- changes at that location
+    
+    // Extract the first few non-+/- lines as context to find match location
+    const firstContextLines: string[] = [];
+    for (const line of diffLines) {
+        if (line.startsWith(' ')) {
+            firstContextLines.push(line.substring(1));
+        } else if (!line.startsWith('+') && !line.startsWith('-') && line.trim() !== '') {
+            // Lines without prefix are also context
+            firstContextLines.push(line);
+        }
+        if (firstContextLines.length >= 3) break;
+    }
+    
+    // Try to find the match location in original file
+    let matchIndex = -1;
+    if (firstContextLines.length > 0) {
+        for (let i = 0; i < originalLines.length; i++) {
+            let matches = true;
+            for (let j = 0; j < firstContextLines.length && i + j < originalLines.length; j++) {
+                if (originalLines[i + j].trim() !== firstContextLines[j].trim()) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                matchIndex = i;
+                break;
+            }
+        }
+    }
+    
+    if (matchIndex === -1) {
+        // Couldn't find context match - fall back to extracting just the + lines
+        console.warn('[Grok] Could not find context match in original file, extracting + lines only');
+        for (const line of diffLines) {
+            if (line.startsWith('+')) {
+                resultLines.push(line.substring(1));
+            } else if (line.startsWith(' ')) {
+                resultLines.push(line.substring(1));
+            } else if (!line.startsWith('-') && line.trim() !== '') {
+                resultLines.push(line);
+            }
+        }
+        
+        // If we got nothing useful, return the + lines with context
+        if (resultLines.length === 0) {
+            console.warn('[Grok] No lines extracted, returning original content unchanged');
+            return originalContent;
+        }
+        
+        return resultLines.join('\n');
+    }
+    
+    // Apply the diff at the matched location
+    let originalIdx = 0;
+    let diffIdx = 0;
+    
+    // Copy lines before the match
+    while (originalIdx < matchIndex) {
+        resultLines.push(originalLines[originalIdx]);
+        originalIdx++;
+    }
+    
+    // Process the diff lines
+    while (diffIdx < diffLines.length) {
+        const line = diffLines[diffIdx];
+        
+        if (line.startsWith('-')) {
+            // Remove line - skip in original
+            originalIdx++;
+            diffIdx++;
+        } else if (line.startsWith('+')) {
+            // Add line
+            resultLines.push(line.substring(1));
+            diffIdx++;
+        } else if (line.startsWith(' ')) {
+            // Context line - copy from original
+            resultLines.push(originalLines[originalIdx] || line.substring(1));
+            originalIdx++;
+            diffIdx++;
+        } else if (line.trim() === '') {
+            // Empty line - could be context or just formatting
+            diffIdx++;
+        } else {
+            // No prefix - treat as context
+            resultLines.push(originalLines[originalIdx] || line);
+            originalIdx++;
+            diffIdx++;
+        }
+    }
+    
+    // Copy remaining original lines
+    while (originalIdx < originalLines.length) {
+        resultLines.push(originalLines[originalIdx]);
+        originalIdx++;
+    }
+    
+    return resultLines.join('\n');
 }

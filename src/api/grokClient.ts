@@ -5,9 +5,11 @@ import { optimizeMessageContent, getToonSystemPromptAddition } from '../utils/to
 const log = createScopedLogger('GrokAPI');
 
 export interface GrokMessageContent {
-    type: 'text' | 'image_url';
+    type: 'text' | 'image_url' | 'file';
     text?: string;
     image_url?: { url: string };
+    /** xAI Files API file reference for document_search */
+    file?: { file_id: string };
 }
 
 export interface GrokMessage {
@@ -24,6 +26,8 @@ export interface GrokUsage {
 export interface GrokResponse {
     text: string;
     usage?: GrokUsage;
+    /** Why the response stopped: 'stop' (normal), 'length' (hit token limit = TRUNCATED), 'end_turn' */
+    finishReason?: 'stop' | 'length' | 'end_turn' | string;
 }
 
 /**
@@ -44,13 +48,75 @@ export function createVisionMessage(text: string, imageBase64Array: string[]): G
     return { role: 'user', content };
 }
 
+/**
+ * Create a message with file attachments for document_search.
+ * Files must be pre-uploaded to xAI Files API.
+ * 
+ * @param text The user's message text
+ * @param fileIds Array of file IDs from xAI Files API
+ * @param imageBase64Array Optional images to include
+ */
+export function createFileMessage(
+    text: string, 
+    fileIds: string[], 
+    imageBase64Array?: string[]
+): GrokMessage {
+    const content: GrokMessageContent[] = [];
+    
+    // Add file references first (triggers document_search)
+    // xAI REST API format: {"type": "file", "file": {"file_id": "..."}}
+    for (const fileId of fileIds) {
+        content.push({
+            type: 'file',
+            file: { file_id: fileId }
+        });
+    }
+    
+    // Add images if present
+    if (imageBase64Array) {
+        for (const imageBase64 of imageBase64Array) {
+            content.push({
+                type: 'image_url',
+                image_url: { url: `data:image/png;base64,${imageBase64}` }
+            });
+        }
+    }
+    
+    // Add text last
+    content.push({ type: 'text', text });
+    
+    return { role: 'user', content };
+}
+
+export interface ChatCompletionOptions {
+    signal?: AbortSignal;
+    onChunk?: (chunk: string) => void;
+    /** 
+     * JSON Schema for structured outputs. When provided, API guarantees response matches schema.
+     * @see https://docs.x.ai/docs/guides/structured-outputs
+     */
+    responseFormat?: object;
+}
+
 export async function sendChatCompletion(
     messages: GrokMessage[],
     model: string,
     apiKey: string,
-    signal?: AbortSignal,
+    signalOrOptions?: AbortSignal | ChatCompletionOptions,
     onChunk?: (chunk: string) => void
 ): Promise<GrokResponse> {
+    // Handle both old signature (signal, onChunk) and new options object
+    let options: ChatCompletionOptions = {};
+    if (signalOrOptions instanceof AbortSignal) {
+        options = { signal: signalOrOptions, onChunk };
+    } else if (signalOrOptions) {
+        options = signalOrOptions;
+    } else if (onChunk) {
+        options = { onChunk };
+    }
+    
+    const { signal, onChunk: chunkCallback, responseFormat } = options;
+    
     const config = vscode.workspace.getConfiguration('grok');
     const baseUrl = config.get<string>('apiBaseUrl') || 'https://api.x.ai/v1';
     const timeoutSeconds = config.get<number>('apiTimeout') || 300;
@@ -74,10 +140,11 @@ export async function sendChatCompletion(
 
     log.info(`Sending request to ${model}`, { 
         messageCount: messages.length, 
-        streaming: !!onChunk,
+        streaming: !!chunkCallback,
         baseUrl,
         timeoutSeconds,
-        requestFormat
+        requestFormat,
+        structuredOutput: !!responseFormat
     });
 
     const startTime = Date.now();
@@ -91,19 +158,32 @@ export async function sendChatCompletion(
     // Get max output tokens from config (default 16384 to prevent truncation)
     const maxOutputTokens = config.get<number>('maxOutputTokens') || 16384;
     
+    // Build request body
+    const requestBody: Record<string, unknown> = {
+        model,
+        messages: optimizedMessages.map(m => ({ role: m.role, content: m.content })),
+        max_tokens: maxOutputTokens,
+        stream: !!chunkCallback,
+        stream_options: chunkCallback ? { include_usage: true } : undefined
+    };
+    
+    // Add structured output schema if provided (guarantees valid JSON response)
+    if (responseFormat) {
+        requestBody.response_format = responseFormat;
+        log.info('Using structured outputs - API will guarantee schema compliance');
+    }
+    
+    // Debug: Log the full request body for diagnosing 500 errors
+    const requestBodyJson = JSON.stringify(requestBody, null, 2);
+    log.info(`Chat completion request body:\n${requestBodyJson.substring(0, 5000)}`);
+    
     const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${apiKey}`,
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-            model,
-            messages: optimizedMessages.map(m => ({ role: m.role, content: m.content })),
-            max_tokens: maxOutputTokens,
-            stream: !!onChunk,
-            stream_options: onChunk ? { include_usage: true } : undefined
-        }),
+        body: JSON.stringify(requestBody),
         signal: combinedSignal
     });
 
@@ -111,9 +191,13 @@ export async function sendChatCompletion(
         const errorBody = await response.text();
         let errorMessage = `API error: ${response.status}`;
         
+        // Log full error response for debugging 500 errors
+        log.error(`Full API error response body: ${errorBody}`);
+        
         try {
             const errorJson = JSON.parse(errorBody);
             errorMessage = errorJson.error?.message || errorMessage;
+            log.error(`Parsed error details:`, errorJson);
         } catch {
             if (errorBody) {
                 errorMessage = errorBody;
@@ -124,7 +208,8 @@ export async function sendChatCompletion(
             status: response.status, 
             model, 
             error: errorMessage,
-            durationMs: Date.now() - startTime 
+            durationMs: Date.now() - startTime,
+            requestBodyPreview: requestBodyJson.substring(0, 1000)
         });
 
         if (response.status === 401) {
@@ -138,9 +223,10 @@ export async function sendChatCompletion(
     }
 
     // Handle streaming response
-    if (onChunk && response.body) {
+    if (chunkCallback && response.body) {
         let fullText = '';
         let usage: GrokUsage | undefined;
+        let finishReason: string | undefined;
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -160,10 +246,23 @@ export async function sendChatCompletion(
 
                         try {
                             const parsed = JSON.parse(data);
+                            
+                            // Check for error in stream
+                            if (parsed.error) {
+                                log.error('Stream error from API:', parsed.error);
+                                throw new Error(parsed.error.message || JSON.stringify(parsed.error));
+                            }
+                            
                             const delta = parsed.choices?.[0]?.delta?.content;
                             if (delta) {
                                 fullText += delta;
-                                onChunk(delta);
+                                chunkCallback(delta);
+                            }
+                            
+                            // Capture finish_reason (indicates why response stopped)
+                            const reason = parsed.choices?.[0]?.finish_reason;
+                            if (reason) {
+                                finishReason = reason;
                             }
                             
                             // Capture usage if present
@@ -174,46 +273,102 @@ export async function sendChatCompletion(
                                     totalTokens: parsed.usage.total_tokens || 0
                                 };
                             }
-                        } catch {
+                        } catch (parseErr: any) {
+                            // Re-throw if it's an API error we detected
+                            if (parseErr.message && !parseErr.message.includes('JSON')) {
+                                throw parseErr;
+                            }
                             // Skip malformed JSON chunks
+                            log.warn(`Skipping malformed chunk: ${data.substring(0, 100)}`);
                         }
+                    } else if (line.trim() && !line.startsWith(':')) {
+                        // Log unexpected non-data lines for debugging
+                        log.warn(`Unexpected stream line: ${line.substring(0, 200)}`);
                     }
                 }
             }
-        } finally {
+        } catch (streamErr: any) {
+            const durationMs = Date.now() - startTime;
+            const durationSec = Math.round(durationMs / 1000);
+            log.error(`Stream read error: ${streamErr.message}`, { 
+                fullTextSoFar: fullText.substring(0, 500),
+                errorName: streamErr.name,
+                durationMs
+            });
             reader.releaseLock();
+            
+            // Create more descriptive error message
+            let enhancedMessage = streamErr.message;
+            if (durationMs > 55000) {
+                enhancedMessage = `API timeout after ${durationSec}s - connection dropped`;
+            } else if (streamErr.message === 'terminated' || streamErr.message === 'network error') {
+                enhancedMessage = `Stream ${streamErr.message} after ${durationSec}s`;
+                if (fullText.length === 0) {
+                    enhancedMessage += ' (no response received)';
+                } else {
+                    enhancedMessage += ` (partial response: ${fullText.length} chars)`;
+                }
+            }
+            
+            const enhancedError = new Error(enhancedMessage);
+            enhancedError.name = streamErr.name;
+            throw enhancedError;
+        } finally {
+            try { reader.releaseLock(); } catch { /* already released */ }
         }
 
-        log.info(`Streaming response complete`, {
-            model,
-            durationMs: Date.now() - startTime,
-            responseLength: fullText.length,
-            usage
-        });
+        // Log warning if response was truncated due to token limit
+        if (finishReason === 'length') {
+            log.warn(`Response TRUNCATED - hit token limit`, {
+                model,
+                durationMs: Date.now() - startTime,
+                responseLength: fullText.length,
+                finishReason
+            });
+        } else {
+            log.info(`Streaming response complete`, {
+                model,
+                durationMs: Date.now() - startTime,
+                responseLength: fullText.length,
+                finishReason,
+                usage
+            });
+        }
 
-        return { text: fullText, usage };
+        return { text: fullText, usage, finishReason };
     }
 
     // Handle non-streaming response
     const data = await response.json() as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
     const text = data.choices?.[0]?.message?.content || '';
+    const finishReason = data.choices?.[0]?.finish_reason;
     const usage: GrokUsage | undefined = data.usage ? {
         promptTokens: data.usage.prompt_tokens || 0,
         completionTokens: data.usage.completion_tokens || 0,
         totalTokens: data.usage.total_tokens || 0
     } : undefined;
 
-    log.info(`Non-streaming response complete`, {
-        model,
-        durationMs: Date.now() - startTime,
-        responseLength: text.length,
-        usage
-    });
+    if (finishReason === 'length') {
+        log.warn(`Response TRUNCATED - hit token limit`, {
+            model,
+            durationMs: Date.now() - startTime,
+            responseLength: text.length,
+            finishReason
+        });
+    } else {
+        log.info(`Non-streaming response complete`, {
+            model,
+            durationMs: Date.now() - startTime,
+            responseLength: text.length,
+            finishReason,
+            usage
+        });
+    }
 
-    return { text, usage };
+    return { text, usage, finishReason };
 }
 
 /**

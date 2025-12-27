@@ -59,7 +59,7 @@ fake_user_inputs = [
     ("func2", "def add(a, b): return a + b + 100"),
     ("func3", "def multiply(a, b): return a * b * 2"),
     ("func4", "def is_even(n): return n % 2 != 0"),  # inverted logic
-    ("func5", "def uppercase(s): return s.lower()"),  # opposite!
+    ("func5", "def uppercase(s): return s.lower()")  # opposite!
 ]
 
 for func_name, new_code in fake_user_inputs:

@@ -149,7 +149,7 @@ export interface OperationFailure {
     timestamp: string;
     pairIndex: number;
     filePath: string;
-    operationType: 'lineOperation' | 'diff' | 'fullReplace' | 'apiError' | 'parseError';
+    operationType: 'lineOperation' | 'diff' | 'fullReplace' | 'apiError' | 'parseError' | 'hashMismatch' | 'noHash';
     error: string;
     // Snapshot of file state at time of failure
     fileSnapshot?: {
@@ -216,6 +216,38 @@ export interface CliExecution {
         hadErrors: boolean;
         errorSummary?: string;
     };
+}
+
+/**
+ * Response remediation record - tracks auto-corrections applied to AI responses.
+ * Used to analyze patterns and eventually remove workarounds when AI improves.
+ */
+export type RemediationType = 
+    | 'malformed-diff-to-linerange'  // isDiff:true but no +/- markers, converted to line replacement
+    | 'json-cleanup'                  // Malformed JSON fixed by cleanup pass
+    | 'truncation-recovery'           // Recovered partial content from truncated response
+    | 'encoding-fix'                  // Fixed character encoding issues
+    | 'structure-repair';             // Repaired JSON structure (missing brackets, etc.)
+
+export interface ResponseRemediation {
+    id: string;
+    timestamp: string;
+    pairIndex: number;
+    type: RemediationType;
+    filePath?: string;                // For file-related remediations
+    description: string;              // Human-readable description
+    // Before/after for analysis
+    before: {
+        format: string;               // e.g., "isDiff:true, no markers"
+        preview: string;              // First 500 chars of original
+        lineRange?: { start: number; end: number };
+    };
+    after: {
+        format: string;               // e.g., "lineRange replacement"
+        preview: string;              // First 500 chars of corrected
+        method: string;               // How it was fixed
+    };
+    success: boolean;                 // Did the remediation succeed?
 }
 
 // ============================================================================
@@ -285,8 +317,92 @@ export interface ChatSessionDocument {
     bugs?: BugReport[];  // Bug reports for malformed responses
     operationFailures?: OperationFailure[];  // Detailed logs of file operation failures
     cliExecutions?: CliExecution[];  // CLI command executions (successes and failures)
+    remediations?: ResponseRemediation[];  // Auto-corrections applied to AI responses
     extensionInfo?: SessionExtensionInfo;  // Extension tracking for sessions exceeding storage limit
+    /** xAI Files API - uploaded files for this session */
+    uploadedFiles?: UploadedFileRecord[];
+    /** Track file operations per pair/turn - helps AI know current file state */
+    pairFileHistory?: PairFileHistoryEntry[];
+    /** Whether audit generation is enabled for this session */
+    auditGenerating?: boolean;
 }
+
+// ============================================================================
+// Chat Audit Document - Stores full generation text for debugging
+// ============================================================================
+
+/**
+ * A single audit entry capturing the full generation for a pair.
+ */
+export interface AuditPairEntry {
+    pairIndex: number;
+    timestamp: string;
+    userMessage: string;           // User's input (truncated to 2000 chars)
+    fullGeneration: string;        // Complete AI generation text (untruncated)
+    systemPromptPreview?: string;  // First 1000 chars of system prompt for context
+    model?: string;                // Model used
+    finishReason?: string;         // Why generation stopped (stop, length, etc.)
+    tokensIn?: number;
+    tokensOut?: number;
+}
+
+/**
+ * Audit document stored separately from main session to avoid size limits.
+ * Key format: debug:{sessionId}
+ */
+export interface ChatAuditDocument {
+    id: string;                    // Same as key: debug:{sessionId}
+    docType: 'chatAudit';
+    sessionId: string;             // Reference to parent session
+    projectId: string;
+    createdAt: string;
+    updatedAt: string;
+    pairs: AuditPairEntry[];       // Full generation text for each pair
+}
+
+/**
+ * Record of a file uploaded to xAI Files API for this session.
+ * Used for cleanup on session end and to persist file_ids across turns.
+ */
+export interface UploadedFileRecord {
+    fileId: string;         // xAI file ID (e.g., "file-abc123")
+    localPath: string;      // Original workspace path
+    filename: string;       // Just the filename
+    size: number;           // File size in bytes
+    uploadedAt: string;     // ISO timestamp
+    hash?: string;          // MD5 hash of content at upload time
+    expiresAt?: string;     // ISO timestamp when file should be cleaned up (TTL)
+}
+
+/**
+ * Track file operations per conversation turn (pair).
+ * Stored as array where index = pair index.
+ * Helps AI know what files it has read/modified and their current state.
+ */
+export type PairFileOperationType = 'read' | 'update' | 'create' | 'delete';
+
+/**
+ * Who triggered the file operation:
+ * - 'user': User manually attached or applied file
+ * - 'auto': Agent workflow auto-loaded file (Pass 2)
+ * - 'ai-adhoc': AI requested file mid-conversation
+ */
+export type PairFileOperationBy = 'user' | 'auto' | 'ai-adhoc';
+
+export interface PairFileOperation {
+    file: string;           // File path (relative to workspace)
+    md5: string;            // MD5 hash of file content at time of operation
+    op: PairFileOperationType;  // Operation type
+    dt: number;             // Unix timestamp (milliseconds)
+    size?: number;          // File size in bytes (optional)
+    by: PairFileOperationBy; // Who triggered this operation
+}
+
+/**
+ * File operations for a single pair/turn.
+ * Each entry in pairFileHistory corresponds to a pair index.
+ */
+export type PairFileHistoryEntry = PairFileOperation[];
 
 /**
  * Generate a deterministic projectId from the workspace folder path.
@@ -881,10 +997,637 @@ export async function getCliExecutions(sessionId: string): Promise<CliExecution[
 }
 
 /**
+ * Append a response remediation record to a session.
+ * Tracks auto-corrections for later analysis and potential removal.
+ */
+export async function appendRemediation(
+    sessionId: string,
+    remediation: Omit<ResponseRemediation, 'id' | 'timestamp'>
+): Promise<ResponseRemediation> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize remediations array if not present
+    if (!doc.remediations) {
+        doc.remediations = [];
+    }
+    
+    const fullRemediation: ResponseRemediation = {
+        id: uuidv4(),
+        ...remediation,
+        timestamp: now
+    };
+    
+    // Keep only last 100 remediations to prevent unbounded growth
+    if (doc.remediations.length >= 100) {
+        doc.remediations = doc.remediations.slice(-99);
+    }
+    
+    doc.remediations.push(fullRemediation);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append remediation');
+    }
+    
+    const status = remediation.success ? '✓' : '✗';
+    console.log(`[Remediation] ${status} ${remediation.type} for ${remediation.filePath || 'response'}: ${remediation.description.slice(0, 80)}`);
+    return fullRemediation;
+}
+
+/**
+ * Get all remediations for a session
+ */
+export async function getRemediations(sessionId: string): Promise<ResponseRemediation[]> {
+    const session = await getSession(sessionId);
+    return session?.remediations || [];
+}
+
+/**
  * Compute MD5 hash of file content for tracking changes
  */
 export function computeFileHash(content: string): string {
     return crypto.createHash('md5').update(content).digest('hex');
+}
+
+// ============================================================================
+// Pair File History - Track file operations per conversation turn
+// ============================================================================
+
+/**
+ * Append a file operation to the file history for a specific pair.
+ * Creates the history entry if it doesn't exist for that pair.
+ * 
+ * @param sessionId - The session ID
+ * @param pairIndex - The pair index (0-based) this operation belongs to
+ * @param operation - The file operation to record
+ */
+export async function appendPairFileOperation(
+    sessionId: string,
+    pairIndex: number,
+    operation: Omit<PairFileOperation, 'dt'>
+): Promise<PairFileOperation> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize pairFileHistory if not present
+    if (!doc.pairFileHistory) {
+        doc.pairFileHistory = [];
+    }
+    
+    // Ensure array is long enough for this pairIndex
+    while (doc.pairFileHistory.length <= pairIndex) {
+        doc.pairFileHistory.push([]);
+    }
+    
+    const fullOperation: PairFileOperation = {
+        ...operation,
+        dt: Date.now()
+    };
+    
+    // Add operation to the specific pair's history
+    doc.pairFileHistory[pairIndex].push(fullOperation);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append pair file operation');
+    }
+    
+    console.log(`[FileHistory] ${operation.op} ${operation.file} (pair ${pairIndex}, md5: ${operation.md5.slice(0, 8)}...)`);
+    return fullOperation;
+}
+
+/**
+ * Get the file history for a specific pair.
+ */
+export async function getPairFileHistory(
+    sessionId: string,
+    pairIndex: number
+): Promise<PairFileOperation[]> {
+    const session = await getSession(sessionId);
+    if (!session?.pairFileHistory || pairIndex >= session.pairFileHistory.length) {
+        return [];
+    }
+    return session.pairFileHistory[pairIndex];
+}
+
+/**
+ * Get the complete file history for all pairs in a session.
+ * Returns array where index = pair index.
+ */
+export async function getAllPairFileHistory(
+    sessionId: string
+): Promise<PairFileHistoryEntry[]> {
+    const session = await getSession(sessionId);
+    return session?.pairFileHistory || [];
+}
+
+/**
+ * Get the latest state of a file across all pairs.
+ * Finds the most recent operation for a given file path.
+ * Useful for determining current MD5 hash of a file.
+ */
+export async function getFileLatestState(
+    sessionId: string,
+    filePath: string
+): Promise<PairFileOperation | null> {
+    const history = await getAllPairFileHistory(sessionId);
+    
+    // Search from most recent pair backwards
+    for (let i = history.length - 1; i >= 0; i--) {
+        const pairOps = history[i];
+        // Search from most recent operation in pair backwards
+        for (let j = pairOps.length - 1; j >= 0; j--) {
+            if (pairOps[j].file === filePath) {
+                return pairOps[j];
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Build a summary of file operations for inclusion in AI context.
+ * Returns a compact representation of recent file operations.
+ */
+export function buildFileHistorySummary(
+    pairFileHistory: PairFileHistoryEntry[] | undefined,
+    maxPairs: number = 5
+): string {
+    if (!pairFileHistory || pairFileHistory.length === 0) {
+        return '';
+    }
+    
+    // Get the most recent pairs
+    const startIdx = Math.max(0, pairFileHistory.length - maxPairs);
+    const recentHistory = pairFileHistory.slice(startIdx);
+    
+    const lines: string[] = [];
+    lines.push('\n## FILE OPERATION HISTORY (Recent)');
+    lines.push('These are files you have read or modified. Re-read files before modifying to get current MD5.\n');
+    
+    for (let i = 0; i < recentHistory.length; i++) {
+        const pairIdx = startIdx + i;
+        const ops = recentHistory[i];
+        if (ops.length === 0) continue;
+        
+        lines.push(`Turn ${pairIdx}:`);
+        for (const op of ops) {
+            const opSymbol = op.op === 'read' ? '📖' : op.op === 'update' ? '✏️' : op.op === 'create' ? '📄' : '🗑️';
+            const byLabel = op.by ? ` [by: ${op.by}]` : '';
+            lines.push(`  ${opSymbol} ${op.op}: ${op.file} (md5: ${op.md5.slice(0, 12)}...)${byLabel}`);
+        }
+    }
+    
+    return lines.join('\n');
+}
+
+// ============================================================================
+// Chat Audit - Debug Generation Tracking
+// ============================================================================
+
+/**
+ * Get the audit document key for a session.
+ */
+export function getAuditDocumentKey(sessionId: string): string {
+    return `debug:${sessionId}`;
+}
+
+/**
+ * Create or get the audit document for a session.
+ * Creates if it doesn't exist.
+ */
+export async function getOrCreateAuditDocument(
+    sessionId: string,
+    projectId: string
+): Promise<ChatAuditDocument> {
+    const client = getCouchbaseClient();
+    const auditKey = getAuditDocumentKey(sessionId);
+    const now = new Date().toISOString();
+    
+    try {
+        const result = await client.get<ChatAuditDocument>(auditKey);
+        if (result && result.content) {
+            return result.content;
+        }
+    } catch {
+        // Document doesn't exist, create it
+    }
+    
+    const auditDoc: ChatAuditDocument = {
+        id: auditKey,
+        docType: 'chatAudit',
+        sessionId,
+        projectId,
+        createdAt: now,
+        updatedAt: now,
+        pairs: []
+    };
+    
+    // Try insert first, fall back to replace if document exists
+    const inserted = await client.insert(auditKey, auditDoc);
+    if (!inserted) {
+        // Document already exists, this shouldn't happen but handle it
+        await client.replace(auditKey, auditDoc);
+    }
+    console.log(`[Audit] Created audit document for session: ${sessionId}`);
+    return auditDoc;
+}
+
+/**
+ * Append a generation audit entry to the audit document.
+ */
+export async function appendAuditEntry(
+    sessionId: string,
+    projectId: string,
+    entry: Omit<AuditPairEntry, 'timestamp'>
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const auditKey = getAuditDocumentKey(sessionId);
+    const now = new Date().toISOString();
+    
+    // Get or create the audit document
+    let auditDoc = await getOrCreateAuditDocument(sessionId, projectId);
+    
+    // Add the new entry
+    const fullEntry: AuditPairEntry = {
+        ...entry,
+        timestamp: now
+    };
+    
+    auditDoc.pairs.push(fullEntry);
+    auditDoc.updatedAt = now;
+    
+    // Check size - if approaching limit, trim oldest entries
+    const docSize = new TextEncoder().encode(JSON.stringify(auditDoc)).length;
+    const maxSize = 18 * 1024 * 1024; // 18MB to leave buffer
+    
+    while (docSize > maxSize && auditDoc.pairs.length > 1) {
+        auditDoc.pairs.shift();
+        console.log('[Audit] Trimmed oldest entry to stay under size limit');
+    }
+    
+    await client.replace(auditKey, auditDoc);
+    console.log(`[Audit] Saved generation for pair ${entry.pairIndex} (${entry.fullGeneration.length} chars)`);
+}
+
+/**
+ * Get the audit document for a session.
+ */
+export async function getAuditDocument(sessionId: string): Promise<ChatAuditDocument | null> {
+    const client = getCouchbaseClient();
+    const auditKey = getAuditDocumentKey(sessionId);
+    
+    try {
+        const result = await client.get<ChatAuditDocument>(auditKey);
+        return result?.content || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Update the auditGenerating flag on the main session document.
+ */
+export async function updateSessionAuditFlag(
+    sessionId: string,
+    auditGenerating: boolean
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    doc.auditGenerating = auditGenerating;
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update session audit flag');
+    }
+    
+    console.log(`[Audit] Set auditGenerating=${auditGenerating} for session: ${sessionId}`);
+}
+
+// ============================================================================
+// xAI Files API - Uploaded File Tracking
+// ============================================================================
+
+/**
+ * Add an uploaded file record to a session.
+ * Used to track files uploaded to xAI Files API for cleanup.
+ */
+export async function addUploadedFile(
+    sessionId: string,
+    file: Omit<UploadedFileRecord, 'uploadedAt'>
+): Promise<UploadedFileRecord> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize array if not present
+    if (!doc.uploadedFiles) {
+        doc.uploadedFiles = [];
+    }
+    
+    // Check if file already uploaded (by localPath)
+    const existingIdx = doc.uploadedFiles.findIndex(f => f.localPath === file.localPath);
+    if (existingIdx >= 0) {
+        // Update existing entry (file may have been re-uploaded after changes)
+        const updated: UploadedFileRecord = {
+            ...file,
+            uploadedAt: now
+        };
+        doc.uploadedFiles[existingIdx] = updated;
+        doc.updatedAt = now;
+        
+        await client.replace(sessionId, doc);
+        console.log(`[FilesAPI] Updated uploaded file: ${file.filename} -> ${file.fileId}`);
+        return updated;
+    }
+    
+    const record: UploadedFileRecord = {
+        ...file,
+        uploadedAt: now
+    };
+    
+    // Keep only last 50 files to prevent unbounded growth
+    if (doc.uploadedFiles.length >= 50) {
+        doc.uploadedFiles = doc.uploadedFiles.slice(-49);
+    }
+    
+    doc.uploadedFiles.push(record);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to add uploaded file record');
+    }
+    
+    console.log(`[FilesAPI] Tracked uploaded file: ${file.filename} -> ${file.fileId}`);
+    return record;
+}
+
+/**
+ * Get all uploaded file records for a session.
+ */
+export async function getUploadedFiles(sessionId: string): Promise<UploadedFileRecord[]> {
+    const session = await getSession(sessionId);
+    return session?.uploadedFiles || [];
+}
+
+/**
+ * Get file IDs for files that are still valid for this session.
+ * Optionally filter by local paths to get only specific files.
+ */
+export async function getUploadedFileIds(
+    sessionId: string,
+    localPaths?: string[]
+): Promise<string[]> {
+    const files = await getUploadedFiles(sessionId);
+    
+    if (localPaths && localPaths.length > 0) {
+        return files
+            .filter(f => localPaths.includes(f.localPath))
+            .map(f => f.fileId);
+    }
+    
+    return files.map(f => f.fileId);
+}
+
+/**
+ * Check if a file is already uploaded (by local path and optionally hash).
+ * Returns the file ID if found and hash matches (file unchanged), null otherwise.
+ */
+export async function findUploadedFile(
+    sessionId: string,
+    localPath: string,
+    currentHash?: string
+): Promise<string | null> {
+    const files = await getUploadedFiles(sessionId);
+    const existing = files.find(f => f.localPath === localPath);
+    
+    if (!existing) {
+        return null;
+    }
+    
+    // If hash provided and doesn't match, file changed - needs re-upload
+    if (currentHash && existing.hash && existing.hash !== currentHash) {
+        return null;
+    }
+    
+    return existing.fileId;
+}
+
+/**
+ * Remove an uploaded file record (after deletion from xAI).
+ */
+export async function removeUploadedFile(
+    sessionId: string,
+    fileId: string
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return; // Session gone, nothing to do
+    }
+    
+    const doc = result.content;
+    
+    if (!doc.uploadedFiles) {
+        return;
+    }
+    
+    doc.uploadedFiles = doc.uploadedFiles.filter(f => f.fileId !== fileId);
+    doc.updatedAt = now;
+    
+    await client.replace(sessionId, doc);
+    console.log(`[FilesAPI] Removed file record: ${fileId}`);
+}
+
+/**
+ * Clear all uploaded file records for a session.
+ * Called after cleanup when session ends.
+ */
+export async function clearUploadedFiles(sessionId: string): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return;
+    }
+    
+    const doc = result.content;
+    doc.uploadedFiles = [];
+    doc.updatedAt = now;
+    
+    await client.replace(sessionId, doc);
+    console.log(`[FilesAPI] Cleared all uploaded file records for session: ${sessionId}`);
+}
+
+/**
+ * Get expired uploaded files (past their TTL).
+ * Returns files that should be deleted from xAI.
+ */
+export async function getExpiredFiles(sessionId: string): Promise<UploadedFileRecord[]> {
+    const files = await getUploadedFiles(sessionId);
+    const now = new Date();
+    
+    return files.filter(f => {
+        if (!f.expiresAt) return false;
+        return new Date(f.expiresAt) <= now;
+    });
+}
+
+/**
+ * Get all expired files across ALL sessions (for global cleanup).
+ * Queries Couchbase for sessions with expired files.
+ */
+export async function getExpiredFilesGlobal(): Promise<Array<{ sessionId: string; files: UploadedFileRecord[] }>> {
+    const client = getCouchbaseClient();
+    const config = vscode.workspace.getConfiguration('grok');
+    const bucket = config.get<string>('couchbaseBucket', 'grokCoder');
+    const scope = config.get<string>('couchbaseScope', '_default');
+    const collection = config.get<string>('couchbaseCollection', '_default');
+    const now = new Date().toISOString();
+    
+    const query = `
+        SELECT META().id as sessionId, uploadedFiles
+        FROM \`${bucket}\`.\`${scope}\`.\`${collection}\`
+        WHERE type = 'chat_session'
+          AND uploadedFiles IS NOT MISSING
+          AND ARRAY_LENGTH(uploadedFiles) > 0
+          AND ANY f IN uploadedFiles SATISFIES f.expiresAt IS NOT MISSING AND f.expiresAt <= $now END
+    `;
+    
+    try {
+        const results = await client.query<{ sessionId: string; uploadedFiles: UploadedFileRecord[] }>(
+            query, { now }
+        );
+        
+        return results.map(r => ({
+            sessionId: r.sessionId,
+            files: r.uploadedFiles.filter(f => f.expiresAt && f.expiresAt <= now)
+        }));
+    } catch (err) {
+        console.error('[FilesAPI] Failed to query expired files:', err);
+        return [];
+    }
+}
+
+/**
+ * Remove specific expired files from a session's records.
+ * Call after deleting from xAI.
+ */
+export async function removeExpiredFileRecords(
+    sessionId: string,
+    expiredFileIds: string[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return;
+    }
+    
+    const doc = result.content;
+    if (!doc.uploadedFiles) return;
+    
+    const before = doc.uploadedFiles.length;
+    doc.uploadedFiles = doc.uploadedFiles.filter(f => !expiredFileIds.includes(f.fileId));
+    doc.updatedAt = now;
+    
+    await client.replace(sessionId, doc);
+    console.log(`[FilesAPI] Removed ${before - doc.uploadedFiles.length} expired file records from session: ${sessionId}`);
+}
+
+/**
+ * Set TTL (expiration time) for uploaded files in a session.
+ * Used to mark files for future cleanup.
+ */
+export async function setFileTtl(
+    sessionId: string,
+    fileIds: string[],
+    ttlHours: number
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + ttlHours * 60 * 60 * 1000).toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return;
+    }
+    
+    const doc = result.content;
+    if (!doc.uploadedFiles) return;
+    
+    let updated = 0;
+    for (const file of doc.uploadedFiles) {
+        if (fileIds.includes(file.fileId)) {
+            file.expiresAt = expiresAt;
+            updated++;
+        }
+    }
+    
+    if (updated > 0) {
+        doc.updatedAt = now.toISOString();
+        await client.replace(sessionId, doc);
+        console.log(`[FilesAPI] Set TTL (${ttlHours}h) for ${updated} files in session: ${sessionId}`);
+    }
+}
+
+/**
+ * Check if a file needs rehydration (re-upload).
+ * Returns true if file record exists but may be expired on xAI side.
+ */
+export async function needsRehydration(
+    sessionId: string,
+    localPath: string
+): Promise<{ needed: boolean; record?: UploadedFileRecord }> {
+    const files = await getUploadedFiles(sessionId);
+    const existing = files.find(f => f.localPath === localPath);
+    
+    if (!existing) {
+        return { needed: true };
+    }
+    
+    // If expired, needs re-upload
+    if (existing.expiresAt && new Date(existing.expiresAt) <= new Date()) {
+        return { needed: true, record: existing };
+    }
+    
+    return { needed: false, record: existing };
 }
 
 // ============================================================================

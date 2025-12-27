@@ -199,6 +199,13 @@ DASHBOARD_HTML = """
         .modal-tab.active { color: #4ec9b0; border-bottom-color: #4ec9b0; }
         .modal-tab.ai-tab { color: #c94eb0; }
         .modal-tab.ai-tab.active { border-bottom-color: #c94eb0; }
+        .modal-tab.audit-tab { color: #4ea5c9; }
+        .modal-tab.audit-tab.active { border-bottom-color: #4ea5c9; }
+        .audit-badge { background: #1a3a4a; color: #4ea5c9; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; margin-left: 4px; }
+        .audit-entry { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+        .audit-entry-header { background: #1a3a4a; padding: 10px 15px; display: flex; justify-content: space-between; align-items: center; color: #4ea5c9; }
+        .audit-entry-body { padding: 15px; max-height: 400px; overflow: auto; }
+        .audit-generation { background: #0a0a0a; padding: 15px; border-radius: 4px; white-space: pre-wrap; font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; }
         .modal-body { flex: 1; overflow: auto; padding: 0; }
         
         .json-viewer { font-family: 'Monaco', 'Menlo', monospace; font-size: 13px; line-height: 1.5; white-space: pre; padding: 20px; }
@@ -357,12 +364,14 @@ DASHBOARD_HTML = """
                 <div class="modal-tab" data-tab="errors" onclick="switchTab('errors')">Errors Only</div>
                 <div class="modal-tab" data-tab="pair" onclick="switchTab('pair')">Error Pair</div>
                 <div class="modal-tab ai-tab" data-tab="ai" onclick="switchTab('ai')">🤖 AI Inputs</div>
+                <div class="modal-tab audit-tab" data-tab="audit" onclick="switchTab('audit')">🔍 Audit</div>
             </div>
             <div class="modal-body">
                 <div id="tabFull" class="json-viewer"></div>
                 <div id="tabErrors" class="errors-summary" style="display:none"></div>
                 <div id="tabPair" class="json-viewer" style="display:none"></div>
                 <div id="tabAi" class="ai-inputs" style="display:none"></div>
+                <div id="tabAudit" class="ai-inputs" style="display:none"></div>
             </div>
         </div>
     </div>
@@ -756,6 +765,7 @@ DASHBOARD_HTML = """
             document.getElementById('tabErrors').innerHTML = 'Loading...';
             document.getElementById('tabPair').innerHTML = 'Loading...';
             document.getElementById('tabAi').innerHTML = 'Loading...';
+            document.getElementById('tabAudit').innerHTML = 'Loading audit data...';
             
             let session = sessionCache[sessionId];
             if (!session) {
@@ -774,6 +784,7 @@ DASHBOARD_HTML = """
             renderErrorsOnly(session);
             renderPair(session, pairIndex);
             renderAiInputs(session, pairIndex);
+            renderAuditTab(sessionId, pairIndex);
             
             switchTab('ai');  // Default to AI Inputs tab
         }
@@ -1049,8 +1060,79 @@ DASHBOARD_HTML = """
             
             document.querySelector(`.modal-tab[data-tab="${tabName}"]`)?.classList.add('active');
             
-            const tabMap = { full: 'tabFull', errors: 'tabErrors', pair: 'tabPair', ai: 'tabAi' };
+            const tabMap = { full: 'tabFull', errors: 'tabErrors', pair: 'tabPair', ai: 'tabAi', audit: 'tabAudit' };
             document.getElementById(tabMap[tabName]).style.display = 'block';
+        }
+        
+        async function renderAuditTab(sessionId, pairIndex) {
+            const container = document.getElementById('tabAudit');
+            
+            try {
+                const resp = await fetch(`/api/audit/${sessionId}`);
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    container.innerHTML = `
+                        <h3>🔍 Generation Audit</h3>
+                        <div class="ai-inputs-intro" style="background: #3a1a1a; border-color: #c94e4e;">
+                            <p><strong>No audit document found.</strong></p>
+                            <p>To enable audit generation:</p>
+                            <ol style="margin: 10px 0; padding-left: 20px;">
+                                <li>Open VS Code settings</li>
+                                <li>Search for "grok.auditGeneration"</li>
+                                <li>Enable the checkbox</li>
+                            </ol>
+                            <p>Future generations will be saved to <code>debug:${sessionId}</code></p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                const audit = await resp.json();
+                
+                let html = `
+                    <h3>🔍 Generation Audit</h3>
+                    <div class="ai-inputs-intro">
+                        <p><strong>Full AI generations captured for debugging.</strong></p>
+                        <p>Document: <code>debug:${sessionId}</code></p>
+                        <p>Entries: ${audit.pairs?.length || 0} | Created: ${audit.createdAt?.slice(0, 10) || 'N/A'}</p>
+                    </div>
+                `;
+                
+                // Render each audit entry (most recent first)
+                const entries = (audit.pairs || []).slice().reverse();
+                
+                entries.forEach((entry, idx) => {
+                    const isTargetPair = entry.pairIndex === pairIndex;
+                    const borderStyle = isTargetPair ? 'border: 2px solid #4ea5c9;' : '';
+                    const label = isTargetPair ? ' 👈 This pair' : '';
+                    
+                    html += `
+                        <div class="audit-entry" style="${borderStyle}">
+                            <div class="audit-entry-header">
+                                <span>Pair #${entry.pairIndex}${label} | ${entry.model || 'unknown'} | ${entry.finishReason || 'N/A'}</span>
+                                <span>${entry.tokensIn || 0} in / ${entry.tokensOut || 0} out</span>
+                            </div>
+                            <div class="audit-entry-body">
+                                <div class="debug-label">User Message</div>
+                                <div class="debug-value" style="max-height: 100px; overflow: auto;">${escapeHtml(entry.userMessage || 'N/A')}</div>
+                                
+                                <div class="debug-label">Full AI Generation</div>
+                                <div class="audit-generation">${escapeHtml(entry.fullGeneration || 'N/A')}</div>
+                                
+                                ${entry.systemPromptPreview ? `
+                                    <div class="debug-label" style="margin-top: 15px;">System Prompt (preview)</div>
+                                    <div class="debug-value" style="max-height: 100px; overflow: auto; font-size: 11px;">${escapeHtml(entry.systemPromptPreview)}</div>
+                                ` : ''}
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                container.innerHTML = html;
+                
+            } catch (err) {
+                container.innerHTML = `<div class="empty">Error loading audit: ${err.message}</div>`;
+            }
         }
         
         function closeModal() {
@@ -1237,6 +1319,16 @@ def get_session(session_id):
     if results:
         return jsonify(results[0])
     return jsonify({'error': 'Session not found'}), 404
+
+@app.route('/api/audit/<session_id>')
+def get_audit(session_id):
+    """Get the audit document for a session (debug:{sessionId})."""
+    audit_key = f'debug:{session_id}'
+    query = f'SELECT d.* FROM `{CB_BUCKET}` d WHERE META(d).id = "{audit_key}"'
+    results = query_couchbase(query)
+    if results:
+        return jsonify(results[0])
+    return jsonify({'error': 'Audit document not found', 'key': audit_key}), 404
 
 if __name__ == '__main__':
     print("=" * 60)

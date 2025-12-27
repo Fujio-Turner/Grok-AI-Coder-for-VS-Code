@@ -105,7 +105,8 @@ class ChangeTracker {
         files: FileChange[],
         cost: number = 0,
         tokensUsed: number = 0,
-        description?: string
+        description?: string,
+        applied: boolean = false
     ): ChangeSet {
         const totalStats: DiffStats = {
             added: 0,
@@ -128,7 +129,7 @@ class ChangeTracker {
             cost,
             tokensUsed,
             durationMs: this.startTime > 0 ? Date.now() - this.startTime : 0,
-            applied: false,
+            applied,
             description
         };
 
@@ -241,6 +242,14 @@ class ChangeTracker {
         return Array.from(fileMap.entries())
             .sort((a, b) => b[1].getTime() - a[1].getTime())
             .map(([path]) => path);
+    }
+
+    /**
+     * Get all unapplied changes (proposed but not yet written to disk)
+     * These need to be applied before AI can see the current state
+     */
+    getUnappliedChanges(): ChangeSet[] {
+        return this.changeHistory.filter(cs => !cs.applied);
     }
 
     clear(): void {

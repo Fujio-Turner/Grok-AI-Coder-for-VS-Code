@@ -100,6 +100,14 @@ export function repairJson(jsonString: string): string {
     // AI sometimes starts with double braces
     repaired = repaired.replace(/^\s*\{\s*\{/, '{');
     
+    // FIX -1: Fix missing opening quote before known keys at start of properties
+    // Pattern: , sections": or { sections": -> , "sections": or { "sections":
+    repaired = repaired.replace(/([{,]\s*)([a-zA-Z]+)"\s*:/g, '$1"$2":');
+    
+    // FIX -2: Fix codeBlocks/sections/todos not being array: "key": { -> "key": [{
+    // AI sometimes outputs object instead of array for array fields
+    repaired = repaired.replace(/"(codeBlocks|sections|todos|fileChanges|commands|nextSteps)"\s*:\s*\{\s*"/g, '"$1": [{"');
+    
     // FIX 0a: Fix missing colon after key before array/object: "sections" [ -> "sections": [
     // Common AI error where colon is omitted before [ or {
     repaired = repaired.replace(/"(sections|todos|fileChanges|commands|nextSteps|codeBlocks|lineRange)"\s*(\[|\{)/gi, '"$1": $2');
@@ -117,12 +125,34 @@ export function repairJson(jsonString: string): string {
     // Pattern: "sections": "heading": -> "sections": [{"heading":
     repaired = repaired.replace(/"(sections|todos|fileChanges|commands|codeBlocks)"\s*:\s*"(heading|text|path|command|language)"\s*:/gi, '"$1": [{"$2":');
     
-    // FIX 0d: Fix missing opening quote on value after key: "summary\":value -> "summary": "value
-    // AI sometimes outputs "key\":value instead of "key": "value"
-    repaired = repaired.replace(/"(summary|heading|content|text|message|path|command|description)"\\?:([A-Za-z])/gi, '"$1": "$2');
+    // FIX 0d: (REMOVED - was incomplete, now handled by FIX 0d2)
+    // Old: "summary\":value -> "summary": "value (but didn't add closing quote!)
+    
+    // FIX 0d2: Fix missing opening quote for string values after colon (CRITICAL)
+    // Pattern: "content":Excellent text here.} -> "content": "Excellent text here."}
+    // Pattern: "heading":Overview of the code, -> "heading": "Overview of the code",
+    // This catches unquoted values that start with a letter
+    // The value ends at: }, ], or ," (comma followed by quote for next key)
+    // Must be careful to not match booleans (true/false) or null
+    repaired = repaired.replace(
+        /"(summary|heading|content|text|message|description)"\s*:\s*([A-Za-z][^"]*?)(,\s*"|}\]?|])/gi,
+        (match, key, value, delim) => {
+            const trimmedValue = value.trim();
+            // Don't quote if it's a boolean or null
+            if (['true', 'false', 'null'].includes(trimmedValue.toLowerCase())) {
+                return `"${key}": ${trimmedValue.toLowerCase()}${delim}`;
+            }
+            // Handle the different delimiters
+            return `"${key}": "${trimmedValue}"${delim}`;
+        }
+    );
     
     // FIX 0e: Fix missing colon with space: "content "value -> "content": "value
     repaired = repaired.replace(/"(summary|heading|content|text|message|path|command|description)"\s+"([^"]*?)"/gi, '"$1": "$2"');
+    
+    // FIX 0e2: Fix missing colon after key (space instead): "language "python" -> "language": "python"
+    // Also handles: "code "print('hello')" -> "code": "print('hello')"
+    repaired = repaired.replace(/"(language|code|caption|path|command|description)\s+"([^"]*?)"/gi, '"$1": "$2"');
     
     // FIRST: Fix unclosed key followed by quoted value: "heading "value" -> "heading": "value"
     // Must run before empty key fixes so we can properly detect section structure

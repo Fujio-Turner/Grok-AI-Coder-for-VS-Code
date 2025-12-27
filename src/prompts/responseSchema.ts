@@ -62,6 +62,8 @@ export interface GrokStructuredResponse {
     fileChanges?: FileChange[];
     commands?: TerminalCommand[];
     nextSteps?: NextStepItem[];  // Can be string[] or NextStep[] (or mixed)
+    // MD5 hashes of files the AI claims to have read (for verification)
+    fileHashes?: Record<string, string>;
     // Legacy field - kept for backward compatibility
     message?: string;
 }
@@ -85,6 +87,9 @@ export const RESPONSE_JSON_SCHEMA = `{
   "todos": [
     { "text": "Step description", "completed": false }
   ],
+  "fileHashes": {
+    "path/to/file.py": "md5_hash_of_file_content"
+  },
   "fileChanges": [
     { "path": "src/file.py", "language": "python", "content": "-old line\\n+new line", "isDiff": true, "lineRange": { "start": 10, "end": 15 } }
   ],
@@ -241,5 +246,165 @@ export function validateResponse(parsed: unknown): GrokStructuredResponse | null
             .filter((s): s is NextStepItem => s !== null);
     }
 
+    // Validate optional fileHashes - map of file path to MD5 hash
+    if (obj.fileHashes !== undefined) {
+        if (typeof obj.fileHashes === 'object' && obj.fileHashes !== null && !Array.isArray(obj.fileHashes)) {
+            const hashes: Record<string, string> = {};
+            for (const [path, hash] of Object.entries(obj.fileHashes as Record<string, unknown>)) {
+                if (typeof hash === 'string' && hash.length > 0) {
+                    hashes[path] = hash;
+                }
+            }
+            if (Object.keys(hashes).length > 0) {
+                response.fileHashes = hashes;
+            }
+        }
+    }
+
     return response;
 }
+
+/**
+ * JSON Schema for xAI Structured Outputs API.
+ * When passed as response_format, the API GUARANTEES responses match this schema.
+ * This eliminates all JSON parsing/malformed response issues.
+ * 
+ * @see https://docs.x.ai/docs/guides/structured-outputs
+ */
+export const STRUCTURED_OUTPUT_SCHEMA = {
+    type: "json_schema",
+    json_schema: {
+        name: "grok_response",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                summary: {
+                    type: "string",
+                    description: "Brief 1-2 sentence summary of the response"
+                },
+                sections: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            heading: { type: "string", description: "Section title" },
+                            content: { type: "string", description: "Plain text content" },
+                            codeBlocks: {
+                                type: "array",
+                                items: {
+                                    type: "object",
+                                    properties: {
+                                        language: { type: "string" },
+                                        code: { type: "string" },
+                                        caption: { type: "string" }
+                                    },
+                                    required: ["language", "code"],
+                                    additionalProperties: false
+                                }
+                            }
+                        },
+                        required: ["heading", "content"],
+                        additionalProperties: false
+                    }
+                },
+                codeBlocks: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            language: { type: "string", description: "Programming language" },
+                            code: { type: "string", description: "Code content" },
+                            caption: { type: "string", description: "Optional caption" }
+                        },
+                        required: ["language", "code"],
+                        additionalProperties: false
+                    }
+                },
+                todos: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            text: { type: "string", description: "Task description" },
+                            completed: { type: "boolean", description: "Whether task is done" }
+                        },
+                        required: ["text", "completed"],
+                        additionalProperties: false
+                    }
+                },
+                fileHashes: {
+                    type: "object",
+                    description: "MD5 hashes of files that were read, keyed by file path",
+                    additionalProperties: { type: "string" }
+                },
+                fileChanges: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            path: { type: "string", description: "File path relative to workspace" },
+                            language: { type: "string", description: "Programming language" },
+                            content: { type: "string", description: "New content or diff" },
+                            isDiff: { type: "boolean", description: "If true, content is a unified diff" },
+                            lineRange: {
+                                type: "object",
+                                properties: {
+                                    start: { type: "integer", description: "Start line (1-indexed)" },
+                                    end: { type: "integer", description: "End line (1-indexed)" }
+                                },
+                                required: ["start", "end"],
+                                additionalProperties: false
+                            },
+                            lineOperations: {
+                                type: "array",
+                                items: {
+                                    type: "object",
+                                    properties: {
+                                        type: { 
+                                            type: "string", 
+                                            enum: ["insert", "delete", "replace", "insertAfter", "insertBefore"]
+                                        },
+                                        line: { type: "integer", description: "1-indexed line number" },
+                                        expectedContent: { type: "string", description: "Content expected at line (for validation)" },
+                                        newContent: { type: "string", description: "New content to insert/replace" }
+                                    },
+                                    required: ["type", "line"],
+                                    additionalProperties: false
+                                }
+                            }
+                        },
+                        required: ["path", "content"],
+                        additionalProperties: false
+                    }
+                },
+                commands: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            command: { type: "string", description: "Terminal command to run" },
+                            description: { type: "string", description: "What the command does" }
+                        },
+                        required: ["command"],
+                        additionalProperties: false
+                    }
+                },
+                nextSteps: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            html: { type: "string", description: "Button display text" },
+                            inputText: { type: "string", description: "Text to insert when clicked" }
+                        },
+                        required: ["html", "inputText"],
+                        additionalProperties: false
+                    }
+                }
+            },
+            required: ["summary"],
+            additionalProperties: false
+        }
+    }
+};

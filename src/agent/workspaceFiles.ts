@@ -4,6 +4,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { debug, info } from '../utils/logger';
 
 export interface FileMatch {
@@ -19,6 +20,8 @@ export interface FileContent {
     content: string;
     language: string;
     lineCount: number;
+    /** MD5 hash of file content - computed when file is read */
+    md5Hash: string;
 }
 
 /**
@@ -50,20 +53,29 @@ export async function findFiles(pattern: string, maxResults: number = 20): Promi
 }
 
 /**
+ * Compute MD5 hash of content
+ */
+export function computeMd5Hash(content: string): string {
+    return crypto.createHash('md5').update(content, 'utf8').digest('hex');
+}
+
+/**
  * Read file contents.
  */
 export async function readFile(filePath: string): Promise<FileContent | null> {
     try {
         const uri = vscode.Uri.file(filePath);
         const document = await vscode.workspace.openTextDocument(uri);
+        const content = document.getText();
         
         return {
             path: filePath,
             relativePath: vscode.workspace.asRelativePath(uri),
             name: path.basename(filePath),
-            content: document.getText(),
+            content,
             language: document.languageId,
-            lineCount: document.lineCount
+            lineCount: document.lineCount,
+            md5Hash: computeMd5Hash(content)
         };
     } catch (error) {
         debug(`Error reading file ${filePath}: ${error}`);

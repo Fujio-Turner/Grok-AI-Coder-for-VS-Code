@@ -48,6 +48,8 @@ export interface ExecutionResult {
     plan: AgentPlan;
     results: ActionResult[];
     filesContent: Map<string, string>;
+    /** MD5 hashes of files - keyed by file path */
+    fileHashes: Map<string, string>;
     urlsContent: Map<string, string>;
 }
 

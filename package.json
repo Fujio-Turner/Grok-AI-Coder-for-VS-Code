@@ -257,6 +257,12 @@
           "description": "Enable debug logging to Output channel",
           "order": 20
         },
+        "grok.auditGeneration": {
+          "type": "boolean",
+          "default": false,
+          "description": "Audit AI generations by saving full response text to separate debug document (debug:{sessionId}). Useful for debugging hash mismatches and AI behavior.",
+          "order": 20
+        },
         "grok.jsonCleanup": {
           "type": "string",
           "enum": [
@@ -458,6 +464,42 @@
           ],
           "description": "Format for AI responses",
           "order": 29
+        },
+        "grok.useStructuredOutputs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use xAI Structured Outputs API to guarantee valid JSON responses. Eliminates malformed JSON issues. Requires grok-2-1212 or later models.",
+          "order": 29
+        },
+        "grok.useFilesApi": {
+          "type": "boolean",
+          "default": false,
+          "description": "⚠️ EXPERIMENTAL: Use xAI Files API for file handling. Currently NOT supported via REST API - causes 'terminated' errors. Keep disabled unless using SDK/gRPC integration.",
+          "order": 30
+        },
+        "grok.autoUploadFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically upload files identified by agent workflow when Files API is enabled",
+          "order": 31
+        },
+        "grok.maxUploadSize": {
+          "type": "number",
+          "default": 10485760,
+          "description": "Maximum file size to upload in bytes (default 10MB, xAI limit is 48MB)",
+          "order": 32
+        },
+        "grok.cleanupFilesOnSessionEnd": {
+          "type": "boolean",
+          "default": true,
+          "description": "Delete uploaded files from xAI servers when session ends (if TTL not set)",
+          "order": 33
+        },
+        "grok.fileTtlHours": {
+          "type": "number",
+          "default": 24,
+          "description": "Hours to keep uploaded files before cleanup (0 = delete immediately on session end, -1 = never auto-delete)",
+          "order": 34
         }
       }
     },

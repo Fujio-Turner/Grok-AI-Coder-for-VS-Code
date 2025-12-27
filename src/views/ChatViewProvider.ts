@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { v4 as uuidv4 } from 'uuid';
-import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection, fetchLanguageModels, GrokModelInfo } from '../api/grokClient';
+import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection, fetchLanguageModels, GrokModelInfo, ChatCompletionOptions } from '../api/grokClient';
 import { getCouchbaseClient } from '../storage/couchbaseClient';
 import { 
     createSession, 
@@ -34,11 +34,22 @@ import {
     updateLastPairResponseWithExtension,
     getSessionTotalStorage,
     needsExtension,
-    createSessionExtension
+    createSessionExtension,
+    // File history tracking
+    appendPairFileOperation,
+    getAllPairFileHistory,
+    buildFileHistorySummary,
+    PairFileOperation,
+    PairFileHistoryEntry,
+    // Audit generation
+    appendAuditEntry,
+    updateSessionAuditFlag,
+    getProjectId
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
 import { parseResponse, GrokStructuredResponse } from '../prompts/responseParser';
+import { STRUCTURED_OUTPUT_SCHEMA } from '../prompts/responseSchema';
 import { parseWithCleanup } from '../prompts/jsonCleaner';
 import { getModelName, ModelType, debug, info, error as logError, detectModelType } from '../utils/logger';
 import { 
@@ -52,12 +63,23 @@ import {
     previewDiffStats,
     applySimpleDiff,
     validateFileChange,
-    resolveFilePathToUri
+    resolveFilePathToUri,
+    resolveFilePathToUriWithSearch
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
 import { validateAndApplyOperations, LineOperation } from '../edits/lineOperations';
-import { runAgentWorkflow } from '../agent/agentOrchestrator';
+import { runAgentWorkflow, runFilesApiWorkflow, buildFilesApiMessage } from '../agent/agentOrchestrator';
+import { createFileMessage } from '../api/grokClient';
+import { deleteFiles } from '../api/fileUploader';
+import { 
+    getUploadedFiles, 
+    clearUploadedFiles, 
+    setFileTtl,
+    getExpiredFilesGlobal,
+    removeExpiredFileRecords,
+    needsRehydration
+} from '../storage/chatSessionRepository';
 import { findFiles } from '../agent/workspaceFiles';
 import { fetchUrl } from '../agent/httpFetcher';
 import { generateImages, detectImageGenerationRequest, generateImagePrompts, createImageId, GeneratedImage } from '../api/imageGenClient';
@@ -338,9 +360,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 requestFormat: config.get<string>('requestFormat', 'json'),
                 responseFormat: config.get<string>('responseFormat', 'json'),
                 jsonCleanup: config.get<string>('jsonCleanup', 'auto'),
+                useStructuredOutputs: config.get<boolean>('useStructuredOutputs', false),
+                
+                // Files API
+                useFilesApi: config.get<boolean>('useFilesApi', false),
+                autoUploadFiles: config.get<boolean>('autoUploadFiles', true),
+                maxUploadSize: config.get<number>('maxUploadSize', 10485760),
+                cleanupFilesOnSessionEnd: config.get<boolean>('cleanupFilesOnSessionEnd', true),
+                fileTtlHours: config.get<number>('fileTtlHours', 24),
                 
                 // Debug
                 debug: config.get<boolean>('debug', false),
+                auditGeneration: config.get<boolean>('auditGeneration', false),
                 enableSound: config.get<boolean>('enableSound', false)
             }
         });
@@ -392,9 +423,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 requestFormat: 'requestFormat',
                 responseFormat: 'responseFormat',
                 jsonCleanup: 'jsonCleanup',
+                useStructuredOutputs: 'useStructuredOutputs',
+                
+                // Files API
+                useFilesApi: 'useFilesApi',
+                autoUploadFiles: 'autoUploadFiles',
+                maxUploadSize: 'maxUploadSize',
+                cleanupFilesOnSessionEnd: 'cleanupFilesOnSessionEnd',
+                fileTtlHours: 'fileTtlHours',
                 
                 // Debug
                 debug: 'debug',
+                auditGeneration: 'auditGeneration',
                 enableSound: 'enableSound'
             };
             
@@ -976,6 +1016,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 ? failedCli.map((c: any) => `- \`${c.command}\`: ${c.error || 'failed'}`).join('\n')
                 : 'None';
             
+            // Load actual content of modified files for context
+            const modifiedFileContents: Array<{path: string, content: string, lineCount: number}> = [];
+            for (const fileInfo of modifiedFilesWithStats.slice(0, 5)) { // Limit to 5 files
+                try {
+                    const fileUri = vscode.Uri.file(fileInfo.path);
+                    const content = await vscode.workspace.fs.readFile(fileUri);
+                    const textContent = Buffer.from(content).toString('utf8');
+                    modifiedFileContents.push({
+                        path: fileInfo.path,
+                        content: textContent,
+                        lineCount: textContent.split('\n').length
+                    });
+                    info(`Handoff: loaded file content for ${fileInfo.path} (${textContent.length} chars)`);
+                } catch (err) {
+                    debug(`Handoff: could not load file ${fileInfo.path}:`, err);
+                }
+            }
+            
+            // Build file content section
+            const fileContentSection = modifiedFileContents.length > 0
+                ? modifiedFileContents.map(f => {
+                    const fileName = f.path.split('/').pop() || f.path;
+                    return `#### 📄 ${fileName}\nPath: \`${f.path}\`\n\`\`\`\n${f.content}\n\`\`\``;
+                }).join('\n\n')
+                : 'No file contents available';
+
             // Build structured handoff context - comprehensive for AI
             const handoffText = `## HANDOFF CONTEXT
 
@@ -992,11 +1058,11 @@ ${modifiedFilesWithStats.length > 0
     ? modifiedFilesWithStats.map(f => `- \`${f.path}\` (+${f.stats.added}/-${f.stats.removed})`).join('\n') 
     : 'None'}
 
-### FILES REFERENCED (context attached during session)
-${contextFiles.length > 0 ? contextFiles.map(f => `- \`${f}\``).join('\n') : 'None'}
+### CURRENT STATE OF MODIFIED FILES
+${fileContentSection}
 
 ### CURRENT TASKS (continue these - priority order)
-${todos.filter(t => !t.completed).map((t, i) => `${i + 1}. [ ] ${t.text}`).join('\n') || 'All tasks completed'}
+${todos.map((t, i) => !t.completed ? `${i + 1}. [ ] ${t.text}` : null).filter(Boolean).join('\n') || 'All tasks completed'}
 
 ### COMPLETED TASKS
 ${todos.filter(t => t.completed).map(t => `- [x] ${t.text}`).join('\n') || 'None'}
@@ -1012,10 +1078,9 @@ ${cliSummary}
 
 ### INSTRUCTIONS
 1. Continue working on CURRENT TASKS in priority order
-2. Read the FILES MODIFIED if you need context on what was changed
-3. Read the FILES REFERENCED if you need the source content
-4. Check RECENT ERRORS if there are issues to address
-5. IMPORTANT: When outputting fileChanges, use the EXACT file paths listed above`;
+2. Use the file contents above - they show the CURRENT state of each file
+3. IMPORTANT: When outputting fileChanges, use the EXACT file paths listed above
+4. Do NOT make up file names - only modify files listed in "FILES MODIFIED"`;
 
             // Create new session with parent reference
             const newSession = await createSession(sessionId);
@@ -1057,15 +1122,63 @@ ${cliSummary}
                 parentSessionId: sessionId
             });
 
-            // Pre-fill the input with handoff context so user can see and edit it
-            const pendingTasks = todos.filter(t => !t.completed);
-            const prefillText = pendingTasks.length > 0
-                ? `Continue with: ${pendingTasks.map(t => t.text).join(', ')}`
-                : `Continue from session @${sessionId.slice(0, 8)} - ${oldSession.summary || 'previous work'}`;
+            // Pre-fill the input with comprehensive handoff context
+            // User can see and edit everything that's being handed off
+            // Track original indices to preserve numbering
+            const pendingTasksWithIndex = todos.map((t, i) => ({ ...t, originalIndex: i + 1 })).filter(t => !t.completed);
+            const completedTasks = todos.filter(t => t.completed);
+            
+            // Build comprehensive prefill with all context
+            const prefillParts: string[] = [];
+            
+            // Header
+            prefillParts.push(`## HANDOFF REQUEST`);
+            prefillParts.push(`Parent Session: ${sessionId.slice(0, 8)}`);
+            prefillParts.push(`Project: ${oldSession.projectName}`);
+            prefillParts.push('');
+            
+            // Pending tasks - preserve original numbering
+            if (pendingTasksWithIndex.length > 0) {
+                prefillParts.push(`### CONTINUE WITH:`);
+                pendingTasksWithIndex.forEach(t => prefillParts.push(`${t.originalIndex}. ${t.text}`));
+                prefillParts.push('');
+            }
+            
+            // Completed tasks (for context)
+            if (completedTasks.length > 0) {
+                prefillParts.push(`### ALREADY COMPLETED:`);
+                completedTasks.forEach(t => prefillParts.push(`- ✓ ${t.text}`));
+                prefillParts.push('');
+            }
+            
+            // Files to modify
+            if (modifiedFilesWithStats.length > 0) {
+                prefillParts.push(`### FILES TO MODIFY (use these EXACT paths):`);
+                modifiedFilesWithStats.forEach(f => {
+                    const fileName = f.path.split('/').pop() || f.path;
+                    prefillParts.push(`- ${fileName}`);
+                    prefillParts.push(`  Path: ${f.path}`);
+                    prefillParts.push(`  Changes: +${f.stats.added}/-${f.stats.removed} lines`);
+                });
+                prefillParts.push('');
+            }
+            
+            // Recent context
+            if (recentContext.length > 0) {
+                prefillParts.push(`### RECENT CONTEXT:`);
+                recentContext.slice(-4).forEach(ctx => prefillParts.push(ctx));
+                prefillParts.push('');
+            }
+            
+            // Summary
+            if (oldSession.summary) {
+                prefillParts.push(`### SESSION SUMMARY:`);
+                prefillParts.push(oldSession.summary);
+            }
             
             this._postMessage({
                 type: 'prefillInput',
-                text: prefillText
+                text: prefillParts.join('\n')
             });
 
             vscode.window.showInformationMessage(`Handed off to new session. Parent: ${sessionId.slice(0, 6)}`);
@@ -1127,11 +1240,42 @@ ${cliSummary}
 
     private async _rewindToChangeSet(changeSetId: string) {
         try {
+            debug(`_rewindToChangeSet called with changeSetId: ${changeSetId}`);
+            
+            // CRITICAL: Reload change history from Couchbase BEFORE reverting
+            // The in-memory tracker may be empty or out of sync
+            if (this._currentSessionId) {
+                const savedHistory = await getSessionChangeHistory(this._currentSessionId);
+                if (savedHistory && savedHistory.history && savedHistory.history.length > 0) {
+                    const tracker = getChangeTracker();
+                    const currentHistoryLength = tracker.getHistory().length;
+                    
+                    if (currentHistoryLength === 0 || currentHistoryLength !== savedHistory.history.length) {
+                        debug(`Tracker out of sync: tracker has ${currentHistoryLength}, Couchbase has ${savedHistory.history.length}. Restoring...`);
+                        tracker.fromSerializable(savedHistory);
+                    }
+                    
+                    debug(`After sync: tracker.history.length=${tracker.getHistory().length}, position=${tracker.getCurrentPosition()}`);
+                } else {
+                    debug('No change history found in Couchbase');
+                    vscode.window.showErrorMessage('No change history available to revert');
+                    return;
+                }
+            }
+            
+            const tracker = getChangeTracker();
+            const history = tracker.getHistory();
+            debug(`Current tracker state: history.length=${history.length}, position=${tracker.getCurrentPosition()}`);
+            
             const success = await revertToChangeSet(changeSetId);
             if (success) {
                 vscode.window.showInformationMessage('Reverted to previous state');
+                // Persist the updated change history after revert
+                await this._persistChangeHistory();
+                // Refresh the UI to show updated change history
+                this._sendInitialChanges();
             } else {
-                vscode.window.showErrorMessage('Failed to rewind');
+                vscode.window.showErrorMessage('Failed to rewind - check console for details');
             }
         } catch (error: any) {
             logError('Rewind failed:', error);
@@ -1141,9 +1285,23 @@ ${cliSummary}
 
     private async _forwardToChangeSet(changeSetId: string) {
         try {
+            // CRITICAL: Reload change history from Couchbase BEFORE forwarding
+            if (this._currentSessionId) {
+                const savedHistory = await getSessionChangeHistory(this._currentSessionId);
+                if (savedHistory && savedHistory.history && savedHistory.history.length > 0) {
+                    const tracker = getChangeTracker();
+                    if (tracker.getHistory().length === 0) {
+                        debug('Tracker empty, restoring from Couchbase for forward operation');
+                        tracker.fromSerializable(savedHistory);
+                    }
+                }
+            }
+            
             const success = await reapplyFromChangeSet(changeSetId);
             if (success) {
                 vscode.window.showInformationMessage('Reapplied changes');
+                await this._persistChangeHistory();
+                this._sendInitialChanges();
             } else {
                 vscode.window.showErrorMessage('Failed to forward');
             }
@@ -1154,6 +1312,9 @@ ${cliSummary}
     }
 
     private async _rewindStep() {
+        // Ensure tracker is synced with Couchbase first
+        await this._ensureTrackerSynced();
+        
         const tracker = getChangeTracker();
         if (!tracker.canRewind()) {
             vscode.window.showInformationMessage('Nothing to rewind');
@@ -1168,6 +1329,9 @@ ${cliSummary}
     }
 
     private async _forwardStep() {
+        // Ensure tracker is synced with Couchbase first
+        await this._ensureTrackerSynced();
+        
         const tracker = getChangeTracker();
         if (!tracker.canForward()) {
             vscode.window.showInformationMessage('Nothing to forward');
@@ -1178,6 +1342,21 @@ ${cliSummary}
         const next = tracker.getCurrentChange();
         if (next) {
             await this._forwardToChangeSet(next.id);
+        }
+    }
+    
+    private async _ensureTrackerSynced() {
+        if (!this._currentSessionId) return;
+        
+        const tracker = getChangeTracker();
+        const savedHistory = await getSessionChangeHistory(this._currentSessionId);
+        
+        if (savedHistory && savedHistory.history && savedHistory.history.length > 0) {
+            const currentHistoryLength = tracker.getHistory().length;
+            if (currentHistoryLength !== savedHistory.history.length) {
+                debug(`Syncing tracker: ${currentHistoryLength} → ${savedHistory.history.length} entries`);
+                tracker.fromSerializable(savedHistory);
+            }
         }
     }
 
@@ -1209,6 +1388,11 @@ ${cliSummary}
 
     public async loadSession(sessionId: string) {
         try {
+            // Cleanup files from previous session before switching
+            if (this._currentSessionId && this._currentSessionId !== sessionId) {
+                await this._cleanupSessionFiles();
+            }
+            
             const session = await getSessionWithExtensions(sessionId);
             if (session) {
                 this._currentSessionId = sessionId;
@@ -1313,6 +1497,15 @@ ${cliSummary}
 
     public async createNewSession() {
         try {
+            // Cleanup uploaded files from previous session if Files API was used
+            await this._cleanupSessionFiles();
+            
+            // CRITICAL: Clear change tracker when starting new session
+            // This prevents old session changes from polluting the new session
+            const tracker = getChangeTracker();
+            tracker.clear();
+            debug('Cleared change tracker for new session');
+            
             debug('Creating new session in Couchbase...');
             const session = await createSession();
             this._currentSessionId = session.id;
@@ -1333,6 +1526,99 @@ ${cliSummary}
                 type: 'error',
                 message: `Failed to create session: ${error}. Is Couchbase running?`
             });
+        }
+    }
+    
+    /**
+     * Cleanup files uploaded to xAI Files API for the current session.
+     * Called when session ends or switches.
+     * 
+     * Behavior based on grok.fileTtlHours:
+     * - 0: Delete immediately (legacy behavior)
+     * - >0: Set TTL, files deleted on next cleanup pass
+     * - -1: Never auto-delete (manual cleanup only)
+     */
+    private async _cleanupSessionFiles(): Promise<void> {
+        if (!this._currentSessionId) {
+            return;
+        }
+        
+        const config = vscode.workspace.getConfiguration('grok');
+        const cleanupEnabled = config.get<boolean>('cleanupFilesOnSessionEnd', true);
+        const ttlHours = config.get<number>('fileTtlHours', 24);
+        
+        if (!cleanupEnabled) {
+            debug('File cleanup disabled by config');
+            return;
+        }
+        
+        try {
+            const files = await getUploadedFiles(this._currentSessionId);
+            if (files.length === 0) {
+                return;
+            }
+            
+            const apiKey = await this._context.secrets.get('grokApiKey');
+            if (!apiKey) {
+                return;
+            }
+            
+            // TTL -1 means never auto-delete
+            if (ttlHours < 0) {
+                debug('File TTL is -1, skipping cleanup (files persist indefinitely)');
+                return;
+            }
+            
+            // TTL 0 means delete immediately (legacy behavior)
+            if (ttlHours === 0) {
+                info(`Cleaning up ${files.length} uploaded file(s) immediately (TTL=0)`);
+                const fileIds = files.map(f => f.fileId);
+                const deleted = await deleteFiles(fileIds, apiKey);
+                await clearUploadedFiles(this._currentSessionId);
+                info(`Cleaned up ${deleted}/${files.length} files`);
+                return;
+            }
+            
+            // TTL > 0: Set expiration time, don't delete yet
+            const fileIds = files.filter(f => !f.expiresAt).map(f => f.fileId);
+            if (fileIds.length > 0) {
+                await setFileTtl(this._currentSessionId, fileIds, ttlHours);
+                info(`Set ${ttlHours}h TTL for ${fileIds.length} file(s) - will be cleaned up later`);
+            }
+            
+            // Also run global cleanup of expired files from all sessions
+            await this._cleanupExpiredFilesGlobal(apiKey);
+            
+        } catch (err) {
+            debug('Error cleaning up session files:', err);
+        }
+    }
+    
+    /**
+     * Cleanup expired files across all sessions.
+     * Called during session switch to opportunistically clean up old files.
+     */
+    private async _cleanupExpiredFilesGlobal(apiKey: string): Promise<void> {
+        try {
+            const expiredSessions = await getExpiredFilesGlobal();
+            
+            if (expiredSessions.length === 0) {
+                return;
+            }
+            
+            let totalDeleted = 0;
+            for (const { sessionId, files } of expiredSessions) {
+                const fileIds = files.map(f => f.fileId);
+                const deleted = await deleteFiles(fileIds, apiKey);
+                await removeExpiredFileRecords(sessionId, fileIds);
+                totalDeleted += deleted;
+            }
+            
+            if (totalDeleted > 0) {
+                info(`[FilesAPI] Global cleanup: deleted ${totalDeleted} expired file(s) from ${expiredSessions.length} session(s)`);
+            }
+        } catch (err) {
+            debug('Error in global expired file cleanup:', err);
         }
     }
 
@@ -1437,31 +1723,98 @@ ${cliSummary}
             // Auto-attach modified files on "continue" messages
             // This ensures AI has current file state for accurate diffs
             let finalMessageText = messageText;
-            const isContinueMessage = /^continue$/i.test(messageText.trim());
+            const isContinueMessage = /^continue/i.test(messageText.trim());
             if (isContinueMessage && this._currentSessionId) {
                 try {
                     const tracker = getChangeTracker();
-                    const modifiedFiles = tracker.getModifiedFilePaths();
+                    const autoApply = config.get<boolean>('autoApply', true);
+                    
+                    // Check if there are unapplied changes
+                    const unappliedChanges = tracker.getUnappliedChanges();
+                    if (unappliedChanges.length > 0) {
+                        if (autoApply) {
+                            // AUTO-APPLY: Apply pending changes before continuing
+                            // This is critical for iterative workflows where user says "continue"
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚡ Auto-applying pending changes before continuing...\n' });
+                            
+                            for (const changeSet of unappliedChanges) {
+                                try {
+                                    await this.applyEdits('all');
+                                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Applied: ${changeSet.description}\n` });
+                                } catch (applyErr: any) {
+                                    debug('Failed to auto-apply change:', applyErr);
+                                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `⚠️ Failed to auto-apply: ${applyErr.message}\n` });
+                                }
+                            }
+                        } else {
+                            // WARN: Auto-apply is disabled, user must apply manually
+                            this._postMessage({ 
+                                type: 'updateResponseChunk', 
+                                pairIndex, 
+                                deltaText: `⚠️ **Warning:** You have ${unappliedChanges.length} pending change(s) that haven't been applied.\n` +
+                                           `   The AI will see stale file content. Click "Apply" first, or enable "Auto Apply" in settings.\n\n`
+                            });
+                            vscode.window.showWarningMessage(
+                                `You have ${unappliedChanges.length} pending change(s). Apply them first so AI sees the current state.`,
+                                'Apply Now', 'Continue Anyway'
+                            ).then(async (selection) => {
+                                if (selection === 'Apply Now') {
+                                    await this.applyEdits('all');
+                                }
+                            });
+                        }
+                    }
+                    
+                    let modifiedFiles = tracker.getModifiedFilePaths();
+                    debug(`Continue message: found ${modifiedFiles.length} modified files in tracker:`, modifiedFiles);
+                    
+                    // If tracker is empty but we have persisted history, restore it
+                    if (modifiedFiles.length === 0) {
+                        const savedHistory = await getSessionChangeHistory(this._currentSessionId);
+                        if (savedHistory && savedHistory.history && savedHistory.history.length > 0) {
+                            debug('Tracker empty but found persisted history, restoring...');
+                            tracker.fromSerializable(savedHistory);
+                            modifiedFiles = tracker.getModifiedFilePaths();
+                            debug(`After restore: ${modifiedFiles.length} modified files`);
+                        }
+                    }
                     
                     if (modifiedFiles.length > 0) {
                         this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔄 Auto-attaching modified files for context...\n' });
                         
                         const fileContents: string[] = [];
+                        const attachedNames: string[] = [];
                         for (const filePath of modifiedFiles.slice(0, 5)) { // Limit to 5 most recent
                             try {
                                 const content = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
                                 const textContent = Buffer.from(content).toString('utf8');
                                 const fileName = filePath.split('/').pop() || filePath;
-                                fileContents.push(`📄 ${fileName}:\n\`\`\`\n${textContent}\n\`\`\``);
-                                info(`Auto-attached: ${fileName}`);
+                                const md5Hash = computeFileHash(textContent);
+                                fileContents.push(`📄 ${fileName} (MD5: ${md5Hash}):\n\`\`\`\n${textContent}\n\`\`\``);
+                                attachedNames.push(fileName);
+                                info(`Auto-attached: ${fileName} (MD5: ${md5Hash.slice(0, 8)}...)`);
+                                
+                                // Track file read in pairFileHistory
+                                try {
+                                    await appendPairFileOperation(this._currentSessionId!, pairIndex, {
+                                        file: filePath,
+                                        md5: md5Hash,
+                                        op: 'read',
+                                        size: textContent.length,
+                                        by: 'auto'
+                                    });
+                                } catch (trackErr) {
+                                    debug('Failed to track file read:', trackErr);
+                                }
                             } catch (readErr) {
                                 debug(`Failed to read ${filePath}:`, readErr);
                             }
                         }
                         
                         if (fileContents.length > 0) {
-                            finalMessageText = `${messageText}\n\n**Current state of modified files:**\n${fileContents.join('\n\n')}`;
-                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} modified file(s)\n\n` });
+                            finalMessageText = `${messageText}\n\n**Current state of modified files (FRESH READ - use these MD5 hashes):**\n${fileContents.join('\n\n')}`;
+                            const fileList = attachedNames.map(f => `   └─ ${f}`).join('\n');
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} modified file(s)\n${fileList}\n\n` });
                         }
                     }
                 } catch (attachErr) {
@@ -1470,54 +1823,131 @@ ${cliSummary}
             }
 
             // Agent workflow: analyze if files are needed and load them
+            // Use Files API if enabled (uploads files to xAI for document_search)
+            const useFilesApi = config.get<boolean>('useFilesApi', false);
+            let filesApiFileIds: string[] = [];
+            
             if (!hasImages && !isContinueMessage) {
                 try {
                     this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔍 Analyzing request...\n' });
                     
-                    const agentResult = await runAgentWorkflow(
-                        messageText,
-                        apiKey,
-                        fastModel,
-                        (progress) => {
-                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📂 ${progress}\n` });
-                        }
-                    );
-                    
-                    // Record planning step metrics
-                    if (agentResult.stepMetrics) {
-                        const { planning, execute } = agentResult.stepMetrics;
-                        recordStep(
-                            this._currentSessionId!, 
-                            'planning', 
-                            planning.timeMs, 
-                            planning.tokensIn, 
-                            planning.tokensOut
-                        );
-                        if (execute.timeMs > 0) {
-                            recordStep(this._currentSessionId!, 'execute', execute.timeMs, 0, 0);
-                        }
-                    }
-                    
-                    const hasFiles = agentResult.filesLoaded.length > 0;
-                    const hasUrls = agentResult.urlsLoaded > 0;
-                    
-                    if (hasFiles || hasUrls) {
-                        const parts: string[] = [];
-                        if (hasFiles) parts.push(`${agentResult.filesLoaded.length} file(s)`);
-                        if (hasUrls) parts.push(`${agentResult.urlsLoaded} URL(s)`);
+                    if (useFilesApi) {
+                        // Files API workflow - upload files to xAI
+                        info('Using Files API workflow');
                         
-                        this._postMessage({ 
-                            type: 'updateResponseChunk', 
-                            pairIndex, 
-                            deltaText: `✅ Loaded ${parts.join(', ')}\n\n` 
-                        });
-                        finalMessageText = agentResult.augmentedMessage;
-                        info(`Agent loaded ${parts.join(', ')}`);
-                    } else if (!agentResult.skipped) {
-                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files or URLs found\n\n' });
+                        const filesResult = await runFilesApiWorkflow(
+                            messageText,
+                            apiKey,
+                            fastModel,
+                            this._currentSessionId!,
+                            (progress) => {
+                                this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📂 ${progress}\n` });
+                            }
+                        );
+                        
+                        // Record planning step metrics
+                        if (filesResult.stepMetrics) {
+                            const { planning, execute } = filesResult.stepMetrics;
+                            recordStep(
+                                this._currentSessionId!, 
+                                'planning', 
+                                planning.timeMs, 
+                                planning.tokensIn, 
+                                planning.tokensOut
+                            );
+                            if (execute.timeMs > 0) {
+                                recordStep(this._currentSessionId!, 'execute', execute.timeMs, 0, 0);
+                            }
+                        }
+                        
+                        filesApiFileIds = filesResult.fileIds;
+                        
+                        // Build message text (no file content embedded)
+                        if (filesResult.fileIds.length > 0 || filesResult.urlContent.size > 0) {
+                            const parts: string[] = [];
+                            if (filesResult.newlyUploaded.length > 0) parts.push(`${filesResult.newlyUploaded.length} uploaded`);
+                            if (filesResult.reused.length > 0) parts.push(`${filesResult.reused.length} reused`);
+                            if (filesResult.urlContent.size > 0) parts.push(`${filesResult.urlContent.size} URL(s)`);
+                            
+                            this._postMessage({ 
+                                type: 'updateResponseChunk', 
+                                pairIndex, 
+                                deltaText: `✅ Files API: ${parts.join(', ')}\n\n` 
+                            });
+                            
+                            // Build message with plan and URLs (files attached via file_id)
+                            finalMessageText = buildFilesApiMessage(
+                                messageText,
+                                filesResult.plan!,
+                                filesResult.urlContent,
+                                filesResult.fileIds.length
+                            );
+                            
+                            info(`Files API: ${filesResult.fileIds.length} file(s) attached`);
+                        }
+                    } else {
+                        // Original workflow - embed file content in prompt
+                        const agentResult = await runAgentWorkflow(
+                            messageText,
+                            apiKey,
+                            fastModel,
+                            (progress) => {
+                                this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📂 ${progress}\n` });
+                            }
+                        );
+                        
+                        // Record planning step metrics
+                        if (agentResult.stepMetrics) {
+                            const { planning, execute } = agentResult.stepMetrics;
+                            recordStep(
+                                this._currentSessionId!, 
+                                'planning', 
+                                planning.timeMs, 
+                                planning.tokensIn, 
+                                planning.tokensOut
+                            );
+                            if (execute.timeMs > 0) {
+                                recordStep(this._currentSessionId!, 'execute', execute.timeMs, 0, 0);
+                            }
+                        }
+                        
+                        const hasFiles = agentResult.filesLoaded.length > 0;
+                        const hasUrls = agentResult.urlsLoaded > 0;
+                        
+                        if (hasFiles || hasUrls) {
+                            const parts: string[] = [];
+                            if (hasFiles) parts.push(`${agentResult.filesLoaded.length} file(s)`);
+                            if (hasUrls) parts.push(`${agentResult.urlsLoaded} URL(s)`);
+                            
+                            this._postMessage({ 
+                                type: 'updateResponseChunk', 
+                                pairIndex, 
+                                deltaText: `✅ Loaded ${parts.join(', ')}\n\n` 
+                            });
+                            finalMessageText = agentResult.augmentedMessage;
+                            info(`Agent loaded ${parts.join(', ')}`);
+                        } else if (!agentResult.skipped) {
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files or URLs found\n\n' });
+                        }
                     }
                 } catch (agentError) {
                     debug('Agent workflow error (continuing without files):', agentError);
+                }
+            } else if (isContinueMessage && useFilesApi) {
+                // On "continue" with Files API, attach all previously uploaded files
+                try {
+                    const existingFiles = await getUploadedFiles(this._currentSessionId!);
+                    filesApiFileIds = existingFiles.map(f => f.fileId);
+                    if (filesApiFileIds.length > 0) {
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `📁 Attached ${filesApiFileIds.length} file(s) from session\n\n` 
+                        });
+                        info(`Continue with Files API: ${filesApiFileIds.length} file(s) attached`);
+                    }
+                } catch (err) {
+                    debug('Error fetching uploaded files for continue:', err);
                 }
             }
 
@@ -1563,23 +1993,40 @@ ${cliSummary}
                 }
             }
 
-            const messages = await this._buildMessages(finalMessageText, hasImages ? images : undefined);
+            const messages = await this._buildMessages(
+                finalMessageText, 
+                hasImages ? images : undefined,
+                filesApiFileIds.length > 0 ? filesApiFileIds : undefined
+            );
 
             // Track main response step timing
             const mainStepStart = startStepTimer();
             
-            const grokResponse = await sendChatCompletion(
-                messages,
-                model,
-                apiKey,
-                this._abortController.signal,
-                (chunk) => {
+            // Check if structured outputs are enabled (API guarantees valid JSON)
+            const useStructuredOutputs = config.get<boolean>('useStructuredOutputs', false);
+            
+            const completionOptions: ChatCompletionOptions = {
+                signal: this._abortController.signal,
+                onChunk: (chunk) => {
                     this._postMessage({
                         type: 'updateResponseChunk',
                         pairIndex,
                         deltaText: chunk
                     });
-                }
+                },
+                // When enabled, API guarantees response matches schema - no more malformed JSON!
+                responseFormat: useStructuredOutputs ? STRUCTURED_OUTPUT_SCHEMA : undefined
+            };
+            
+            if (useStructuredOutputs) {
+                info('Using Structured Outputs - API will guarantee valid JSON schema');
+            }
+            
+            const grokResponse = await sendChatCompletion(
+                messages,
+                model,
+                apiKey,
+                completionOptions
             );
             
             const mainStepTime = endStepTimer(mainStepStart);
@@ -1605,6 +2052,39 @@ ${cliSummary}
                 debug('Saved raw response to Couchbase');
             } catch (saveErr) {
                 logError('Failed to save raw response:', saveErr);
+            }
+            
+            // AUDIT: If audit generation is enabled, save full generation to debug document
+            const auditEnabled = config.get<boolean>('auditGeneration', false);
+            if (auditEnabled && this._currentSessionId) {
+                try {
+                    // Get system prompt preview (first 1000 chars)
+                    const systemMsg = messages.find(m => m.role === 'system');
+                    const systemPromptPreview = typeof systemMsg?.content === 'string' 
+                        ? systemMsg.content.slice(0, 1000) 
+                        : undefined;
+                    
+                    await appendAuditEntry(
+                        this._currentSessionId,
+                        getProjectId(),
+                        {
+                            pairIndex,
+                            userMessage: finalMessageText.slice(0, 2000),
+                            fullGeneration: grokResponse.text,
+                            systemPromptPreview,
+                            model,
+                            finishReason: grokResponse.finishReason,
+                            tokensIn: grokResponse.usage?.promptTokens,
+                            tokensOut: grokResponse.usage?.completionTokens
+                        }
+                    );
+                    
+                    // Mark session as having audit enabled
+                    await updateSessionAuditFlag(this._currentSessionId, true);
+                    debug('Saved audit entry for pair:', pairIndex);
+                } catch (auditErr) {
+                    debug('Failed to save audit entry:', auditErr);
+                }
             }
 
             // Parse structured JSON response with configurable AI cleanup
@@ -1827,10 +2307,16 @@ ${cliSummary}
             const suspiciousChanges: string[] = [];
             
             // CRITICAL: Block ALL file changes if response was truncated
-            const wasTruncated = 
+            // PRIMARY CHECK: API's finish_reason === 'length' means token limit hit
+            const apiTruncated = grokResponse.finishReason === 'length';
+            const wasTruncated = apiTruncated ||
                 (structured.summary && structured.summary.toLowerCase().includes('truncated')) ||
                 (grokResponse.text && grokResponse.text.length < 200 && structured.fileChanges && structured.fileChanges.length > 0) ||
                 (grokResponse.text && !grokResponse.text.trim().endsWith('}') && structured.fileChanges && structured.fileChanges.length > 0);
+            
+            if (apiTruncated) {
+                logError(`API returned finish_reason='length' - response hit token limit and was truncated`);
+            }
             
             if (wasTruncated && structured.fileChanges && structured.fileChanges.length > 0) {
                 const truncationWarning = `🚫 BLOCKED: ${structured.fileChanges.length} file change(s) from truncated response. ` +
@@ -1845,7 +2331,8 @@ ${cliSummary}
             
             if (structured.fileChanges && structured.fileChanges.length > 0) {
                 const editPromises = structured.fileChanges.map(async (fc, idx) => {
-                    const fileUri = resolveFilePathToUri(fc.path);
+                    // Use async search-enabled resolver to find files even if AI provides incorrect path
+                    const fileUri = await resolveFilePathToUriWithSearch(fc.path);
                     if (!fileUri) {
                         logError(`Unable to resolve file path: ${fc.path}`);
                         vscode.window.showErrorMessage(`Cannot apply change: Unable to resolve path "${fc.path}". It may be outside the workspace or invalid.`);
@@ -1869,6 +2356,48 @@ ${cliSummary}
                             const doc = await vscode.workspace.openTextDocument(fileUri);
                             const originalContent = doc.getText();
                             const originalHash = computeFileHash(originalContent);
+                            
+                            // HASH VERIFICATION: Check if AI provided correct hash (proves it read the file)
+                            const providedHash = structured.fileHashes?.[fc.path];
+                            if (!providedHash) {
+                                // AI didn't provide hash - it may not have read the file
+                                blockedChanges.push(`${fc.path}: No file hash provided - AI may not have read the file`);
+                                logError(`BLOCKED: No fileHash for ${fc.path}. AI may be hallucinating content.`);
+                                vscode.window.showWarningMessage(
+                                    `⚠️ AI did not provide file hash for ${fc.path}. This usually means it didn't actually read the file. Please attach the file and try again.`,
+                                    'OK'
+                                );
+                                return null;
+                            }
+                            
+                            if (providedHash !== originalHash) {
+                                // Hash mismatch - AI has stale or wrong content
+                                blockedChanges.push(`${fc.path}: Hash mismatch - AI has outdated or wrong file content`);
+                                logError(`BLOCKED: Hash mismatch for ${fc.path}. Provided: ${providedHash}, Actual: ${originalHash}`);
+                                vscode.window.showWarningMessage(
+                                    `⚠️ Hash mismatch for ${fc.path}. AI's file content is outdated or incorrect. Please re-attach the file.`,
+                                    'OK'
+                                );
+                                
+                                // Log hash mismatch to Couchbase
+                                if (this._currentSessionId) {
+                                    appendOperationFailure(this._currentSessionId, {
+                                        pairIndex,
+                                        filePath: fc.path,
+                                        operationType: 'hashMismatch',
+                                        error: `Hash mismatch: provided=${providedHash}, actual=${originalHash}`,
+                                        fileSnapshot: {
+                                            hash: originalHash,
+                                            lineCount: originalContent.split('\n').length,
+                                            sizeBytes: originalContent.length,
+                                            capturedAt: new Date().toISOString()
+                                        }
+                                    }).catch(err => debug('Failed to log hash mismatch:', err));
+                                }
+                                return null;
+                            }
+                            
+                            debug(`Hash verified for ${fc.path}: ${originalHash}`);
                             const result = validateAndApplyOperations(originalContent, fc.lineOperations as LineOperation[]);
                             
                             if (result.success && result.newContent) {
@@ -1876,15 +2405,25 @@ ${cliSummary}
                                 debug(`Applied ${fc.lineOperations.length} line operations to ${fc.path}`);
                             } else {
                                 // Line operation validation failed - log to Couchbase
-                                blockedChanges.push(`${fc.path}: Line operation failed - ${result.error}`);
+                                const failedOp = result.failedOperation;
+                                const lines = originalContent.split('\n');
+                                const actualContent = failedOp?.line ? lines[failedOp.line - 1] : undefined;
+                                
+                                // Show detailed error to user
+                                const errorDetails = failedOp 
+                                    ? `Line ${failedOp.line}: expected "${failedOp.expectedContent?.substring(0, 40)}..." but found "${actualContent?.substring(0, 40)}..."`
+                                    : result.error;
+                                blockedChanges.push(`${fc.path}: ${errorDetails}`);
                                 logError(`BLOCKED: Line operation validation failed: ${result.error}`);
+                                
+                                // Show warning about AI hallucination
+                                vscode.window.showWarningMessage(
+                                    `⚠️ AI hallucinated file content for ${fc.path}. It tried to modify content that doesn't exist. Attach the file to let AI see actual content.`,
+                                    'OK'
+                                );
                                 
                                 // Log detailed failure to Couchbase for debugging
                                 if (this._currentSessionId) {
-                                    const failedOp = result.failedOperation;
-                                    const lines = originalContent.split('\n');
-                                    const actualContent = failedOp?.line ? lines[failedOp.line - 1] : undefined;
-                                    
                                     appendOperationFailure(this._currentSessionId, {
                                         pairIndex,
                                         filePath: fc.path,
@@ -1927,6 +2466,78 @@ ${cliSummary}
                     }
                     // FALLBACK: If isDiff is true, apply the diff to the existing file content
                     else if (fc.isDiff) {
+                        // Pre-check: Ensure diff content has proper markers before attempting to apply
+                        const diffLines = fc.content.split('\n');
+                        const hasAddLines = diffLines.some(l => l.startsWith('+'));
+                        const hasRemoveLines = diffLines.some(l => l.startsWith('-'));
+                        const hasHunkHeaders = diffLines.some(l => l.startsWith('@@'));
+                        
+                        if (!hasAddLines && !hasRemoveLines && !hasHunkHeaders) {
+                            // AI set isDiff:true but sent raw content without diff markers
+                            // AUTO-FIX: If lineRange is provided, convert to line replacement
+                            if (fc.lineRange && fc.lineRange.start > 0 && fc.lineRange.end >= fc.lineRange.start) {
+                                info(`[Remediation] Converting malformed diff to lineRange replacement for ${fc.path}`);
+                                
+                                try {
+                                    const doc = await vscode.workspace.openTextDocument(fileUri);
+                                    const originalContent = doc.getText();
+                                    const originalLines = originalContent.split('\n');
+                                    
+                                    // Replace lines in the specified range
+                                    const startLine = fc.lineRange.start - 1; // 1-indexed to 0-indexed
+                                    const endLine = fc.lineRange.end;
+                                    const newLines = fc.content.split('\n');
+                                    
+                                    // Build new content: before + new + after
+                                    const beforeLines = originalLines.slice(0, startLine);
+                                    const afterLines = originalLines.slice(endLine);
+                                    newText = [...beforeLines, ...newLines, ...afterLines].join('\n');
+                                    
+                                    // Track this remediation for analytics
+                                    if (this._currentSessionId) {
+                                        const { appendRemediation } = await import('../storage/chatSessionRepository');
+                                        appendRemediation(this._currentSessionId, {
+                                            type: 'malformed-diff-to-linerange',
+                                            pairIndex,
+                                            filePath: fc.path,
+                                            description: `Converted isDiff:true without markers to lineRange replacement (lines ${fc.lineRange.start}-${fc.lineRange.end})`,
+                                            before: {
+                                                format: 'isDiff:true, no +/- markers',
+                                                preview: fc.content.slice(0, 500),
+                                                lineRange: fc.lineRange
+                                            },
+                                            after: {
+                                                format: 'lineRange replacement',
+                                                preview: newText.slice(0, 500),
+                                                method: `Replaced lines ${fc.lineRange.start}-${fc.lineRange.end} with ${newLines.length} new lines`
+                                            },
+                                            success: true
+                                        }).catch(err => debug('Failed to log remediation:', err));
+                                    }
+                                    
+                                    info(`[Remediation] Success: replaced lines ${fc.lineRange.start}-${fc.lineRange.end} with ${newLines.length} lines`);
+                                } catch (err: any) {
+                                    // File doesn't exist - use content as new file
+                                    newText = fc.content;
+                                    debug(`File ${fc.path} not found, using content as new file`);
+                                }
+                            } else {
+                                // No lineRange - cannot auto-fix, must block
+                                blockedChanges.push(`${fc.path}: isDiff:true but no +/- markers and no lineRange`);
+                                logError(`BLOCKED: ${fc.path} - AI sent isDiff:true but content lacks diff format and no lineRange for fallback.`);
+                                
+                                if (this._currentSessionId) {
+                                    appendSessionBug(this._currentSessionId, {
+                                        type: 'Other',
+                                        pairIndex,
+                                        by: 'script',
+                                        description: `Auto-detected: isDiff:true but no diff markers for ${fc.path} - prevented file corruption (no lineRange for auto-fix)`,
+                                        debugContext: { rawResponsePreview: fc.content.slice(0, 300) }
+                                    }).catch(err => debug('Failed to report missing diff markers bug:', err));
+                                }
+                                return null; // Skip this edit
+                            }
+                        } else {
                         try {
                             const doc = await vscode.workspace.openTextDocument(fileUri);
                             const originalContent = doc.getText();
@@ -1966,6 +2577,7 @@ ${cliSummary}
                                 .join('\n');
                             debug(`File ${fc.path} not found, extracting + lines from diff`);
                         }
+                        } // Close the else block for proper diff markers
                     } else {
                         // SAFETY CHECK: Validate non-diff file changes to prevent corruption
                         const validation = await validateFileChange(fileUri, newText, fc.isDiff || false);
@@ -2223,7 +2835,7 @@ ${cliSummary}
                         return true;
                     });
                 
-                const editResults = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean }, idx: number) => {
+                const editResults = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean; lineOperations?: LineOperation[] }, idx: number) => {
                     const filePath = fc.path.trim();
                     const fileUri = resolveFilePathToUri(filePath);
                     if (!fileUri) {
@@ -2243,8 +2855,28 @@ ${cliSummary}
                     
                     let newText = fc.content;
                     
+                    // PREFERRED: Use lineOperations if provided (safest method)
+                    if (fc.lineOperations && fc.lineOperations.length > 0) {
+                        try {
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            const originalContent = doc.getText();
+                            const result = validateAndApplyOperations(originalContent, fc.lineOperations);
+                            
+                            if (result.success && result.newContent) {
+                                newText = result.newContent;
+                                debug(`Applied ${fc.lineOperations.length} line operations to ${filePath}`);
+                            } else {
+                                logError(`Line operation failed for ${filePath}: ${result.error}`);
+                                vscode.window.showErrorMessage(`Line operation failed for ${filePath}: ${result.error}`);
+                                return null;
+                            }
+                        } catch (err: any) {
+                            logError(`Failed to apply line operations to ${filePath}: ${err.message}`);
+                            return null;
+                        }
+                    }
                     // If isDiff is true, apply the diff to the existing file content
-                    if (fc.isDiff) {
+                    else if (fc.isDiff) {
                         try {
                             const doc = await vscode.workspace.openTextDocument(fileUri);
                             const originalContent = doc.getText();
@@ -2321,10 +2953,53 @@ ${cliSummary}
                 vscode.window.showErrorMessage(`Failed to apply edits: ${result.error}`);
                 return;
             }
+            
+            // CRITICAL: Log bug if diff application failed (rollback won't work!)
+            if (result.noActualChanges) {
+                await appendSessionBug(this._currentSessionId, {
+                    type: 'Other',
+                    pairIndex: session.pairs.length - 1,
+                    by: 'script',
+                    description: `Auto-detected: CRITICAL - No actual file changes detected. Diff application completely failed. Rollback is NOT possible for these changes.`
+                });
+                vscode.window.showWarningMessage('⚠️ WARNING: Diff application failed - no actual changes made. Rollback will not work!');
+            } else if (result.failedDiffs && result.failedDiffs.length > 0) {
+                await appendSessionBug(this._currentSessionId, {
+                    type: 'Other',
+                    pairIndex: session.pairs.length - 1,
+                    by: 'script',
+                    description: `Auto-detected: ${result.failedDiffs.length} file(s) had identical before/after content - diff may have failed: ${result.failedDiffs.join(', ')}`
+                });
+            }
 
             await this._context.globalState.update('grok.lastEditGroupId', editGroupId);
 
             vscode.window.showInformationMessage(`Applied ${editsToApply.length} edit(s)`);
+            
+            // Track file updates in pairFileHistory
+            const currentPairIndex = session.pairs.length - 1;
+            for (const edit of editsToApply) {
+                try {
+                    // Read the file after applying to get current MD5
+                    const doc = await vscode.workspace.openTextDocument(edit.fileUri);
+                    const newContent = doc.getText();
+                    const newMd5 = computeFileHash(newContent);
+                    
+                    // Check if this is a new file (oldText was empty or undefined)
+                    const isNewFile = !edit.oldText || edit.oldText.trim() === '';
+                    
+                    await appendPairFileOperation(this._currentSessionId!, currentPairIndex, {
+                        file: edit.fileUri.fsPath,
+                        md5: newMd5,
+                        op: isNewFile ? 'create' : 'update',
+                        size: newContent.length,
+                        by: 'user'
+                    });
+                    debug(`Tracked file ${isNewFile ? 'create' : 'update'}: ${edit.fileUri.fsPath} (MD5: ${newMd5.slice(0, 8)}...)`);
+                } catch (trackErr) {
+                    debug('Failed to track file update:', trackErr);
+                }
+            }
             
             this._postMessage({
                 type: 'editsApplied',
@@ -2716,7 +3391,7 @@ ${cliSummary}
         }
     }
 
-    private async _buildMessages(userText: string, images?: string[]): Promise<GrokMessage[]> {
+    private async _buildMessages(userText: string, images?: string[], fileIds?: string[]): Promise<GrokMessage[]> {
         const messages: GrokMessage[] = [];
 
         // Use hardcoded system prompt with workspace info (project-agnostic)
@@ -2734,7 +3409,53 @@ ${cliSummary}
                         const parentSession = await getSession(session.parentSessionId);
                         if (parentSession?.handoffText) {
                             info('Injecting handoff context from parent session:', session.parentSessionId.slice(0, 6));
-                            systemPrompt += `\n\n## Handoff Context\nThis session is a continuation from a previous session. Here is the context:\n\n${parentSession.handoffText}`;
+                            systemPrompt += `\n\n## Handoff Context (CRITICAL - READ THIS FIRST)
+This session is a continuation from a previous session. 
+
+**⚠️ IMPORTANT: You MUST use the EXACT file paths listed below. Do NOT make up or invent file names.**
+
+${parentSession.handoffText}`;
+                            
+                            // Auto-load modified files from parent session so AI has the actual content
+                            if (parentSession.changeHistory?.history) {
+                                const fileSet = new Set<string>();
+                                for (const cs of parentSession.changeHistory.history) {
+                                    for (const f of cs.files) {
+                                        fileSet.add(f.filePath);
+                                    }
+                                }
+                                
+                                // Load and include file contents (limit to avoid token explosion)
+                                const filesToLoad = Array.from(fileSet).slice(0, 5);
+                                if (filesToLoad.length > 0) {
+                                    let fileContents = '\n\n## Current File Contents (from parent session)\n';
+                                    for (const filePath of filesToLoad) {
+                                        try {
+                                            const uri = vscode.Uri.file(filePath);
+                                            const doc = await vscode.workspace.openTextDocument(uri);
+                                            const content = doc.getText();
+                                            // Truncate very large files
+                                            const truncated = content.length > 8000 
+                                                ? content.slice(0, 8000) + '\n\n... (truncated, file too large)'
+                                                : content;
+                                            const fileName = filePath.split('/').pop() || filePath;
+                                            fileContents += `\n### ${fileName}\n\`\`\`\n${truncated}\n\`\`\`\n`;
+                                            info(`Loaded handoff file: ${fileName}`);
+                                        } catch (err) {
+                                            debug(`Could not load handoff file: ${filePath}`);
+                                        }
+                                    }
+                                    systemPrompt += fileContents;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Add file operation history to help AI track file state
+                    if (session.pairFileHistory && session.pairFileHistory.length > 0) {
+                        const fileHistorySummary = buildFileHistorySummary(session.pairFileHistory, 5);
+                        if (fileHistorySummary) {
+                            systemPrompt += fileHistorySummary;
                         }
                     }
                     
@@ -2760,9 +3481,15 @@ ${cliSummary}
             messages.unshift({ role: 'system', content: systemPrompt });
         }
 
-        if (images && images.length > 0) {
+        // Build the final user message based on what's attached
+        if (fileIds && fileIds.length > 0) {
+            // Files API - attach file_ids for document_search
+            messages.push(createFileMessage(userText, fileIds, images));
+        } else if (images && images.length > 0) {
+            // Vision - images attached
             messages.push(createVisionMessage(userText, images));
         } else {
+            // Plain text
             messages.push({ role: 'user', content: userText });
         }
 
@@ -2869,8 +3596,18 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .think-toggle:hover{color:var(--vscode-foreground)}
 .think-arrow{transition:transform 0.2s;font-size:10px}
 .think-arrow.open{transform:rotate(90deg)}
-.stream-content{font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:150px;overflow-y:auto;line-height:1.5;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:8px;display:none}
+.stream-content{font-size:12px;color:var(--vscode-descriptionForeground);white-space:pre-wrap;max-height:80px;overflow-y:auto;line-height:1.4;margin-top:8px;border-left:2px solid var(--vscode-textBlockQuote-border);padding-left:10px;display:none;font-family:var(--vscode-editor-font-family);opacity:0.7}
 .stream-content.show{display:block}
+.activity-log{margin-top:10px;padding:8px 10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;font-size:12px}
+.activity-log-header{font-weight:500;color:var(--vscode-foreground);margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.activity-item{padding:2px 0;display:block}
+.activity-item.search{color:var(--vscode-terminal-ansiCyan)}
+.activity-item.file{color:var(--vscode-descriptionForeground);padding-left:12px}
+.activity-item.url{color:var(--vscode-terminal-ansiBlue)}
+.activity-item.error{color:var(--vscode-terminal-ansiRed)}
+.activity-item.success{color:var(--vscode-testing-iconPassed)}
+.activity-log-persisted{margin-bottom:12px;padding:8px 10px;background:var(--vscode-textBlockQuote-background);border-radius:6px;font-size:11px;border-left:3px solid var(--vscode-textBlockQuote-border)}
+.activity-log-persisted .activity-log-header{font-size:11px;opacity:0.8;margin-bottom:4px}
 .spin{width:14px;height:14px;border:2px solid var(--vscode-descriptionForeground);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .diff{margin:10px 0;border:1px solid var(--vscode-panel-border);border-radius:6px;overflow:hidden}
@@ -3165,6 +3902,8 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 .api-key-row input{flex:1}
 .api-key-row button{padding:6px 10px;font-size:11px;white-space:nowrap}
 .future-badge{display:inline-block;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:9px;padding:2px 6px;border-radius:3px;margin-left:6px;vertical-align:middle}
+.info-box{background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textLink-foreground);padding:10px 12px;margin-top:12px;border-radius:0 4px 4px 0;font-size:11px;line-height:1.5;color:var(--vscode-foreground)}
+.info-box strong{color:var(--vscode-textLink-foreground)}
 
 /* Chart Styles */
 .chart-time-filter{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
@@ -3221,6 +3960,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
         <button class="settings-tab" data-tab="models">Models</button>
         <button class="settings-tab" data-tab="chat">Chat</button>
         <button class="settings-tab" data-tab="optimize">Optimize</button>
+        <button class="settings-tab" data-tab="files">Files API</button>
         <button class="settings-tab" data-tab="debug">Debug</button>
         <button class="settings-tab" data-tab="chart">Usage</button>
     </div>
@@ -3417,6 +4157,58 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 </select>
                 <div class="desc">Control when AI is used to fix malformed responses</div>
             </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-useStructuredOutputs">
+                    <label>Use Structured Outputs (Recommended)</label>
+                </div>
+                <div class="desc">API guarantees valid JSON responses - eliminates malformed JSON issues. Requires grok-2-1212+</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Files API Section -->
+    <div class="settings-section" id="section-files">
+        <div class="settings-group">
+            <h3>xAI Files API</h3>
+            <div class="warning-banner" style="background:#3a2a1a;border:1px solid #c9944e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px;">
+                <strong>⚠️ EXPERIMENTAL:</strong> Files API is NOT supported via REST - causes "terminated" errors. Keep disabled unless using SDK/gRPC integration.
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-useFilesApi">
+                    <label>Enable Files API (experimental)</label>
+                </div>
+                <div class="desc" style="color:#c9944e;">⚠️ Currently broken over REST API. Keep disabled.</div>
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-autoUploadFiles">
+                    <label>Auto-Upload Files</label>
+                </div>
+                <div class="desc">Automatically upload files identified by agent workflow</div>
+            </div>
+            <div class="setting-row">
+                <label>Max Upload Size (MB)</label>
+                <input type="number" id="set-maxUploadSize" min="1" max="48" step="1">
+                <div class="desc">Maximum file size to upload (xAI limit: 48MB)</div>
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-cleanupFilesOnSessionEnd">
+                    <label>Cleanup Files on Session End</label>
+                </div>
+                <div class="desc">Enable cleanup logic when session switches or ends</div>
+            </div>
+            <div class="setting-row">
+                <label>File TTL (Hours)</label>
+                <input type="number" id="set-fileTtlHours" min="-1" max="168" step="1">
+                <div class="desc">Hours to keep files before cleanup. 0=delete immediately, -1=never auto-delete, 24=default</div>
+            </div>
+            <div class="info-box">
+                <strong>Benefits:</strong> Files persist across conversation turns, AI can search multiple times, reduced token usage, no hallucination.
+                <br><strong>Cost:</strong> $10 per 1,000 document_search invocations (on top of token costs).
+            </div>
         </div>
     </div>
     
@@ -3433,10 +4225,27 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
             </div>
             <div class="setting-row">
                 <div class="checkbox-row">
+                    <input type="checkbox" id="set-auditGeneration">
+                    <label>Audit AI Generations</label>
+                </div>
+                <div class="desc">Save full AI response text to Couchbase (<code>debug:{sessionId}</code>) for debugging hash mismatches</div>
+            </div>
+            <div class="setting-row">
+                <div class="checkbox-row">
                     <input type="checkbox" id="set-enableSound">
                     <label>Enable Sound</label>
                 </div>
                 <div class="desc">Play sound when task completes</div>
+            </div>
+        </div>
+        <div class="settings-group">
+            <h3>Log Locations</h3>
+            <div class="setting-row">
+                <div class="desc" style="font-family: monospace; font-size: 11px; background: #1e1e1e; padding: 10px; border-radius: 4px;">
+                    <strong>Output Channel:</strong> View → Output → "Grok AI Coder"<br>
+                    <strong>Audit Documents:</strong> Couchbase key <code>debug:{sessionId}</code><br>
+                    <strong>Error Dashboard:</strong> <code>tools/error_dashboard.py</code> → http://localhost:5050
+                </div>
             </div>
         </div>
     </div>
@@ -4021,8 +4830,16 @@ function populateSettings(s){
     document.getElementById('set-requestFormat').value=s.requestFormat||'json';
     document.getElementById('set-responseFormat').value=s.responseFormat||'json';
     document.getElementById('set-jsonCleanup').value=s.jsonCleanup||'auto';
+    document.getElementById('set-useStructuredOutputs').checked=s.useStructuredOutputs||false;
+    // Files API
+    document.getElementById('set-useFilesApi').checked=s.useFilesApi||false;
+    document.getElementById('set-autoUploadFiles').checked=s.autoUploadFiles!==false;
+    document.getElementById('set-maxUploadSize').value=Math.round((s.maxUploadSize||10485760)/1048576);
+    document.getElementById('set-cleanupFilesOnSessionEnd').checked=s.cleanupFilesOnSessionEnd!==false;
+    document.getElementById('set-fileTtlHours').value=s.fileTtlHours!==undefined?s.fileTtlHours:24;
     // Debug
     document.getElementById('set-debug').checked=s.debug||false;
+    document.getElementById('set-auditGeneration').checked=s.auditGeneration||false;
     document.getElementById('set-enableSound').checked=s.enableSound||false;
     
     updateDeploymentFields();
@@ -4063,8 +4880,16 @@ function collectSettings(){
         requestFormat:document.getElementById('set-requestFormat').value,
         responseFormat:document.getElementById('set-responseFormat').value,
         jsonCleanup:document.getElementById('set-jsonCleanup').value,
+        useStructuredOutputs:document.getElementById('set-useStructuredOutputs').checked,
+        // Files API
+        useFilesApi:document.getElementById('set-useFilesApi').checked,
+        autoUploadFiles:document.getElementById('set-autoUploadFiles').checked,
+        maxUploadSize:parseInt(document.getElementById('set-maxUploadSize').value)*1048576||10485760,
+        cleanupFilesOnSessionEnd:document.getElementById('set-cleanupFilesOnSessionEnd').checked,
+        fileTtlHours:parseInt(document.getElementById('set-fileTtlHours').value)||24,
         // Debug
         debug:document.getElementById('set-debug').checked,
+        auditGeneration:document.getElementById('set-auditGeneration').checked,
         enableSound:document.getElementById('set-enableSound').checked
     };
 }
@@ -4452,10 +5277,10 @@ hist.innerHTML='';m.sessions.forEach(s=>{const d=document.createElement('div');d
 const sum=document.createElement('div');sum.className='hist-sum';sum.textContent=s.summary||'New chat';sum.title=s.summary||'';
 const meta=document.createElement('div');meta.className='hist-meta';meta.textContent=timeAgo(s.updatedAt)+(s.pairCount?' · '+s.pairCount+' msgs':'');
 d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'loadSession',sessionId:s.id});};hist.appendChild(d);});break;
-case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;updUI();hideStickySummary();scrollToBottom();break;
+case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;activityLog=[];updUI();hideStickySummary();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
-if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';let content='<div class="msg-actions">'+bugBtn+'</div>';if(m.imageGalleryHtml){content+=m.imageGalleryHtml;}else{content+=fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup);}curDiv.querySelector('.c').innerHTML=content;if(m.response?.usage)updStats(m.response.usage);}
+if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';let content='<div class="msg-actions">'+bugBtn+'</div>';const persistedActivity=fmtActivityLog(activityLog,true);content+=persistedActivity;if(m.imageGalleryHtml){content+=m.imageGalleryHtml;}else{content+=fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup);}curDiv.querySelector('.c').innerHTML=content;if(m.response?.usage)updStats(m.response.usage);}
 // Use structured TODOs if available, fallback to legacy parsing
 let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
@@ -4470,7 +5295,7 @@ lastResponseSummary=m.structured?.summary||'';
 lastResponseNextSteps=m.structured?.nextSteps||[];
 stickySummaryDismissed=false;
 updateStickySummary();
-busy=0;curDiv=null;stream='';updUI();scrollToBottom();saveChatState();break;
+busy=0;curDiv=null;stream='';activityLog=[];updUI();scrollToBottom();saveChatState();break;
 case'requestCancelled':if(curDiv){curDiv.classList.add('e');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44;margin-top:6px">⏹ Cancelled</div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');const pi=parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';const errInfo=categorizeError(m.message);curDiv.querySelector('.c').innerHTML='<div class="msg-actions">'+bugBtn+'</div><div style="color:#c44">⚠️ Error: '+esc(m.message)+'</div>'+(errInfo.suggestion?'<div class="error-suggestion">💡 '+esc(errInfo.suggestion)+'</div>':'')+'<div class="error-btns"><button class="btn btn-s" onclick="vs.postMessage({type:\\'retryLastRequest\\'})">Retry</button><button class="btn btn-s btn-diag" onclick="diagnoseError(\\''+esc(m.message.replace(/'/g,"\\\\'")||'')+'\\')">🔍 Diagnose</button></div>';}busy=0;curDiv=null;stream='';updUI();break;
 case'usageUpdate':updStats(m.usage);break;
@@ -4613,8 +5438,47 @@ a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(
 }
 else{a.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinal(p.response.text||'',p.response.usage,null)+'</div>';}
 chat.appendChild(a);}
-let streamExpanded=false;
-function updStream(){if(!curDiv)return;const isJson=stream.trim().startsWith('{');const arrowClass=streamExpanded?'think-arrow open':'think-arrow';const contentClass=streamExpanded?'stream-content show':'stream-content';curDiv.querySelector('.c').innerHTML='<div class="think"><div class="spin"></div><span class="think-toggle" onclick="toggleStream()"><span class="'+arrowClass+'">▶</span> Generating...</span></div>'+(isJson?'':'<div class="'+contentClass+'">'+fmtMd(stream.slice(-800))+'</div>');}
+let streamExpanded=true;
+let activityLog=[];
+function extractActivityItems(text){
+// Extract key operations: searches, file results, URL fetches, reads
+const lines=text.trim().split('\\n').filter(l=>l.trim());
+return lines.filter(line=>{
+return line.includes('🔍')||line.includes('✅')||line.includes('🌐')||
+       line.includes('📄')||line.includes('└─')||line.includes('⚠️')||
+       line.includes('🔄')||line.includes('❌');
+});
+}
+function fmtActivityItem(line){
+let cls='';
+if(line.includes('🔍')||line.includes('Searching'))cls='search';
+else if(line.includes('✅'))cls='success';
+else if(line.includes('🌐'))cls='url';
+else if(line.includes('⚠️')||line.includes('❌'))cls='error';
+else if(line.includes('└─'))cls='file';
+else if(line.includes('📄')||line.includes('🔄'))cls='file';
+return '<div class="activity-item '+cls+'">'+esc(line)+'</div>';
+}
+function fmtActivityLog(items,forPersist){
+if(items.length===0)return '';
+const cls=forPersist?'activity-log-persisted':'activity-log';
+const header=forPersist?'<div class="activity-log-header">📋 Context loaded</div>':'<div class="activity-log-header">📋 Loading context...</div>';
+return '<div class="'+cls+'">'+header+items.map(fmtActivityItem).join('')+'</div>';
+}
+function updStream(){
+if(!curDiv)return;
+const isJson=stream.trim().startsWith('{');
+const arrowClass=streamExpanded?'think-arrow open':'think-arrow';
+const contentClass=streamExpanded?'stream-content show':'stream-content';
+// Update activity log with new items
+const newItems=extractActivityItems(stream);
+newItems.forEach(item=>{if(!activityLog.includes(item))activityLog.push(item);});
+// Build HTML: spinner + streaming text + activity log
+let html='<div class="think"><div class="spin"></div><span class="think-toggle" onclick="toggleStream()"><span class="'+arrowClass+'">▶</span> Generating...</span></div>';
+if(!isJson){html+='<div class="'+contentClass+'">'+esc(stream.slice(-500))+'</div>';}
+html+=fmtActivityLog(activityLog,false);
+curDiv.querySelector('.c').innerHTML=html;
+}
 function toggleStream(){streamExpanded=!streamExpanded;updStream();}
 function fmtFinal(t,u,diffPreview){const result=fmtCode(t,diffPreview);let h=result.html;
 // Build done bar with optional action buttons

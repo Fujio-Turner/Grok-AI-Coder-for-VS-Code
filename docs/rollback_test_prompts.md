@@ -4,7 +4,7 @@
 - `rollback_test_template.py` - Original template (never modify)
 - `rollback_test.py` - Working copy (gets modified during test)
 
-This tests the change history and rollback feature by making 5 sequential changes, then rolling them all back. Also tests CRU (Create, Read, Update) operations.
+This tests the change history and rollback feature by making 5 sequential changes, then rolling them all back.
 
 ---
 
@@ -21,97 +21,80 @@ cp rollback_test_template.py rollback_test.py
 
 | Issue | Solution |
 |-------|----------|
-| "terminated" error | Wait 30s, try again (rate limiting) |
-| `contextFiles: []` | File not in workspace - copy it there |
-| AI does all steps at once | Repeat "ONLY do one change, then STOP" |
+| "terminated" error | Check `grok.useFilesApi` is `false` in settings |
+| AI does all steps at once | Be firm: "STOP after this one change" |
 | AI creates new file | Say "MODIFY the existing file, don't create new" |
-| File already modified | Reset from template (see above) |
+| AI asks for file | Attach rollback_test.py with backtick (\`) |
+| Hash mismatch error | File was modified since AI read it - re-attach |
 
 ---
 
-## Step 1: Find File and Start the Task
+## The 5 Changes (Reference)
+
+The test modifies `original_document` dict in `rollback_test.py`:
+
+| Change | Line | Original | Modified To |
+|--------|------|----------|-------------|
+| 1 | 10 | `return 'Hello'` | `return 'Bonjour!'` |
+| 2 | 11 | `return a + b` | `return a + b + 100` |
+| 3 | 12 | `return a * b` | `return a * b * 2` |
+| 4 | 13 | `n % 2 == 0` | `n % 2 != 0` |
+| 5 | 14 | `s.upper()` | `s.lower()` |
+
+---
+
+## Step 1: Initial Prompt (All Changes Specified)
 
 **User Prompt:**
 ```
-Find the rollback test file and MODIFY its original_document dict. I need to make 5 changes total.
+Find the rollback test file and MODIFY its original_document dict. 
+
+I need you to make these 5 changes, ONE AT A TIME:
+1. func1 greet: change 'Hello' → 'Bonjour!'
+2. func2 add: change 'a + b' → 'a + b + 100'
+3. func3 multiply: change 'a * b' → 'a * b * 2'
+4. func4 is_even: change 'n % 2 == 0' → 'n % 2 != 0'
+5. func5 uppercase: change '.upper()' → '.lower()'
 
 IMPORTANT RULES:
-1. Do ONLY ONE change per response (start with greet → "Bonjour!")
-2. After completing ONE change, STOP and wait for me to say "continue"
-3. Do NOT create new files - modify the existing file directly
+- Do ONLY change #1 now
+- After applying ONE change, STOP and wait for me to say "continue"
+- Do NOT create new files - modify the existing rollback_test.py directly
 
-Change 1: In original_document, change greet to return "Bonjour!" instead of "Hello"
+Start with change #1: In original_document, change greet to return "Bonjour!" instead of "Hello"
 ```
 
 **Expected Result:**
-- AI finds `rollback_test.py` using file search (OS-agnostic)
-- Loads the file content
-- Modifies ONLY the greet function in original_document
-- Line 10 modified: `"func1": "def greet(): return 'Bonjour!'"`
-- Change History shows: Change #1 - 1 file
-- Waits for user to say "continue"
+- AI finds `rollback_test.py`
+- Modifies ONLY line 10: `"func1": "def greet(): return 'Bonjour!'"`
+- Change History shows: Change #1 - 1 file, modified: 1
+- AI stops and waits
 
 ---
 
-## Step 2: Second Change
+## Steps 2-5: Continue with Remaining Changes
 
 **User Prompt:**
 ```
 continue
 ```
 
-**Expected Result:**
-- AI changes add function to return `a + b + 100`
-- Line 11 modified: `"func2": "def add(a, b): return a + b + 100"`
-- Change History shows: Change #2 - 1 file
+Repeat "continue" for each remaining change. The AI knows the full plan from Step 1.
 
----
+**Expected Results:**
 
-## Step 3: Third Change
-
-**User Prompt:**
-```
-continue
-```
-
-**Expected Result:**
-- AI changes multiply function to return `a * b * 2`
-- Line 12 modified: `"func3": "def multiply(a, b): return a * b * 2"`
-- Change History shows: Change #3 - 1 file
-
----
-
-## Step 4: Fourth Change
-
-**User Prompt:**
-```
-continue
-```
-
-**Expected Result:**
-- AI changes is_even to check `n % 2 != 0` (inverted logic)
-- Line 13 modified: `"func4": "def is_even(n): return n % 2 != 0"`
-- Change History shows: Change #4 - 1 file
-
----
-
-## Step 5: Fifth Change
-
-**User Prompt:**
-```
-continue
-```
-
-**Expected Result:**
-- AI changes uppercase to use `.lower()` instead of `.upper()`
-- Line 14 modified: `"func5": "def uppercase(s): return s.lower()"`
-- Change History shows: Change #5 - 1 file
+| Step | Line Modified | New Value |
+|------|---------------|-----------|
+| 2 | 11 | `"def add(a, b): return a + b + 100"` |
+| 3 | 12 | `"def multiply(a, b): return a * b * 2"` |
+| 4 | 13 | `"def is_even(n): return n % 2 != 0"` |
+| 5 | 14 | `"def uppercase(s): return s.lower()"` |
 
 ---
 
 ## Verification: All Changes Applied
 
-At this point, `original_document` should look like:
+After all 5 changes, `original_document` should look like:
 ```python
 original_document = {
     "func1": "def greet(): return 'Bonjour!'",
@@ -122,23 +105,16 @@ original_document = {
 }
 ```
 
+Change History panel should show 5 separate entries.
+
 ---
 
 ## Rollback Testing
 
-### Rollback 1
+### Rollback All Changes
 
 **User Action:**
-Click the **◀ Rewind** button in Change History panel, or click on Change #4
-
-**Expected Result:**
-- Change #5 reverted (uppercase back to `.upper()`)
-- Position indicator moves to Change #4
-
-### Rollback 2-5
-
-**User Action:**
-Continue clicking **◀ Rewind** until at original state
+Click the **◀ Rewind** button in Change History panel 5 times, or click directly on the earliest entry.
 
 **Expected Result After All Rollbacks:**
 ```python
@@ -163,6 +139,8 @@ Run the rollback_test.py script to verify the document is back to original state
 **Expected Output:**
 ```
 ✅ SUCCESS: Document restored to original state!
+   Original: <hash>
+   Final:    <hash>
 ```
 
 ---
@@ -171,8 +149,29 @@ Run the rollback_test.py script to verify the document is back to original state
 
 | Feature | Tested |
 |---------|--------|
-| Change tracking | ✅ 5 changes recorded |
-| Diff stats | ✅ +/- lines shown |
+| File search | ✅ AI finds file in workspace |
+| lineOperations | ✅ Single-line replacements |
+| Hash verification | ✅ AI must provide correct file hash |
+| Change tracking | ✅ 5 separate changes recorded |
+| Diff stats | ✅ modified: 1 for each change |
 | Rollback UI | ✅ Rewind button works |
 | Content restoration | ✅ Original content restored |
 | Couchbase persistence | ✅ History saved to session |
+
+---
+
+## Alternative: Single-Shot Test (All 5 at Once)
+
+If you want to test applying all changes in one request:
+
+**User Prompt:**
+```
+Find rollback_test.py and modify original_document with ALL these changes at once:
+1. func1: 'Hello' → 'Bonjour!'
+2. func2: 'a + b' → 'a + b + 100'
+3. func3: 'a * b' → 'a * b * 2'
+4. func4: 'n % 2 == 0' → 'n % 2 != 0'
+5. func5: '.upper()' → '.lower()'
+```
+
+This creates a single Change History entry with all 5 modifications.
