@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { changeTracker, FileChange, ChangeSet, DiffStats } from './changeTracker';
+import { createFileBackup, getOriginalBackup, restoreFromBackup, FileBackupReference } from '../storage/chatSessionRepository';
 
 /**
  * Resolves a file path (absolute, relative, or file:// URI) to a vscode.Uri.
@@ -122,6 +123,8 @@ export interface ApplyResult {
     failedDiffs?: string[];
     /** True if NO actual changes were made - rollback impossible */
     noActualChanges?: boolean;
+    /** Backup references created for original files (before first modification) */
+    backups?: Map<string, FileBackupReference>;
 }
 
 const editSnapshots: Map<string, FileSnapshot[]> = new Map();
@@ -238,11 +241,13 @@ export async function applyEdits(
     editGroupId: string,
     sessionId?: string,
     cost: number = 0,
-    tokensUsed: number = 0
+    tokensUsed: number = 0,
+    pairIndex: number = 0
 ): Promise<ApplyResult> {
     const workspaceEdit = new vscode.WorkspaceEdit();
     const snapshots: FileSnapshot[] = [];
     const fileChanges: FileChange[] = [];
+    const backupRefs: Map<string, FileBackupReference> = new Map();
 
     changeTracker.startTracking();
 
@@ -258,6 +263,30 @@ export async function applyEdits(
                 uri: edit.fileUri,
                 content: oldContent
             });
+            
+            // Create backup of original file before first modification
+            // Only backs up if no backup exists for this file yet
+            if (sessionId && oldContent) {
+                try {
+                    const existingBackup = await getOriginalBackup(edit.fileUri.fsPath);
+                    if (!existingBackup) {
+                        const backupRef = await createFileBackup(
+                            edit.fileUri.fsPath,
+                            oldContent,
+                            sessionId,
+                            pairIndex
+                        );
+                        if (backupRef) {
+                            backupRefs.set(edit.fileUri.fsPath, backupRef);
+                            console.log(`[Grok] Created original backup for ${edit.fileUri.fsPath}`);
+                        }
+                    } else {
+                        console.log(`[Grok] Original backup already exists for ${edit.fileUri.fsPath}`);
+                    }
+                } catch (backupErr) {
+                    console.error(`[Grok] Failed to create backup for ${edit.fileUri.fsPath}:`, backupErr);
+                }
+            }
         } catch {
             // File doesn't exist yet
         }
@@ -358,7 +387,8 @@ export async function applyEdits(
         success: true, 
         changeSet,
         failedDiffs: identicalChanges.map(fc => fc.filePath),
-        noActualChanges
+        noActualChanges,
+        backups: backupRefs.size > 0 ? backupRefs : undefined
     };
 }
 
@@ -397,6 +427,70 @@ export async function revertEdits(editGroupId: string): Promise<void> {
         }
     } else {
         throw new Error('Failed to revert edits');
+    }
+}
+
+/**
+ * Revert a file to its original state using the Couchbase backup.
+ * This is the ultimate fallback - restores the file to its state before ANY AI modifications.
+ * @param filePath Absolute path to the file to revert
+ * @param save Whether to save the file to disk after reverting (default: true)
+ * @returns true if successful, false otherwise
+ */
+export async function revertToOriginalBackup(filePath: string, save: boolean = true): Promise<boolean> {
+    try {
+        const backup = await getOriginalBackup(filePath);
+        if (!backup) {
+            console.error(`[Grok] No original backup found for ${filePath}`);
+            return false;
+        }
+        
+        const originalContent = await restoreFromBackup(backup.id);
+        if (!originalContent) {
+            console.error(`[Grok] Failed to restore content from backup ${backup.id}`);
+            return false;
+        }
+        
+        const uri = vscode.Uri.file(filePath);
+        const workspaceEdit = new vscode.WorkspaceEdit();
+        
+        try {
+            const doc = await vscode.workspace.openTextDocument(uri);
+            const fullRange = new vscode.Range(
+                doc.positionAt(0),
+                doc.positionAt(doc.getText().length)
+            );
+            workspaceEdit.replace(uri, fullRange, originalContent);
+        } catch {
+            // File doesn't exist - create it
+            workspaceEdit.createFile(uri, { overwrite: true });
+            workspaceEdit.insert(uri, new vscode.Position(0, 0), originalContent);
+        }
+        
+        const success = await vscode.workspace.applyEdit(workspaceEdit);
+        if (!success) {
+            console.error(`[Grok] Failed to apply workspace edit for ${filePath}`);
+            return false;
+        }
+        
+        // Save to disk if requested
+        if (save) {
+            try {
+                const doc = await vscode.workspace.openTextDocument(uri);
+                await doc.save();
+                console.log(`[Grok] Reverted and saved ${filePath} to original backup (MD5: ${backup.originalMd5})`);
+            } catch (saveErr) {
+                console.error(`[Grok] Failed to save reverted file ${filePath}:`, saveErr);
+                return false;
+            }
+        } else {
+            console.log(`[Grok] Reverted ${filePath} to original backup (MD5: ${backup.originalMd5}) - NOT SAVED`);
+        }
+        
+        return true;
+    } catch (err) {
+        console.error(`[Grok] Error reverting ${filePath} to original:`, err);
+        return false;
     }
 }
 

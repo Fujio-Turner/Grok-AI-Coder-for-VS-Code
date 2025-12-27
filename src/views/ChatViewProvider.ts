@@ -64,7 +64,8 @@ import {
     applySimpleDiff,
     validateFileChange,
     resolveFilePathToUri,
-    resolveFilePathToUriWithSearch
+    resolveFilePathToUriWithSearch,
+    revertToOriginalBackup
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
@@ -283,8 +284,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'downloadImage':
                     await this._downloadImage(message.url, message.filename);
                     break;
+                case 'revertToOriginal':
+                    await this._revertFileToOriginal(message.filePath);
+                    break;
             }
         });
+    }
+    
+    /**
+     * Revert a file to its original state (before any AI modifications) and save to disk.
+     */
+    private async _revertFileToOriginal(filePath: string) {
+        try {
+            const success = await revertToOriginalBackup(filePath, true);
+            if (success) {
+                vscode.window.showInformationMessage(`Reverted ${filePath.split('/').pop()} to original and saved`);
+                // Refresh change history display
+                this._sendInitialChanges();
+            } else {
+                vscode.window.showErrorMessage(`Failed to revert ${filePath.split('/').pop()} - no original backup found`);
+            }
+        } catch (err: any) {
+            vscode.window.showErrorMessage(`Error reverting file: ${err.message}`);
+        }
     }
 
     private _sendInitialChanges() {
@@ -2941,12 +2963,14 @@ ${cliSummary}
                 : 0;
             const tokensUsed = lastSuccessPair.response.usage?.totalTokens || 0;
 
+            const currentPairIndex = session.pairs.length - 1;
             const result = await doApplyEdits(
                 editsToApply, 
                 editGroupId, 
                 this._currentSessionId,
                 cost,
-                tokensUsed
+                tokensUsed,
+                currentPairIndex
             );
 
             if (!result.success) {
@@ -2976,8 +3000,7 @@ ${cliSummary}
 
             vscode.window.showInformationMessage(`Applied ${editsToApply.length} edit(s)`);
             
-            // Track file updates in pairFileHistory
-            const currentPairIndex = session.pairs.length - 1;
+            // Track file updates in pairFileHistory (currentPairIndex already defined above)
             for (const edit of editsToApply) {
                 try {
                     // Read the file after applying to get current MD5
@@ -3564,8 +3587,11 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .change-item.current{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
 .change-item.applied{border-left:3px solid var(--vscode-testing-iconPassed)}
 .change-item.reverted{border-left:3px solid var(--vscode-descriptionForeground);opacity:.7}
-.change-files{display:flex;flex-wrap:wrap;gap:4px;font-size:11px}
+.change-files{display:flex;flex-direction:column;gap:4px;font-size:11px}
+.change-file-row{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%}
 .change-file{background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);padding:2px 6px;border-radius:3px;font-size:10px}
+.revert-original-btn{background:var(--vscode-button-secondaryBackground);border:1px solid var(--vscode-button-border,transparent);cursor:pointer;font-size:11px;padding:4px 8px;border-radius:4px;transition:opacity .2s,background .2s;color:var(--vscode-button-secondaryForeground);white-space:nowrap}
+.revert-original-btn:hover{background:var(--vscode-button-secondaryHoverBackground,var(--vscode-button-secondaryBackground));opacity:0.9}
 .change-stats{display:flex;gap:8px;align-items:center;font-size:11px}
 .change-meta{display:flex;gap:8px;font-size:10px;color:var(--vscode-descriptionForeground)}
 .change-cost{color:var(--vscode-charts-green)}
@@ -5026,11 +5052,31 @@ function renderChanges(){
     changeHistory.forEach((cs,i)=>{
         const div=document.createElement('div');div.className='change-item'+(i===currentChangePos?' current':'')+(cs.applied?' applied':' reverted');
         div.dataset.id=cs.id;div.dataset.pos=i;
-        const files=cs.files.map(f=>'<span class="change-file">'+esc(f.fileName)+'</span>').join('');
+        // Render each file with a revert button
+        const filesHtml=cs.files.map(f=>{
+            const revertBtn='<button class="revert-original-btn" data-path="'+esc(f.filePath)+'" title="Revert to original and save to disk">↩ Revert</button>';
+            return '<div class="change-file-row"><span class="change-file">'+esc(f.fileName)+'</span>'+revertBtn+'</div>';
+        }).join('');
         const stats='<span class="stat-add">+'+cs.totalStats.added+'</span><span class="stat-rem">-'+cs.totalStats.removed+'</span>'+(cs.totalStats.modified>0?'<span class="stat-mod">~'+cs.totalStats.modified+'</span>':'');
-        div.innerHTML='<div class="change-files">'+files+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span></div>';
-        div.onclick=()=>{const pos=parseInt(div.dataset.pos);if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:cs.id});else if(pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:cs.id});};
+        div.innerHTML='<div class="change-files">'+filesHtml+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span></div>';
+        // Navigate to this changeset on click (but not on revert button)
+        div.onclick=(e)=>{
+            if(e.target.classList.contains('revert-original-btn'))return;
+            const pos=parseInt(div.dataset.pos);
+            if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:cs.id});
+            else if(pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:cs.id});
+        };
         changesList.appendChild(div);
+    });
+    // Attach revert button handlers
+    document.querySelectorAll('.revert-original-btn').forEach(btn=>{
+        btn.onclick=(e)=>{
+            e.stopPropagation();
+            const filePath=btn.dataset.path;
+            if(confirm('Revert '+filePath.split('/').pop()+' to original and save to disk?')){
+                vs.postMessage({type:'revertToOriginal',filePath});
+            }
+        };
     });
 }
 

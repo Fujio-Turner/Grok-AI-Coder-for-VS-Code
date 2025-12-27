@@ -381,6 +381,40 @@ export interface UploadedFileRecord {
  */
 export type PairFileOperationType = 'read' | 'update' | 'create' | 'delete';
 
+// ============================================================================
+// File Backup Types - Original file storage for 100% recovery
+// ============================================================================
+
+/**
+ * File backup document stored in Couchbase.
+ * Key format: backup:{hash(path)}:{md5(original_content)}
+ * This allows us to always recover the original file before any AI modifications.
+ */
+export interface FileBackupDocument {
+    id: string;                     // Same as document key
+    docType: 'file-backup';
+    filePath: string;               // Full absolute path to the file
+    fileName: string;               // Just the filename
+    originalMd5: string;            // MD5 hash of the original content
+    pathHash: string;               // SHA256 hash of the file path (first 16 chars)
+    createdAt: string;              // When backup was created
+    createdBySession: string;       // Session ID that triggered the backup
+    createdByPair: number;          // Pair index when backup was created
+    sizeBytes: number;              // Original file size
+    contentBase64: string;          // Base64-encoded gzip-compressed content
+    encoding: 'gzip+base64';        // Compression method used
+}
+
+/**
+ * Reference to a file backup stored in pairFileHistory.
+ * This links the backup to a specific file operation.
+ */
+export interface FileBackupReference {
+    backupId: string;               // Document key in Couchbase
+    originalMd5: string;            // MD5 of original content
+    filePath: string;               // For quick lookup
+}
+
 /**
  * Who triggered the file operation:
  * - 'user': User manually attached or applied file
@@ -396,6 +430,7 @@ export interface PairFileOperation {
     dt: number;             // Unix timestamp (milliseconds)
     size?: number;          // File size in bytes (optional)
     by: PairFileOperationBy; // Who triggered this operation
+    backup?: FileBackupReference;  // Reference to original file backup (for first update only)
 }
 
 /**
@@ -2075,4 +2110,210 @@ export async function deleteSessionWithExtensions(sessionId: string): Promise<bo
     const success = await client.remove(sessionId);
     console.log('Deleted session:', sessionId);
     return success;
+}
+
+// ============================================================================
+// File Backup Functions - Store and retrieve original files
+// ============================================================================
+
+import * as zlib from 'zlib';
+import { promisify } from 'util';
+
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
+
+/**
+ * Generate backup document key from file path and content hash.
+ * Format: backup:{pathHash}:{md5}
+ */
+export function getBackupKey(filePath: string, md5: string): string {
+    const pathHash = crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 16);
+    return `backup:${pathHash}:${md5}`;
+}
+
+/**
+ * Check if a backup already exists for a file path.
+ * Returns the backup document if found, null otherwise.
+ */
+export async function getExistingBackupForFile(filePath: string): Promise<FileBackupDocument | null> {
+    const client = getCouchbaseClient();
+    const pathHash = crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 16);
+    
+    // Query for any backup with this path hash
+    try {
+        const query = `
+            SELECT META().id, b.*
+            FROM \`grokCoder\`._default._default b
+            WHERE b.docType = 'file-backup'
+            AND b.pathHash = $pathHash
+            ORDER BY b.createdAt ASC
+            LIMIT 1
+        `;
+        const result = await client.query(query, { pathHash });
+        if (result && result.length > 0) {
+            return result[0] as FileBackupDocument;
+        }
+    } catch (err) {
+        console.error('Failed to query for existing backup:', err);
+    }
+    return null;
+}
+
+/**
+ * Create a backup of a file before first modification.
+ * Only creates if no backup exists for this file.
+ * Returns the backup reference to store in pairFileHistory.
+ */
+export async function createFileBackup(
+    filePath: string,
+    content: string,
+    sessionId: string,
+    pairIndex: number
+): Promise<FileBackupReference | null> {
+    const client = getCouchbaseClient();
+    
+    // Compute MD5 of original content
+    const originalMd5 = crypto.createHash('md5').update(content).digest('hex');
+    const pathHash = crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 16);
+    const backupId = getBackupKey(filePath, originalMd5);
+    
+    // Check if this exact backup already exists
+    try {
+        const existing = await client.get<FileBackupDocument>(backupId);
+        if (existing && existing.content) {
+            console.log('Backup already exists:', backupId);
+            return {
+                backupId,
+                originalMd5,
+                filePath
+            };
+        }
+    } catch {
+        // Backup doesn't exist, create it
+    }
+    
+    // Compress content
+    const contentBuffer = Buffer.from(content, 'utf8');
+    const compressed = await gzipAsync(contentBuffer);
+    const contentBase64 = compressed.toString('base64');
+    
+    const fileName = filePath.split('/').pop() || filePath;
+    
+    const backupDoc: FileBackupDocument = {
+        id: backupId,
+        docType: 'file-backup',
+        filePath,
+        fileName,
+        originalMd5,
+        pathHash,
+        createdAt: new Date().toISOString(),
+        createdBySession: sessionId,
+        createdByPair: pairIndex,
+        sizeBytes: content.length,
+        contentBase64,
+        encoding: 'gzip+base64'
+    };
+    
+    const success = await client.insert(backupId, backupDoc);
+    if (success) {
+        console.log('Created file backup:', backupId, `(${content.length} bytes → ${contentBase64.length} base64)`);
+        return {
+            backupId,
+            originalMd5,
+            filePath
+        };
+    }
+    
+    console.error('Failed to create file backup:', backupId);
+    return null;
+}
+
+/**
+ * Retrieve a backup document by its ID.
+ */
+export async function getFileBackup(backupId: string): Promise<FileBackupDocument | null> {
+    const client = getCouchbaseClient();
+    try {
+        const result = await client.get<FileBackupDocument>(backupId);
+        if (result && result.content) {
+            return result.content;
+        }
+    } catch (err) {
+        console.error('Failed to get file backup:', backupId, err);
+    }
+    return null;
+}
+
+/**
+ * Restore file content from a backup.
+ * Returns the original content as a string.
+ */
+export async function restoreFromBackup(backupId: string): Promise<string | null> {
+    const backup = await getFileBackup(backupId);
+    if (!backup) {
+        return null;
+    }
+    
+    try {
+        const compressed = Buffer.from(backup.contentBase64, 'base64');
+        const decompressed = await gunzipAsync(compressed);
+        return decompressed.toString('utf8');
+    } catch (err) {
+        console.error('Failed to decompress backup:', backupId, err);
+        return null;
+    }
+}
+
+/**
+ * Get the original backup for a file (the first backup ever created).
+ * This is the baseline for revision history.
+ */
+export async function getOriginalBackup(filePath: string): Promise<FileBackupDocument | null> {
+    return getExistingBackupForFile(filePath);
+}
+
+/**
+ * Get all backups for a file, ordered by creation date.
+ * Useful for building a revision history.
+ */
+export async function getAllBackupsForFile(filePath: string): Promise<FileBackupDocument[]> {
+    const client = getCouchbaseClient();
+    const pathHash = crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 16);
+    
+    try {
+        const query = `
+            SELECT META().id, b.*
+            FROM \`grokCoder\`._default._default b
+            WHERE b.docType = 'file-backup'
+            AND b.pathHash = $pathHash
+            ORDER BY b.createdAt ASC
+        `;
+        const result = await client.query(query, { pathHash });
+        return (result || []) as FileBackupDocument[];
+    } catch (err) {
+        console.error('Failed to get backups for file:', filePath, err);
+        return [];
+    }
+}
+
+/**
+ * Get file backups created by a specific session.
+ */
+export async function getBackupsForSession(sessionId: string): Promise<FileBackupDocument[]> {
+    const client = getCouchbaseClient();
+    
+    try {
+        const query = `
+            SELECT META().id, b.*
+            FROM \`grokCoder\`._default._default b
+            WHERE b.docType = 'file-backup'
+            AND b.createdBySession = $sessionId
+            ORDER BY b.createdAt ASC
+        `;
+        const result = await client.query(query, { sessionId });
+        return (result || []) as FileBackupDocument[];
+    } catch (err) {
+        console.error('Failed to get backups for session:', sessionId, err);
+        return [];
+    }
 }
