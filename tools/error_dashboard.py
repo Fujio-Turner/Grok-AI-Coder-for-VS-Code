@@ -730,9 +730,10 @@ DASHBOARD_HTML = """
             const categoryClass = `category-${e.category}`;
             const userBadge = e.reportedBy === 'user' ? '<span class="user-badge">👤 USER</span>' : '';
             const sessionTypeBadge = getSessionTypeBadge(e.sessionId);
+            const auditBadge = e.hasAudit ? '<span class="audit-badge">🔍 AUDIT</span>' : '';
             return `
                 <tr data-type="${e.type}" data-session="${e.sessionId}" data-pair="${e.pairIndex}">
-                    <td><span class="type-badge type-${e.type}">${e.type.toUpperCase()}</span>${userBadge}</td>
+                    <td><span class="type-badge type-${e.type}">${e.type.toUpperCase()}</span>${userBadge}${auditBadge}</td>
                     <td><span class="type-badge ${categoryClass}">${e.category}</span></td>
                     <td class="timestamp">${formatTime(e.timestamp)}</td>
                     <td><a class="session-link" onclick="viewSession('${e.sessionId}', ${e.pairIndex})">${e.sessionId.slice(0, 8)}...</a>${sessionTypeBadge}</td>
@@ -1090,13 +1091,22 @@ DASHBOARD_HTML = """
                 const audit = await resp.json();
                 
                 let html = `
-                    <h3>🔍 Generation Audit</h3>
-                    <div class="ai-inputs-intro">
-                        <p><strong>Full AI generations captured for debugging.</strong></p>
-                        <p>Document: <code>debug:${sessionId}</code></p>
-                        <p>Entries: ${audit.pairs?.length || 0} | Created: ${audit.createdAt?.slice(0, 10) || 'N/A'}</p>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; color: #888; font-size: 0.85em;">
+                        <span>🔍 <code>debug:${sessionId.slice(0,8)}...</code> | ${audit.pairs?.length || 0} entries</span>
+                        <span>${audit.createdAt?.slice(0, 10) || ''}</span>
                     </div>
                 `;
+                
+                // Helper to pretty-print JSON if possible
+                function formatGeneration(text) {
+                    if (!text) return 'N/A';
+                    try {
+                        const parsed = JSON.parse(text);
+                        return escapeHtml(JSON.stringify(parsed, null, 2));
+                    } catch {
+                        return escapeHtml(text);
+                    }
+                }
                 
                 // Render each audit entry (most recent first)
                 const entries = (audit.pairs || []).slice().reverse();
@@ -1117,7 +1127,7 @@ DASHBOARD_HTML = """
                                 <div class="debug-value" style="max-height: 100px; overflow: auto;">${escapeHtml(entry.userMessage || 'N/A')}</div>
                                 
                                 <div class="debug-label">Full AI Generation</div>
-                                <div class="audit-generation">${escapeHtml(entry.fullGeneration || 'N/A')}</div>
+                                <div class="audit-generation">${formatGeneration(entry.fullGeneration)}</div>
                                 
                                 ${entry.systemPromptPreview ? `
                                     <div class="debug-label" style="margin-top: 15px;">System Prompt (preview)</div>
@@ -1225,59 +1235,78 @@ def get_errors():
         ORDER BY d.updatedAt DESC
     """
     
+    # Query for sessions that have audit documents
+    audit_sessions_query = f"""
+        SELECT REPLACE(META(d).id, "debug:", "") as sessionId
+        FROM `{CB_BUCKET}` d
+        WHERE META(d).id LIKE "debug:%"
+    """
+    
     bugs = query_couchbase(bugs_query)
     failures = query_couchbase(failures_query)
     pair_errors = query_couchbase(pair_errors_query)
     cli_failures = query_couchbase(cli_failures_query)
     session_stats = query_couchbase(session_stats_query)
+    audit_sessions = query_couchbase(audit_sessions_query)
+    
+    # Build set of session IDs that have audit documents
+    sessions_with_audit = set(a.get('sessionId', '') for a in audit_sessions)
     
     session_ids = set()
     all_errors = []
     
     for b in bugs:
-        session_ids.add(b.get('sessionId', ''))
+        sid = b.get('sessionId', '')
+        session_ids.add(sid)
         all_errors.append({
             'type': 'bug', 'bugType': b.get('bugType', 'unknown'),
-            'timestamp': b.get('timestamp', ''), 'sessionId': b.get('sessionId', ''),
+            'timestamp': b.get('timestamp', ''), 'sessionId': sid,
             'pairIndex': b.get('pairIndex', 0),
             'description': f"[{b.get('bugType', 'unknown')}] {b.get('description', '')}",
             'details': f"Pair #{b.get('pairIndex', '?')}",
             'debugContext': b.get('debugContext'),
-            'reportedBy': b.get('reportedBy', 'script')  # 'user' or 'script'
+            'reportedBy': b.get('reportedBy', 'script'),  # 'user' or 'script'
+            'hasAudit': sid in sessions_with_audit
         })
     
     for f in failures:
-        session_ids.add(f.get('sessionId', ''))
+        sid = f.get('sessionId', '')
+        session_ids.add(sid)
         all_errors.append({
             'type': 'failure', 'timestamp': f.get('timestamp', ''),
-            'sessionId': f.get('sessionId', ''), 'pairIndex': f.get('pairIndex', 0),
+            'sessionId': sid, 'pairIndex': f.get('pairIndex', 0),
             'description': f"[{f.get('operationType', 'unknown')}] {f.get('filePath', '')}",
             'details': f.get('error', ''),
-            'debugContext': f.get('debugContext')
+            'debugContext': f.get('debugContext'),
+            'hasAudit': sid in sessions_with_audit
         })
     
     for p in pair_errors:
-        session_ids.add(p.get('sessionId', ''))
+        sid = p.get('sessionId', '')
+        session_ids.add(sid)
         all_errors.append({
             'type': 'error', 'timestamp': p.get('timestamp', ''),
-            'sessionId': p.get('sessionId', ''), 'pairIndex': p.get('pairIndex', 0),
+            'sessionId': sid, 'pairIndex': p.get('pairIndex', 0),
             'description': p.get('errorMessage', 'Unknown error'),
-            'details': f"Pair #{p.get('pairIndex', '?')}"
+            'details': f"Pair #{p.get('pairIndex', '?')}",
+            'hasAudit': sid in sessions_with_audit
         })
     
     for c in cli_failures:
-        session_ids.add(c.get('sessionId', ''))
+        sid = c.get('sessionId', '')
+        session_ids.add(sid)
         cmd = c.get('command', '')[:50]  # Truncate long commands
         auto_label = '🤖' if c.get('wasAutoExecuted') else '👤'
         all_errors.append({
             'type': 'cli', 'timestamp': c.get('timestamp', ''),
-            'sessionId': c.get('sessionId', ''), 'pairIndex': c.get('pairIndex', 0),
+            'sessionId': sid, 'pairIndex': c.get('pairIndex', 0),
             'description': f"[CLI {auto_label}] {cmd}",
             'details': c.get('error', c.get('stderr', '')),
             'command': c.get('command', ''),
             'exitCode': c.get('exitCode'),
             'wasAutoExecuted': c.get('wasAutoExecuted', False),
-            'wasWhitelisted': c.get('wasWhitelisted', False)
+            'wasWhitelisted': c.get('wasWhitelisted', False),
+            'hasAudit': sid in sessions_with_audit
         })
     
     all_errors.sort(key=lambda x: x['timestamp'], reverse=True)
