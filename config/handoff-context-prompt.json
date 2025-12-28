@@ -1,0 +1,6 @@
+{
+  "name": "handoff-context-prompt",
+  "description": "Prompt template injected when a session is a continuation from a previous session (handoff)",
+  "version": "1.0.0",
+  "promptTemplate": "\n\n## Handoff Context (CRITICAL - READ THIS FIRST)\nThis session is a continuation from a previous session. \n\n**⚠️ IMPORTANT: You MUST use the EXACT file paths listed below. Do NOT make up or invent file names.**\n\n{{handoffText}}"
+}

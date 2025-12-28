@@ -1,0 +1,28 @@
+{
+  "name": "image-prompts-schema",
+  "description": "JSON Schema for xAI Structured Outputs API - enforces valid image prompt array format",
+  "version": "1.0.0",
+  "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
+  "schema": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "image_prompts",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "prompts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "A detailed image generation prompt"
+            },
+            "description": "Array of distinct image generation prompts"
+          }
+        },
+        "required": ["prompts"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

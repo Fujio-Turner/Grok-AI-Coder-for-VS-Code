@@ -1,0 +1,140 @@
+{
+  "name": "json-cleanup-schema",
+  "description": "JSON Schema for xAI Structured Outputs API - enforces valid cleaned response format",
+  "version": "1.0.0",
+  "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
+  "note": "This uses the same schema as structured-output-schema.json since we're cleaning main AI responses",
+  "schema": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "grok_response",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "description": "Brief 1-2 sentence summary of the response"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "heading": { "type": "string", "description": "Section title" },
+                "content": { "type": "string", "description": "Plain text content" },
+                "codeBlocks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "language": { "type": "string" },
+                      "code": { "type": "string" },
+                      "caption": { "type": "string" }
+                    },
+                    "required": ["language", "code"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["heading", "content"],
+              "additionalProperties": false
+            }
+          },
+          "codeBlocks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string" },
+                "code": { "type": "string" },
+                "caption": { "type": "string" }
+              },
+              "required": ["language", "code"],
+              "additionalProperties": false
+            }
+          },
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": { "type": "string" },
+                "completed": { "type": "boolean" }
+              },
+              "required": ["text", "completed"],
+              "additionalProperties": false
+            }
+          },
+          "fileHashes": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "fileChanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "language": { "type": "string" },
+                "content": { "type": "string" },
+                "isDiff": { "type": "boolean" },
+                "lineRange": {
+                  "type": "object",
+                  "properties": {
+                    "start": { "type": "integer" },
+                    "end": { "type": "integer" }
+                  },
+                  "required": ["start", "end"],
+                  "additionalProperties": false
+                },
+                "lineOperations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": { "type": "string", "enum": ["insert", "delete", "replace", "insertAfter", "insertBefore"] },
+                      "line": { "type": "integer" },
+                      "expectedContent": { "type": "string" },
+                      "newContent": { "type": "string" }
+                    },
+                    "required": ["type", "line"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["path", "content"],
+              "additionalProperties": false
+            }
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" },
+                "description": { "type": "string" }
+              },
+              "required": ["command"],
+              "additionalProperties": false
+            }
+          },
+          "nextSteps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "html": { "type": "string" },
+                "inputText": { "type": "string" }
+              },
+              "required": ["html", "inputText"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "name": "planning-schema",
+  "description": "JSON Schema for xAI Structured Outputs API - enforces valid planning response format",
+  "version": "1.0.0",
+  "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
+  "schema": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "agent_plan",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "description": "Brief description of what needs to be done"
+          },
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": { "type": "string", "description": "Step description (under 50 chars)" },
+                "order": { "type": "integer", "description": "Step order (1, 2, 3...)" }
+              },
+              "required": ["text", "order"],
+              "additionalProperties": false
+            }
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string", "enum": ["file", "url"], "description": "Action type" },
+                "pattern": { "type": "string", "description": "Glob pattern for file type" },
+                "url": { "type": "string", "description": "URL to fetch for url type" },
+                "reason": { "type": "string", "description": "Why this action is needed" }
+              },
+              "required": ["type", "reason"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["summary", "todos", "actions"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

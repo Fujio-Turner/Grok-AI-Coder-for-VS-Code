@@ -1,0 +1,34 @@
+{
+  "name": "response-schema",
+  "description": "JSON Schema definition included in system prompt to define response format",
+  "version": "1.0.0",
+  "schema": {
+    "summary": "Brief 1-2 sentence summary of your response",
+    "sections": [
+      {
+        "heading": "Section Title",
+        "content": "Plain text content for this section",
+        "codeBlocks": [{ "language": "python", "code": "print('hello')", "caption": "Example" }]
+      }
+    ],
+    "codeBlocks": [
+      { "language": "python", "code": "def foo(): pass", "caption": "Optional caption" }
+    ],
+    "todos": [
+      { "text": "Step description", "completed": false }
+    ],
+    "fileHashes": {
+      "path/to/file.py": "md5_hash_of_file_content"
+    },
+    "fileChanges": [
+      { "path": "src/file.py", "language": "python", "content": "-old line\\n+new line", "isDiff": true, "lineRange": { "start": 10, "end": 15 } }
+    ],
+    "commands": [
+      { "command": "npm test", "description": "Run tests" }
+    ],
+    "nextSteps": [
+      { "html": "Continue to next step", "inputText": "continue" },
+      { "html": "Attach the config file", "inputText": "config.json" }
+    ]
+  }
+}

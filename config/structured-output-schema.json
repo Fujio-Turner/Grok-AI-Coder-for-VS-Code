@@ -1,0 +1,143 @@
+{
+  "name": "structured-output-schema",
+  "description": "JSON Schema for xAI Structured Outputs API - when passed as response_format, the API GUARANTEES responses match this schema",
+  "version": "1.0.0",
+  "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
+  "schema": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "grok_response",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "description": "Brief 1-2 sentence summary of the response"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "heading": { "type": "string", "description": "Section title" },
+                "content": { "type": "string", "description": "Plain text content" },
+                "codeBlocks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "language": { "type": "string" },
+                      "code": { "type": "string" },
+                      "caption": { "type": "string" }
+                    },
+                    "required": ["language", "code"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["heading", "content"],
+              "additionalProperties": false
+            }
+          },
+          "codeBlocks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string", "description": "Programming language" },
+                "code": { "type": "string", "description": "Code content" },
+                "caption": { "type": "string", "description": "Optional caption" }
+              },
+              "required": ["language", "code"],
+              "additionalProperties": false
+            }
+          },
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": { "type": "string", "description": "Task description" },
+                "completed": { "type": "boolean", "description": "Whether task is done" }
+              },
+              "required": ["text", "completed"],
+              "additionalProperties": false
+            }
+          },
+          "fileHashes": {
+            "type": "object",
+            "description": "MD5 hashes of files that were read, keyed by file path",
+            "additionalProperties": { "type": "string" }
+          },
+          "fileChanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string", "description": "File path relative to workspace" },
+                "language": { "type": "string", "description": "Programming language" },
+                "content": { "type": "string", "description": "New content or diff" },
+                "isDiff": { "type": "boolean", "description": "If true, content is a unified diff" },
+                "lineRange": {
+                  "type": "object",
+                  "properties": {
+                    "start": { "type": "integer", "description": "Start line (1-indexed)" },
+                    "end": { "type": "integer", "description": "End line (1-indexed)" }
+                  },
+                  "required": ["start", "end"],
+                  "additionalProperties": false
+                },
+                "lineOperations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": { 
+                        "type": "string", 
+                        "enum": ["insert", "delete", "replace", "insertAfter", "insertBefore"]
+                      },
+                      "line": { "type": "integer", "description": "1-indexed line number" },
+                      "expectedContent": { "type": "string", "description": "Content expected at line (for validation)" },
+                      "newContent": { "type": "string", "description": "New content to insert/replace" }
+                    },
+                    "required": ["type", "line"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["path", "content"],
+              "additionalProperties": false
+            }
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string", "description": "Terminal command to run" },
+                "description": { "type": "string", "description": "What the command does" }
+              },
+              "required": ["command"],
+              "additionalProperties": false
+            }
+          },
+          "nextSteps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "html": { "type": "string", "description": "Button display text" },
+                "inputText": { "type": "string", "description": "Text to insert when clicked" }
+              },
+              "required": ["html", "inputText"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

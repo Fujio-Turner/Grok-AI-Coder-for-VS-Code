@@ -1,7 +1,37 @@
 import * as vscode from 'vscode';
 import { createScopedLogger } from '../utils/logger';
+import { getSchemaFromConfig } from '../utils/configLoader';
 
 const log = createScopedLogger('ImageGen');
+
+/**
+ * Default schema for image prompts generation (fallback if config not found)
+ */
+const DEFAULT_IMAGE_PROMPTS_SCHEMA = {
+    type: "json_schema",
+    json_schema: {
+        name: "image_prompts",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                prompts: {
+                    type: "array",
+                    items: { type: "string" }
+                }
+            },
+            required: ["prompts"],
+            additionalProperties: false
+        }
+    }
+};
+
+/**
+ * Get the image prompts schema from config or use default.
+ */
+function getImagePromptsSchema(): object {
+    return getSchemaFromConfig('image-prompts-schema', DEFAULT_IMAGE_PROMPTS_SCHEMA);
+}
 
 export interface ImageGenerationResult {
     url?: string;
@@ -208,11 +238,9 @@ Each prompt should be:
 - Suitable for high-quality image generation
 - A unique variation/interpretation of the request
 
-${contextInfo ? `Context about the project:\n${contextInfo}` : ''}
+${contextInfo ? `Context about the project:\n${contextInfo}` : ''}`;
 
-Respond with ONLY a JSON array of strings, each being a complete image prompt. No other text.
-Example: ["prompt 1", "prompt 2", "prompt 3"]`;
-
+    // Use structured outputs to guarantee valid JSON response
     const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -224,7 +252,8 @@ Example: ["prompt 1", "prompt 2", "prompt 3"]`;
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userRequest }
-            ]
+            ],
+            response_format: getImagePromptsSchema()
         }),
         signal: AbortSignal.timeout(60000)
     });
@@ -237,11 +266,12 @@ Example: ["prompt 1", "prompt 2", "prompt 3"]`;
         choices?: Array<{ message?: { content?: string } }>;
     };
     
-    const content = data.choices?.[0]?.message?.content || '[]';
+    const content = data.choices?.[0]?.message?.content || '{"prompts":[]}';
     
     try {
-        // Parse the JSON array of prompts
-        const prompts = JSON.parse(content);
+        // With structured outputs, response is guaranteed valid JSON
+        const parsed = JSON.parse(content);
+        const prompts = parsed.prompts || [];
         if (Array.isArray(prompts) && prompts.length > 0) {
             return prompts.slice(0, count);
         }

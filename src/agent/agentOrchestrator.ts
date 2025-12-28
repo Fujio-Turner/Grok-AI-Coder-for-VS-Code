@@ -22,11 +22,64 @@ import {
     TodoAction
 } from './actionTypes';
 import { debug, info, error as logError } from '../utils/logger';
+import { getPromptFromConfig, getSchemaFromConfig } from '../utils/configLoader';
 
 /**
- * System prompt for the fast model to create a plan.
+ * Default planning schema for structured outputs (fallback if config not found)
  */
-const PLANNING_PROMPT = `You are a code assistant planner. Analyze the user's request and create a plan.
+const DEFAULT_PLANNING_SCHEMA = {
+    type: "json_schema",
+    json_schema: {
+        name: "agent_plan",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                summary: { type: "string" },
+                todos: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            text: { type: "string" },
+                            order: { type: "integer" }
+                        },
+                        required: ["text", "order"],
+                        additionalProperties: false
+                    }
+                },
+                actions: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            type: { type: "string", enum: ["file", "url"] },
+                            pattern: { type: "string" },
+                            url: { type: "string" },
+                            reason: { type: "string" }
+                        },
+                        required: ["type", "reason"],
+                        additionalProperties: false
+                    }
+                }
+            },
+            required: ["summary", "todos", "actions"],
+            additionalProperties: false
+        }
+    }
+};
+
+/**
+ * Get the planning schema from config or use default.
+ */
+function getPlanningSchema(): object {
+    return getSchemaFromConfig('planning-schema', DEFAULT_PLANNING_SCHEMA);
+}
+
+/**
+ * Default planning prompt (fallback if config file not found)
+ */
+const DEFAULT_PLANNING_PROMPT = `You are a code assistant planner. Analyze the user's request and create a plan.
 
 IMPORTANT: If the user mentions a URL (especially raw.githubusercontent.com links), you MUST include it as a "url" action to fetch its content. The system will download the actual file content for you.
 
@@ -57,61 +110,14 @@ Rules for todos:
 - Keep each todo concise (under 50 chars)
 - Include 2-5 todos typically
 
-Examples:
-
-User: "The file advanced_prep.py is empty, restore it from https://raw.githubusercontent.com/user/repo/main/advanced_prep.py"
-{
-    "summary": "Restore empty file from GitHub raw content",
-    "todos": [
-        {"text": "Fetch file content from GitHub URL", "order": 1},
-        {"text": "Write content to advanced_prep.py", "order": 2},
-        {"text": "Verify file restoration", "order": 3}
-    ],
-    "actions": [
-        {"type": "url", "url": "https://raw.githubusercontent.com/user/repo/main/advanced_prep.py", "reason": "Source content to restore"},
-        {"type": "file", "pattern": "**/advanced_prep*.py", "reason": "Target file to restore"}
-    ]
-}
-
-User: "Review the 06_read_*.py files for Couchbase"
-{
-    "summary": "Review Couchbase read files for best practices",
-    "todos": [
-        {"text": "Locate and read 06_read_*.py files", "order": 1},
-        {"text": "Check error handling patterns", "order": 2},
-        {"text": "Review timeout configurations", "order": 3},
-        {"text": "Identify improvements", "order": 4}
-    ],
-    "actions": [
-        {"type": "file", "pattern": "**/06_read_*.py", "reason": "Main files to review"}
-    ]
-}
-
-User: "How do I use the Couchbase Python SDK for replica reads? Check the docs."
-{
-    "summary": "Explain Couchbase replica reads with SDK docs",
-    "todos": [
-        {"text": "Fetch Couchbase SDK documentation", "order": 1},
-        {"text": "Find replica read examples", "order": 2},
-        {"text": "Explain usage patterns", "order": 3}
-    ],
-    "actions": [
-        {"type": "url", "url": "https://docs.couchbase.com/python-sdk/current/howtos/concurrent-document-mutations.html", "reason": "Official replica read docs"}
-    ]
-}
-
-User: "What's the best way to handle errors in JavaScript?"
-{
-    "summary": "Explain JavaScript error handling best practices",
-    "todos": [
-        {"text": "Explain try-catch patterns", "order": 1},
-        {"text": "Cover async error handling", "order": 2},
-        {"text": "Show best practices", "order": 3}
-    ],
-    "actions": []
-}
-
 Respond with ONLY the JSON, no other text.`;
+
+/**
+ * Get the planning prompt from config or use default.
+ */
+function getPlanningPrompt(): string {
+    return getPromptFromConfig('planning-prompt', DEFAULT_PLANNING_PROMPT);
+}
 
 export interface PlanResult {
     plan: AgentPlan;
@@ -135,17 +141,17 @@ export async function createPlan(
     let tokensOut = 0;
     
     const messages: GrokMessage[] = [
-        { role: 'system', content: PLANNING_PROMPT },
+        { role: 'system', content: getPlanningPrompt() },
         { role: 'user', content: userMessage }
     ];
 
     try {
+        // Use structured outputs to guarantee valid JSON response
         const response = await sendChatCompletion(
             messages,
             fastModel,
             apiKey,
-            undefined,
-            undefined
+            { responseFormat: getPlanningSchema() }
         );
 
         // Capture token usage
@@ -157,9 +163,9 @@ export async function createPlan(
         const text = response.text.trim();
         debug('Planning response:', text);
 
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
+        // With structured outputs, response is guaranteed valid JSON
+        try {
+            const parsed = JSON.parse(text);
             
             const plan: AgentPlan = {
                 summary: parsed.summary || 'Processing request',
@@ -218,6 +224,8 @@ export async function createPlan(
                 tokensIn,
                 tokensOut
             };
+        } catch (parseError) {
+            debug('JSON parse failed despite structured outputs:', parseError);
         }
     } catch (error) {
         debug('Planning failed:', error);

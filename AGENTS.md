@@ -135,6 +135,51 @@ When appropriate, end your response with a "Next Steps" section to guide the use
 - **API:** xAI Grok (OpenAI-compatible)
 - **Storage:** Couchbase Server
 
+## Project Structure
+
+```
+Grok_AI_Coder/
+├── src/                    # TypeScript source code
+│   ├── agent/              # Agent orchestrator, file/URL handling
+│   ├── api/                # Grok API client, file uploader
+│   ├── prompts/            # Response schema, JSON cleaner
+│   ├── storage/            # Couchbase session repository
+│   ├── utils/              # Logger, config loader, TOON converter
+│   └── views/              # ChatViewProvider (main webview)
+├── config/                 # ⚠️ EXTERNAL CONFIG - AI prompts & schemas
+│   ├── system-prompt.json          # Main AI behavior & JSON format rules
+│   ├── planning-prompt.json        # Fast model planning (Pass 1)
+│   ├── planning-schema.json        # Structured Output schema for planning
+│   ├── response-schema.json        # JSON schema for AI responses
+│   ├── structured-output-schema.json # xAI Structured Outputs API schema
+│   ├── json-cleanup-prompt.json    # Malformed JSON repair prompt
+│   ├── json-cleanup-schema.json    # Structured Output schema for cleanup
+│   ├── toon-to-json-prompt.json    # TOON to JSON conversion prompt
+│   ├── image-gen-prompt.json       # Image prompt generation
+│   ├── image-prompts-schema.json   # Structured Output schema for image prompts
+│   ├── handoff-context-prompt.json # Session continuation template
+│   └── README.md                   # Config documentation
+├── tools/                  # Python utilities (error dashboard, etc.)
+├── media/                  # Icons, CSS, webview assets
+├── docs/                   # Documentation
+└── out/                    # Compiled JavaScript (generated)
+```
+
+### ⚠️ Important: Config Folder
+
+The `config/` folder contains **externalized AI prompts and schemas** that were previously hardcoded in TypeScript. This allows:
+
+1. **Visibility** - See exactly what's sent to the API
+2. **Experimentation** - Edit prompts without recompiling
+3. **Version control** - Track prompt changes independently
+
+**When modifying AI behavior:**
+- Edit the JSON files in `config/` first
+- Reload the extension to pick up changes
+- The TypeScript files in `src/` have fallback defaults if config files are missing
+
+**Config loader:** `src/utils/configLoader.ts` handles loading these files at runtime.
+
 ## Commands
 
 ```bash

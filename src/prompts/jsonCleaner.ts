@@ -7,10 +7,18 @@
 
 import { sendChatCompletion, GrokMessage } from '../api/grokClient';
 import { safeParseJson, isHttpError } from './jsonHelper';
-import { validateResponse, GrokStructuredResponse } from './responseSchema';
+import { validateResponse, GrokStructuredResponse, STRUCTURED_OUTPUT_SCHEMA } from './responseSchema';
 import { debug, info, error as logError } from '../utils/logger';
 import { extractToonContent, fromToon, looksLikeToon } from '../utils/toonConverter';
+import { getPromptFromConfig, getSchemaFromConfig } from '../utils/configLoader';
 import * as vscode from 'vscode';
+
+/**
+ * Get the cleanup schema from config or use the main structured output schema.
+ */
+function getCleanupSchema(): object {
+    return getSchemaFromConfig('json-cleanup-schema', STRUCTURED_OUTPUT_SCHEMA);
+}
 
 /**
  * Get the current response format setting
@@ -20,61 +28,46 @@ function getResponseFormat(): string {
     return config.get<string>('responseFormat') || 'json';
 }
 
-const JSON_CLEANUP_PROMPT = `You are a JSON repair assistant. Your ONLY job is to fix malformed JSON and return valid JSON.
+/**
+ * Default JSON cleanup prompt (fallback if config not found)
+ */
+const DEFAULT_JSON_CLEANUP_PROMPT = `You are a JSON repair assistant. Your ONLY job is to fix malformed JSON and return valid JSON.
 
 The user will provide broken JSON from an AI response. Fix ALL syntax errors and return ONLY the corrected JSON.
-
-Common issues to fix:
-1. Missing colons after keys: "key" "value" -> "key": "value"
-2. Missing commas between properties: "a": 1 "b": 2 -> "a": 1, "b": 2
-3. Missing quotes around string values: "key": value -> "key": "value"
-4. Unclosed strings, objects, or arrays
-5. Trailing commas before } or ]
-6. Empty keys "" that should be "heading", "content", "text", "message", or "sections"
-7. Double opening braces {{ -> {
-8. Missing array brackets for sections: "sections":heading": -> "sections": [{"heading":
-9. Missing [{ after array keys: "sections": "heading": -> "sections": [{"heading":
-10. Sections/todos/fileChanges MUST be arrays: "sections": [{"heading":...}]
 
 CRITICAL RULES:
 - Return ONLY valid JSON, nothing else
 - Start with { and end with }
 - Preserve all the data - don't remove content
-- If the structure has sections with heading/content, keep that structure as an ARRAY of objects
-- sections, todos, fileChanges, commands, nextSteps, codeBlocks are ALL arrays
 - Ensure all arrays and objects are properly closed
 
 Return ONLY the fixed JSON, no explanation.`;
 
-const TOON_TO_JSON_PROMPT = `You are a TOON-to-JSON converter. Convert the malformed TOON (Token-Oriented Object Notation) to valid JSON.
-
-TOON is a compact format like YAML:
-- Key-value: \`key: value\` (no quotes for simple values)
-- Objects use indentation
-- Arrays use \`- \` prefix
-- Tabular data uses \`fields:\` + \`rows:\` format
-- Multiline strings use \`|\` followed by indented content
-
-The response uses this schema:
-{
-  "summary": "string (required)",
-  "sections": [{"heading": "string", "content": "string", "codeBlocks": [...]}],
-  "todos": [{"text": "string", "completed": boolean}],
-  "fileChanges": [{"path": "string", "language": "string", "content": "string", "isDiff": boolean}],
-  "commands": [{"command": "string", "description": "string"}],
-  "nextSteps": ["string"]
-}
+/**
+ * Default TOON-to-JSON prompt (fallback if config not found)
+ */
+const DEFAULT_TOON_TO_JSON_PROMPT = `You are a TOON-to-JSON converter. Convert the malformed TOON (Token-Oriented Object Notation) to valid JSON.
 
 CRITICAL RULES:
 - Return ONLY valid JSON, nothing else
 - Start with { and end with }
 - Preserve ALL the data - don't remove content
-- Convert TOON structure to proper JSON
-- Extract summary value correctly (first key in TOON)
-- Convert tabular todos (fields/rows format) to array of {text, completed} objects
-- Handle multiline content (after |) as string values
 
 Return ONLY the converted JSON, no explanation or markdown fences.`;
+
+/**
+ * Get the JSON cleanup prompt from config or use default.
+ */
+function getJsonCleanupPrompt(): string {
+    return getPromptFromConfig('json-cleanup-prompt', DEFAULT_JSON_CLEANUP_PROMPT);
+}
+
+/**
+ * Get the TOON-to-JSON prompt from config or use default.
+ */
+function getToonToJsonPrompt(): string {
+    return getPromptFromConfig('toon-to-json-prompt', DEFAULT_TOON_TO_JSON_PROMPT);
+}
 
 export interface CleanupResult {
     success: boolean;
@@ -118,16 +111,16 @@ export async function cleanJsonWithModel(
     
     try {
         const messages: GrokMessage[] = [
-            { role: 'system', content: JSON_CLEANUP_PROMPT },
+            { role: 'system', content: getJsonCleanupPrompt() },
             { role: 'user', content: `Fix this broken JSON:\n\n${brokenJson}` }
         ];
 
+        // Use structured outputs to guarantee valid JSON response
         const response = await sendChatCompletion(
             messages,
             fastModel,
             apiKey,
-            undefined,
-            undefined
+            { responseFormat: getCleanupSchema() }
         );
 
         const cleanedText = response.text.trim();
@@ -213,16 +206,16 @@ export async function cleanToonWithModel(
     
     try {
         const messages: GrokMessage[] = [
-            { role: 'system', content: TOON_TO_JSON_PROMPT },
+            { role: 'system', content: getToonToJsonPrompt() },
             { role: 'user', content: `Convert this TOON to valid JSON:\n\n${toonContent}` }
         ];
 
+        // Use structured outputs to guarantee valid JSON response
         const response = await sendChatCompletion(
             messages,
             fastModel,
             apiKey,
-            undefined,
-            undefined
+            { responseFormat: getCleanupSchema() }
         );
 
         const cleanedText = response.text.trim();
