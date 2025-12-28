@@ -970,7 +970,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _handleHandoff(sessionId: string, todos: Array<{text: string, completed: boolean}>) {
+    private async _handleHandoff(sessionId: string, todos: Array<{text: string, aiText?: string, completed: boolean}>) {
         try {
             const oldSession = await getSessionWithExtensions(sessionId);
             if (!oldSession) {
@@ -1255,12 +1255,12 @@ ${cliSummary}
         }
     }
 
-    private async _saveTodos(todos: Array<{text: string, completed: boolean}>) {
+    private async _saveTodos(todos: Array<{text: string, aiText?: string, completed: boolean}>) {
         if (!this._currentSessionId) {
             return;
         }
         try {
-            const todoItems: TodoItem[] = todos.map(t => ({ text: t.text, completed: t.completed }));
+            const todoItems: TodoItem[] = todos.map(t => ({ text: t.text, aiText: t.aiText, completed: t.completed }));
             await updateSessionTodos(this._currentSessionId, todoItems);
             debug('Saved todos to session:', this._currentSessionId);
         } catch (error: any) {
@@ -5133,24 +5133,23 @@ function renderChanges(){
     if(isAtOriginalState||changeHistory.length>0){
         const origDiv=document.createElement('div');
         origDiv.className='change-item original-state'+(isAtOriginalState?' current':'');
-        // Add Restore button for Original (only shown when not at original state)
-        const restoreBtn=isAtOriginalState?'':'<button class="restore-state-btn" data-target="original" title="Restore all files to original state">↩ Restore</button>';
-        origDiv.innerHTML='<div class="change-files"><div class="change-file-row"><span class="change-file" style="color:#6a9">📄 Original (before AI changes)</span>'+restoreBtn+'</div></div><div class="change-stats"></div><div class="change-meta"><span>Baseline</span></div>';
+        // Add Revert button for Original (only shown when not at original state) - right aligned
+        const restoreBtn=isAtOriginalState?'':'<button class="restore-state-btn" data-target="original" title="Revert to original state">↩ Revert</button>';
+        origDiv.innerHTML='<div class="change-files"><div class="change-file-row"><span class="change-file" style="color:#6a9">📄 Original (before AI changes)</span></div></div><div class="change-stats"></div><div class="change-meta"><span>Baseline</span><span style="flex:1"></span>'+restoreBtn+'</div>';
         changesList.appendChild(origDiv);
     }
     changeHistory.forEach((cs,i)=>{
         const div=document.createElement('div');div.className='change-item'+(i===currentChangePos&&!isAtOriginalState?' current':'')+(cs.applied?' applied':' reverted');
         div.dataset.id=cs.id;div.dataset.pos=i;
-        // Render each file with a revert-to-original button
+        // Render each file (no per-file revert button - use changeset-level navigation only)
         const filesHtml=cs.files.map(f=>{
-            const revertBtn='<button class="revert-original-btn" data-path="'+esc(f.filePath)+'" title="Revert to original and save to disk">↩ Revert</button>';
-            return '<div class="change-file-row"><span class="change-file">'+esc(f.fileName)+'</span>'+revertBtn+'</div>';
+            return '<div class="change-file-row"><span class="change-file">'+esc(f.fileName)+'</span></div>';
         }).join('');
         const stats='<span class="stat-add">+'+cs.totalStats.added+'</span><span class="stat-rem">-'+cs.totalStats.removed+'</span>'+(cs.totalStats.modified>0?'<span class="stat-mod">~'+cs.totalStats.modified+'</span>':'');
-        // Add Restore button to navigate to this changeset (only if not current)
+        // Add Revert button to navigate to this changeset (only if not current) - right aligned
         const isCurrent=i===currentChangePos&&!isAtOriginalState;
-        const restoreBtn=isCurrent?'':'<button class="restore-state-btn" data-id="'+cs.id+'" data-pos="'+i+'" title="Restore to this state">↩ Revert</button>';
-        div.innerHTML='<div class="change-files">'+filesHtml+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span>'+restoreBtn+'</div>';
+        const restoreBtn=isCurrent?'':'<button class="restore-state-btn" data-id="'+cs.id+'" data-pos="'+i+'" title="Revert to this state">↩ Revert</button>';
+        div.innerHTML='<div class="change-files">'+filesHtml+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span><span style="flex:1"></span>'+restoreBtn+'</div>';
         changesList.appendChild(div);
     });
     // Attach restore-state button handlers (for navigating between changesets)
@@ -5165,16 +5164,6 @@ function renderChanges(){
                 const csId=btn.dataset.id;
                 if(isAtOriginalState||pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:csId});
                 else if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:csId});
-            }
-        };
-    });
-    // Attach revert-to-original button handlers (per-file revert)
-    document.querySelectorAll('.revert-original-btn').forEach(btn=>{
-        btn.onclick=(e)=>{
-            e.stopPropagation();
-            const filePath=btn.dataset.path;
-            if(confirm('Revert '+filePath.split('/').pop()+' to original and save to disk?')){
-                vs.postMessage({type:'revertToOriginal',filePath});
             }
         };
     });

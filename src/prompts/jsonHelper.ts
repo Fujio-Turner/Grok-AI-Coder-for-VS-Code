@@ -377,7 +377,7 @@ export function recoverTruncatedFileChanges(text: string): { path: string; conte
  */
 export function recoverTruncatedResponse(text: string): {
     summary?: string;
-    todos?: { text: string; completed: boolean }[];
+    todos?: { text: string; aiText?: string; completed: boolean }[];
     nextSteps?: Array<{ html: string; inputText: string } | string>;
     commands?: { command: string; description?: string }[];
     fileChanges?: { path: string; content: string; language?: string; isDiff?: boolean }[];
@@ -391,15 +391,19 @@ export function recoverTruncatedResponse(text: string): {
         debug('Recovered summary from truncated response');
     }
     
-    // Extract todos array - look for complete todo objects
-    const todoPattern = /\{\s*"text"\s*:\s*"([^"]+)"\s*,\s*"completed"\s*:\s*(true|false)\s*\}/g;
-    const todos: { text: string; completed: boolean }[] = [];
+    // Extract todos array - look for complete todo objects (with optional aiText)
+    const todoPattern = /\{\s*"text"\s*:\s*"([^"]+)"(?:\s*,\s*"aiText"\s*:\s*"([^"]*)")?\s*,\s*"completed"\s*:\s*(true|false)\s*\}/g;
+    const todos: { text: string; aiText?: string; completed: boolean }[] = [];
     let todoMatch;
     while ((todoMatch = todoPattern.exec(text)) !== null) {
-        todos.push({
+        const todo: { text: string; aiText?: string; completed: boolean } = {
             text: todoMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
-            completed: todoMatch[2] === 'true'
-        });
+            completed: todoMatch[3] === 'true'
+        };
+        if (todoMatch[2]) {
+            todo.aiText = todoMatch[2].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+        }
+        todos.push(todo);
     }
     if (todos.length > 0) {
         result.todos = todos;

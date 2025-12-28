@@ -58,8 +58,9 @@
             "items": {
               "type": "object",
               "properties": {
-                "text": { "type": "string", "description": "Task description" },
-                "completed": { "type": "boolean", "description": "Whether task is done" }
+                "text": { "type": "string", "description": "Short task description shown to user (max 50 chars)" },
+                "aiText": { "type": "string", "description": "Verbose instructions for AI (hidden from user UI) - include file paths, line numbers, specific changes" },
+                "completed": { "type": "boolean", "description": "ONLY true if fileChange for this step is in THIS response" }
               },
               "required": ["text", "completed"],
               "additionalProperties": false

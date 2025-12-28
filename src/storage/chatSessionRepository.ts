@@ -58,7 +58,7 @@ export interface ChatResponse {
         summary?: string;
         message?: string;
         sections?: Array<{ heading: string; content: string; codeBlocks?: Array<{ language?: string; code: string; caption?: string }> }>;
-        todos?: Array<{ text: string; completed: boolean }>;
+        todos?: Array<{ text: string; aiText?: string; completed: boolean }>;
         fileChanges?: Array<{ path: string; content: string; language?: string; isDiff?: boolean; lineRange?: { start: number; end: number } }>;
         commands?: Array<{ command: string; description?: string }>;
         codeBlocks?: Array<{ language?: string; code: string; caption?: string }>;
@@ -83,6 +83,7 @@ export interface StepTrackerEntry {
 
 export interface TodoItem {
     text: string;
+    aiText?: string;  // Verbose AI instructions (hidden from UI)
     completed: boolean;
 }
 

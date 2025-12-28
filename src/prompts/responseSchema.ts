@@ -6,6 +6,7 @@
 
 export interface TodoItem {
     text: string;
+    aiText?: string;  // Verbose AI instructions (hidden from UI)
     completed: boolean;
 }
 
