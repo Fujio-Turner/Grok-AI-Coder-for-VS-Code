@@ -72,6 +72,7 @@ import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordSte
 import { ChangeSet } from '../edits/changeTracker';
 import { validateAndApplyOperations, LineOperation } from '../edits/lineOperations';
 import { runAgentWorkflow, runFilesApiWorkflow, buildFilesApiMessage } from '../agent/agentOrchestrator';
+import { addLineNumbers } from '../agent/workspaceFiles';
 import { createFileMessage } from '../api/grokClient';
 import { deleteFiles } from '../api/fileUploader';
 import { 
@@ -1062,11 +1063,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }
             }
             
-            // Build file content section
+            // Build file content section with line numbers
             const fileContentSection = modifiedFileContents.length > 0
                 ? modifiedFileContents.map(f => {
                     const fileName = f.path.split('/').pop() || f.path;
-                    return `#### 📄 ${fileName}\nPath: \`${f.path}\`\n\`\`\`\n${f.content}\n\`\`\``;
+                    const numberedContent = addLineNumbers(f.content);
+                    return `#### 📄 ${fileName}\nPath: \`${f.path}\`\nLine numbers are 1-indexed.\n\`\`\`\n${numberedContent}\n\`\`\``;
                 }).join('\n\n')
                 : 'No file contents available';
 
@@ -1875,8 +1877,9 @@ ${cliSummary}
                                     ? filePath.slice(workspaceRoot.length + 1) // +1 for the trailing slash
                                     : filePath;
                                 const md5Hash = computeFileHash(textContent);
-                                // Include BOTH relative path (for fileHashes) and full path for clarity
-                                fileContents.push(`📄 ${relativePath} [MD5: ${md5Hash}]\nPath for fileHashes: "${relativePath}"\n\`\`\`\n${textContent}\n\`\`\``);
+                                // Include line numbers to help AI reference correct lines
+                                const numberedContent = addLineNumbers(textContent);
+                                fileContents.push(`📄 ${relativePath} [MD5: ${md5Hash}]\nPath for fileHashes: "${relativePath}"\nLine numbers are 1-indexed.\n\`\`\`\n${numberedContent}\n\`\`\``);
                                 attachedNames.push(relativePath);
                                 info(`Auto-attached: ${relativePath} (MD5: ${md5Hash.slice(0, 8)}...)`);
                                 
@@ -4498,9 +4501,9 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="inp" style="position:relative">
 <div id="autocomplete"></div>
-<!-- TODO Panel - above stats bar -->
-<div id="todo-bar"><span id="todo-toggle" class="open">▼</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
-<div id="todo-list"></div>
+<!-- TODO Panel - above stats bar (hidden by default until items added) -->
+<div id="todo-bar" class="hide"><span id="todo-toggle" class="open">▼</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
+<div id="todo-list" class="hide"></div>
 
 <div id="stats">
     <div id="stats-left"><span id="stats-changes">0 files</span><span class="changes-info"><span class="stat-add">+0</span><span class="stat-rem">-0</span><span class="stat-mod">~0</span></span></div>
@@ -5070,12 +5073,18 @@ function updateAutoBtn(){autoBtn.textContent=autoApply?'A':'M';autoBtn.className
 
 function renderTodos(){
     if(currentTodos.length===0){
+        // Hide the entire TODOs section when empty
+        todoBar.classList.add('hide');
+        todoList.classList.add('hide');
         todoBar.classList.remove('has-todos');
         todoCount.classList.remove('active');
         todoCount.textContent='(no tasks)';
-        todoList.innerHTML='<div style="color:var(--vscode-descriptionForeground);font-style:italic">No active tasks. AI will populate this when given multi-step work.</div>';
+        todoList.innerHTML='';
         return;
     }
+    // Show TODOs section when there are items
+    todoBar.classList.remove('hide');
+    todoList.classList.remove('hide');
     todoBar.classList.add('has-todos');
     const completedCount=currentTodos.filter(t=>t.completed).length;
     const allDone=completedCount>=currentTodos.length;
@@ -5124,31 +5133,42 @@ function renderChanges(){
     if(isAtOriginalState||changeHistory.length>0){
         const origDiv=document.createElement('div');
         origDiv.className='change-item original-state'+(isAtOriginalState?' current':'');
-        origDiv.innerHTML='<div class="change-files"><div class="change-file-row"><span class="change-file" style="color:#6a9">📄 Original (before AI changes)</span></div></div><div class="change-stats"></div><div class="change-meta"><span>Baseline</span></div>';
-        origDiv.onclick=()=>{if(!isAtOriginalState)vs.postMessage({type:'rewindToOriginalState'});};
-        origDiv.title='Click to revert all files to original state';
+        // Add Restore button for Original (only shown when not at original state)
+        const restoreBtn=isAtOriginalState?'':'<button class="restore-state-btn" data-target="original" title="Restore all files to original state">↩ Restore</button>';
+        origDiv.innerHTML='<div class="change-files"><div class="change-file-row"><span class="change-file" style="color:#6a9">📄 Original (before AI changes)</span>'+restoreBtn+'</div></div><div class="change-stats"></div><div class="change-meta"><span>Baseline</span></div>';
         changesList.appendChild(origDiv);
     }
     changeHistory.forEach((cs,i)=>{
         const div=document.createElement('div');div.className='change-item'+(i===currentChangePos&&!isAtOriginalState?' current':'')+(cs.applied?' applied':' reverted');
         div.dataset.id=cs.id;div.dataset.pos=i;
-        // Render each file with a revert button
+        // Render each file with a revert-to-original button
         const filesHtml=cs.files.map(f=>{
             const revertBtn='<button class="revert-original-btn" data-path="'+esc(f.filePath)+'" title="Revert to original and save to disk">↩ Revert</button>';
             return '<div class="change-file-row"><span class="change-file">'+esc(f.fileName)+'</span>'+revertBtn+'</div>';
         }).join('');
         const stats='<span class="stat-add">+'+cs.totalStats.added+'</span><span class="stat-rem">-'+cs.totalStats.removed+'</span>'+(cs.totalStats.modified>0?'<span class="stat-mod">~'+cs.totalStats.modified+'</span>':'');
-        div.innerHTML='<div class="change-files">'+filesHtml+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span></div>';
-        // Navigate to this changeset on click (but not on revert button)
-        div.onclick=(e)=>{
-            if(e.target.classList.contains('revert-original-btn'))return;
-            const pos=parseInt(div.dataset.pos);
-            if(isAtOriginalState||pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:cs.id});
-            else if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:cs.id});
-        };
+        // Add Restore button to navigate to this changeset (only if not current)
+        const isCurrent=i===currentChangePos&&!isAtOriginalState;
+        const restoreBtn=isCurrent?'':'<button class="restore-state-btn" data-id="'+cs.id+'" data-pos="'+i+'" title="Restore to this state">↩ Revert</button>';
+        div.innerHTML='<div class="change-files">'+filesHtml+'</div><div class="change-stats">'+stats+'</div><div class="change-meta"><span>'+cs.duration+'</span><span class="change-cost">$'+cs.cost.toFixed(4)+'</span><span>'+timeAgo(cs.timestamp)+'</span>'+restoreBtn+'</div>';
         changesList.appendChild(div);
     });
-    // Attach revert button handlers
+    // Attach restore-state button handlers (for navigating between changesets)
+    document.querySelectorAll('.restore-state-btn').forEach(btn=>{
+        btn.onclick=(e)=>{
+            e.stopPropagation();
+            const target=btn.dataset.target;
+            if(target==='original'){
+                vs.postMessage({type:'rewindToOriginalState'});
+            }else{
+                const pos=parseInt(btn.dataset.pos);
+                const csId=btn.dataset.id;
+                if(isAtOriginalState||pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:csId});
+                else if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:csId});
+            }
+        };
+    });
+    // Attach revert-to-original button handlers (per-file revert)
     document.querySelectorAll('.revert-original-btn').forEach(btn=>{
         btn.onclick=(e)=>{
             e.stopPropagation();

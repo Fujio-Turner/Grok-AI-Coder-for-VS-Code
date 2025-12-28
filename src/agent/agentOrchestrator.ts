@@ -8,7 +8,7 @@
 
 import * as vscode from 'vscode';
 import { sendChatCompletion, GrokMessage } from '../api/grokClient';
-import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent } from './workspaceFiles';
+import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent, addLineNumbers } from './workspaceFiles';
 import { fetchUrl, extractUrls } from './httpFetcher';
 import { followImports, formatImportContext } from './importResolver';
 import { 
@@ -480,14 +480,16 @@ export function buildAugmentedMessage(
         augmented += '\n**You CANNOT see these files. Ask the user to attach them or provide the correct path.**\n';
     }
 
-    // Add file contents
+    // Add file contents with line numbers
     if (execution.filesContent.size > 0) {
-        augmented += '\n\n---\n**Files from workspace (with MD5 hashes - use these in fileHashes when modifying):**\n';
+        augmented += '\n\n---\n**Files from workspace (with line numbers and MD5 hashes - use these in fileHashes when modifying):**\n';
         for (const [filePath, content] of execution.filesContent) {
             const hash = execution.fileHashes.get(filePath) || 'UNKNOWN';
-            augmented += `\n### ${filePath} [MD5: ${hash}]\n\`\`\`\n${content}\n\`\`\`\n`;
+            // Add line numbers to help AI reference correct lines
+            const numberedContent = addLineNumbers(content);
+            augmented += `\n### ${filePath} [MD5: ${hash}]\n\`\`\`\n${numberedContent}\n\`\`\`\n`;
         }
-        augmented += '\n**IMPORTANT: When using lineOperations on these files, include the MD5 hash in your fileHashes response field.**\n';
+        augmented += '\n**IMPORTANT: Line numbers shown are 1-indexed. When using lineOperations, use exact line numbers as shown.**\n';
     }
 
     // CRITICAL: Report failed URL fetches so AI doesn't hallucinate

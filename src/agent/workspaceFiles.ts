@@ -7,6 +7,20 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { debug, info } from '../utils/logger';
 
+/**
+ * Add line numbers to file content (1-indexed).
+ * Format: "  1: content" with padding for alignment.
+ * This helps AI accurately reference line numbers in file edits.
+ */
+export function addLineNumbers(content: string): string {
+    const lines = content.split('\n');
+    const padding = String(lines.length).length;
+    return lines.map((line, i) => {
+        const lineNum = String(i + 1).padStart(padding, ' ');
+        return `${lineNum}: ${line}`;
+    }).join('\n');
+}
+
 export interface FileMatch {
     path: string;
     relativePath: string;

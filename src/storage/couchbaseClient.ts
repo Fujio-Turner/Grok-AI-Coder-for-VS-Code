@@ -1,4 +1,27 @@
-import { getConfig, debug, error, info } from '../utils/logger';
+import { getConfig, debug, error, info, warn } from '../utils/logger';
+
+// Couchbase SDK is loaded dynamically to handle native module issues
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let couchbase: typeof import('couchbase') | null = null;
+let couchbaseLoadAttempted = false;
+let couchbaseLoadError: Error | null = null;
+
+async function loadCouchbaseSDK(): Promise<typeof import('couchbase') | null> {
+    if (couchbaseLoadAttempted) {
+        return couchbase;
+    }
+    couchbaseLoadAttempted = true;
+    
+    try {
+        couchbase = await import('couchbase');
+        info('Couchbase SDK loaded successfully');
+        return couchbase;
+    } catch (err) {
+        couchbaseLoadError = err as Error;
+        warn('Couchbase SDK failed to load, falling back to REST mode:', err);
+        return null;
+    }
+}
 
 export interface CouchbaseDocument<T> {
     content: T;
@@ -12,6 +35,7 @@ export interface ICouchbaseClient {
     remove(key: string): Promise<boolean>;
     query<T>(statement: string, namedParams?: Record<string, unknown>): Promise<T[]>;
     ping(): Promise<boolean>;
+    disconnect?(): Promise<void>;
 }
 
 // ============================================================================
@@ -539,30 +563,292 @@ class CapellaDataApiClient implements ICouchbaseClient {
 }
 
 // ============================================================================
+// SDK-Based Couchbase Client (Native Node.js SDK)
+// ============================================================================
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type CouchbaseCluster = any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type CouchbaseCollection = any;
+
+class SdkCouchbaseClient implements ICouchbaseClient {
+    private cluster: CouchbaseCluster | null = null;
+    private connectPromise: Promise<CouchbaseCluster> | null = null;
+    private sdk: typeof import('couchbase') | null = null;
+
+    private getConnectionString(): string {
+        const config = getConfig();
+        let url = config.couchbaseUrl || 'localhost';
+        
+        // Remove http:// or https:// prefix if present (SDK uses couchbase:// or couchbases://)
+        url = url.replace(/^https?:\/\//, '');
+        // Remove trailing slash
+        url = url.replace(/\/$/, '');
+        
+        // For Capella, use couchbases:// (TLS)
+        if (config.couchbaseDeployment === 'capella' && config.capellaDataApiUrl) {
+            // Extract hostname from Capella Data API URL
+            const capellaHost = config.capellaDataApiUrl.replace(/^https?:\/\//, '').replace(/\/$/, '').split('/')[0];
+            // Convert data API URL to connection string (e.g., data.cloud.couchbase.com -> cb.xxx.cloud.couchbase.com)
+            return `couchbases://${capellaHost}`;
+        }
+        
+        return `couchbase://${url}`;
+    }
+
+    private async ensureSDK(): Promise<typeof import('couchbase')> {
+        if (this.sdk) {
+            return this.sdk;
+        }
+        
+        this.sdk = await loadCouchbaseSDK();
+        if (!this.sdk) {
+            throw new Error('Couchbase SDK failed to load: ' + (couchbaseLoadError?.message || 'unknown error'));
+        }
+        return this.sdk;
+    }
+
+    private async ensureConnected(): Promise<CouchbaseCluster> {
+        if (this.cluster) {
+            return this.cluster;
+        }
+
+        // Prevent multiple simultaneous connection attempts
+        if (this.connectPromise) {
+            return this.connectPromise;
+        }
+
+        this.connectPromise = this.connect();
+        try {
+            this.cluster = await this.connectPromise;
+            return this.cluster;
+        } finally {
+            this.connectPromise = null;
+        }
+    }
+
+    private async connect(): Promise<CouchbaseCluster> {
+        const sdk = await this.ensureSDK();
+        const config = getConfig();
+        const connectionString = this.getConnectionString();
+        const timeoutMs = (config.couchbaseTimeout || 30) * 1000;
+
+        debug('Couchbase SDK connecting to:', connectionString);
+
+        try {
+            const cluster = await sdk.connect(connectionString, {
+                username: config.couchbaseUsername,
+                password: config.couchbasePassword,
+                configProfile: 'wanDevelopment', // Optimized for cloud/WAN
+                timeouts: {
+                    kvTimeout: timeoutMs,
+                    queryTimeout: timeoutMs,
+                    connectTimeout: timeoutMs,
+                    managementTimeout: timeoutMs
+                }
+            });
+
+            info('Couchbase SDK connected successfully');
+            return cluster;
+        } catch (err) {
+            error('Couchbase SDK connection failed:', err);
+            throw err;
+        }
+    }
+
+    private async getCollection(): Promise<CouchbaseCollection> {
+        const cluster = await this.ensureConnected();
+        const config = getConfig();
+        return cluster
+            .bucket(config.couchbaseBucket)
+            .scope(config.couchbaseScope)
+            .collection(config.couchbaseCollection);
+    }
+
+    async get<T>(key: string): Promise<CouchbaseDocument<T> | null> {
+        try {
+            debug('Couchbase SDK GET:', key);
+            const sdk = await this.ensureSDK();
+            const collection = await this.getCollection();
+            const result = await collection.get(key);
+            
+            debug('Couchbase SDK GET success:', key);
+            return {
+                content: result.content as T,
+                cas: result.cas.toString()
+            };
+        } catch (err) {
+            const sdk = this.sdk;
+            if (sdk && err instanceof sdk.DocumentNotFoundError) {
+                debug('Couchbase SDK GET: Document not found:', key);
+                return null;
+            }
+            // Also check by error name for compatibility
+            if ((err as Error)?.name === 'DocumentNotFoundError') {
+                debug('Couchbase SDK GET: Document not found:', key);
+                return null;
+            }
+            error('Couchbase SDK GET failed:', err);
+            return null;
+        }
+    }
+
+    async insert<T>(key: string, doc: T): Promise<boolean> {
+        try {
+            debug('Couchbase SDK INSERT:', key);
+            await this.ensureSDK();
+            const collection = await this.getCollection();
+            await collection.insert(key, doc);
+            debug('Couchbase SDK INSERT success:', key);
+            return true;
+        } catch (err) {
+            const sdk = this.sdk;
+            if (sdk && err instanceof sdk.DocumentExistsError) {
+                error('Couchbase SDK INSERT: Document already exists:', key);
+            } else if ((err as Error)?.name === 'DocumentExistsError') {
+                error('Couchbase SDK INSERT: Document already exists:', key);
+            } else {
+                error('Couchbase SDK INSERT failed:', err);
+            }
+            return false;
+        }
+    }
+
+    async replace<T>(key: string, doc: T): Promise<boolean> {
+        try {
+            debug('Couchbase SDK UPSERT:', key);
+            await this.ensureSDK();
+            const collection = await this.getCollection();
+            // Use upsert for replace to match REST behavior (creates if not exists)
+            await collection.upsert(key, doc);
+            debug('Couchbase SDK UPSERT success:', key);
+            return true;
+        } catch (err) {
+            error('Couchbase SDK UPSERT failed:', err);
+            return false;
+        }
+    }
+
+    async remove(key: string): Promise<boolean> {
+        try {
+            debug('Couchbase SDK REMOVE:', key);
+            await this.ensureSDK();
+            const collection = await this.getCollection();
+            await collection.remove(key);
+            debug('Couchbase SDK REMOVE success:', key);
+            return true;
+        } catch (err) {
+            const sdk = this.sdk;
+            if (sdk && err instanceof sdk.DocumentNotFoundError) {
+                debug('Couchbase SDK REMOVE: Document not found:', key);
+                return true; // Match REST behavior - removal of non-existent doc is OK
+            }
+            if ((err as Error)?.name === 'DocumentNotFoundError') {
+                debug('Couchbase SDK REMOVE: Document not found:', key);
+                return true;
+            }
+            error('Couchbase SDK REMOVE failed:', err);
+            return false;
+        }
+    }
+
+    async query<T>(statement: string, namedParams?: Record<string, unknown>): Promise<T[]> {
+        try {
+            debug('Couchbase SDK QUERY:', statement);
+            await this.ensureSDK();
+            const cluster = await this.ensureConnected();
+            
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const options: any = {};
+            if (namedParams) {
+                options.parameters = namedParams;
+            }
+
+            const result = await cluster.query(statement, options);
+            debug('Couchbase SDK QUERY success, rows:', result.rows.length);
+            return result.rows as T[];
+        } catch (err) {
+            error('Couchbase SDK QUERY failed:', err);
+            return [];
+        }
+    }
+
+    async ping(): Promise<boolean> {
+        try {
+            debug('Couchbase SDK PING');
+            await this.ensureSDK();
+            
+            // Use a simple KV exists operation to verify connectivity
+            // This is more reliable than diagnostics() which may have type issues
+            const collection = await this.getCollection();
+            await collection.exists('__ping_test__');
+            
+            info('Couchbase SDK connection healthy');
+            return true;
+        } catch (err) {
+            error('Couchbase SDK PING failed:', err);
+            return false;
+        }
+    }
+
+    async disconnect(): Promise<void> {
+        if (this.cluster) {
+            debug('Couchbase SDK disconnecting');
+            await this.cluster.close();
+            this.cluster = null;
+            info('Couchbase SDK disconnected');
+        }
+    }
+}
+
+// ============================================================================
 // Factory and Singleton
 // ============================================================================
 let clientInstance: ICouchbaseClient | null = null;
 let currentDeploymentMode: string | null = null;
+let currentConnectionMode: string | null = null;
 
 export function getCouchbaseClient(): ICouchbaseClient {
     const config = getConfig();
     const deployment = config.couchbaseDeployment;
+    let connectionMode = config.couchbaseConnectionMode || 'rest'; // Default to REST for compatibility
     
-    // Recreate client if deployment mode changed
-    if (clientInstance && currentDeploymentMode !== deployment) {
-        info('Couchbase deployment mode changed, recreating client', { from: currentDeploymentMode, to: deployment });
+    // If SDK load already failed, force REST mode
+    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
+        warn('Couchbase SDK not available, using REST mode');
+        connectionMode = 'rest';
+    }
+    
+    // Recreate client if deployment mode or connection mode changed
+    if (clientInstance && (currentDeploymentMode !== deployment || currentConnectionMode !== connectionMode)) {
+        info('Couchbase mode changed, recreating client', { 
+            fromDeployment: currentDeploymentMode, 
+            toDeployment: deployment,
+            fromConnection: currentConnectionMode,
+            toConnection: connectionMode 
+        });
+        // Disconnect SDK client if switching away from it
+        if (clientInstance.disconnect) {
+            clientInstance.disconnect().catch(err => error('Error disconnecting:', err));
+        }
         clientInstance = null;
     }
     
     if (!clientInstance) {
-        if (deployment === 'capella') {
-            info('Creating Capella Data API client');
+        // SDK mode - uses native Couchbase SDK for all operations
+        if (connectionMode === 'sdk') {
+            info('Creating Couchbase SDK client');
+            clientInstance = new SdkCouchbaseClient();
+        }
+        // REST mode - legacy HTTP/REST-based clients
+        else if (deployment === 'capella') {
+            info('Creating Capella Data API client (REST)');
             clientInstance = new CapellaDataApiClient();
         } else {
-            info('Creating self-hosted Couchbase client');
+            info('Creating self-hosted Couchbase client (REST)');
             clientInstance = new SelfHostedCouchbaseClient();
         }
         currentDeploymentMode = deployment;
+        currentConnectionMode = connectionMode;
     }
     
     return clientInstance;
@@ -570,9 +856,13 @@ export function getCouchbaseClient(): ICouchbaseClient {
 
 export async function shutdownCouchbase(): Promise<void> {
     info('Couchbase client shutdown');
+    if (clientInstance?.disconnect) {
+        await clientInstance.disconnect();
+    }
     clientInstance = null;
     currentDeploymentMode = null;
+    currentConnectionMode = null;
 }
 
 // Export concrete classes for type checking if needed
-export { SelfHostedCouchbaseClient, CapellaDataApiClient };
+export { SelfHostedCouchbaseClient, CapellaDataApiClient, SdkCouchbaseClient };

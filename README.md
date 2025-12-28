@@ -32,35 +32,84 @@
 
 ## 🚀 Quick Start
 
-### 1. Get Your Grok API Key
+### First-Time Setup Wizard
+
+When you install Grok AI Coder for the first time, a **Setup Wizard** will automatically appear to guide you through the configuration:
+
+1. **Welcome** — Overview of what you'll need
+2. **API Key** — Enter your xAI Grok API key
+3. **Couchbase** — Configure your database connection
+4. **Test** — Verify everything works
+
+You can also open the wizard anytime via Command Palette: **"Grok: Open Setup Wizard"**
+
+---
+
+### What You'll Need
+
+Before getting started, you'll need two things:
+
+#### 1. xAI Grok API Key
 
 1. Visit [x.ai/api](https://x.ai/api)
 2. Create an account and generate an API key
 3. Copy your key (starts with `xai-`)
 
-### 2. Set Up Couchbase
+> 💡 **Tip:** Your API key is stored securely in VS Code's secret storage, never in plain text.
 
-**Option A: Docker (Quickest)**
+#### 2. Couchbase Database
+
+Grok AI Coder uses Couchbase to persist your chat history across sessions. Choose one option:
+
+**Option A: Docker (Quickest for Local Development)**
 ```bash
 docker run -d --name couchbase -p 8091-8096:8091-8096 -p 11210:11210 couchbase:latest
 ```
 
-Then visit `http://localhost:8091`, create a bucket named `grokCoder`, and run:
+After starting, complete initial setup:
+1. Visit `http://localhost:8091` in your browser
+2. Create a new cluster (remember your admin password)
+3. Create a bucket named `grokCoder`
+4. Create these indexes for optimal performance:
+
 ```sql
-CREATE INDEX `find_chats_v1` ON `grokCoder`(`projectId`,`updatedAt` DESC) WHERE (`docType` = "chat");
+-- Required: Chat session queries (list sessions, usage stats)
+CREATE INDEX `find_chats_v1` ON `grokCoder`._default._default(`projectId`, `updatedAt` DESC) 
+WHERE (`docType` = "chat");
+
+-- Required: File backup lookups by path
+CREATE INDEX `adv_pathHash_docType_createdAt` ON `grokCoder`._default._default(`pathHash`, `createdAt`) 
+WHERE (`docType` = "file-backup");
+
+-- Required: File backup lookups by session
+CREATE INDEX `adv_createdBySession_docType_createdAt_v1` ON `grokCoder`._default._default(`createdBySession`, `createdAt`) 
+WHERE (`docType` = "file-backup");
+
+-- Optional: Files API cleanup (only if using experimental Files API)
+CREATE INDEX `chat_session_finder_v1` ON `grokCoder`._default._default(`uploadedFiles`) 
+WHERE (`type` = "chat_session");
 ```
 
-**Option B: Couchbase Capella (Cloud)**
+**Option B: Couchbase Capella (Cloud — No Setup Required)**
 - Sign up at [cloud.couchbase.com](https://cloud.couchbase.com)
-- Create a free tier cluster with a `grokCoder` bucket
-- Enable Data API and note your credentials
+- Create a free tier cluster
+- Create a bucket named `grokCoder`
+- Note your cluster credentials and Data API URL
 
-### 3. Configure the Extension
+---
+
+### Manual Configuration (Alternative to Wizard)
+
+If you prefer to configure manually:
 
 1. Open Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
-2. Run **"Grok: Set API Key"**
-3. Paste your xAI API key
-4. Configure Couchbase settings in VS Code Settings
+2. Run **"Grok: Set API Key"** and paste your xAI API key
+3. Open VS Code Settings and configure:
+   - `grok.couchbaseUrl` — Your Couchbase server (default: `http://localhost`)
+   - `grok.couchbaseUsername` — Database username
+   - `grok.couchbasePassword` — Database password
+   - `grok.couchbaseBucket` — Bucket name (default: `grokCoder`)
+4. Run **"Grok: Test Connections"** to verify
 
 ---
 
@@ -132,6 +181,7 @@ Access via Command Palette (`Cmd+Shift+P`):
 
 | Command | Description |
 |---------|-------------|
+| **Grok: Open Setup Wizard** | First-time configuration wizard |
 | **Grok: Set API Key** | Configure your xAI API key |
 | **Grok: New Chat Session** | Start a fresh conversation |
 | **Grok: Explain Selection** | Explain selected code |

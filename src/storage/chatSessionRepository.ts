@@ -808,6 +808,7 @@ export async function listAllSessions(limit: number = 50): Promise<ChatSessionDo
         SELECT META().id, docType, projectId, projectName, createdAt, updatedAt, pairs
         FROM \`grokCoder\`._default._default
         WHERE docType = "chat"
+        AND projectId IS NOT MISSING
         ORDER BY updatedAt DESC
         LIMIT $limit
     `;

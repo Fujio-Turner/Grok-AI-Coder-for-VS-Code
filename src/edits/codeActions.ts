@@ -417,6 +417,16 @@ export async function revertEdits(editGroupId: string): Promise<void> {
     const success = await vscode.workspace.applyEdit(workspaceEdit);
     
     if (success) {
+        // Save all reverted files to disk
+        for (const snapshot of snapshots) {
+            try {
+                const doc = await vscode.workspace.openTextDocument(snapshot.uri);
+                await doc.save();
+            } catch (saveErr) {
+                console.error('Failed to save reverted file:', snapshot.uri, saveErr);
+            }
+        }
+        
         editSnapshots.delete(editGroupId);
         
         for (const [csId, egId] of changeSetToEditGroup.entries()) {

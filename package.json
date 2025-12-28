@@ -2,9 +2,7 @@
   "name": "grok-ai-coder",
   "displayName": "Grok AI Coder",
   "description": "AI-powered coding assistant with xAI's Grok models, persistent chat history, and full change tracking with rollback",
-
   "version": "1.0.16",
-
   "publisher": "fujio-turner",
   "author": {
     "name": "Fujio Turner"
@@ -125,6 +123,10 @@
       {
         "command": "grok.exportDiagnostics",
         "title": "Grok: Export Diagnostics Report"
+      },
+      {
+        "command": "grok.openSetupWizard",
+        "title": "Grok: Open Setup Wizard"
       }
     ],
     "configuration": {
@@ -183,6 +185,20 @@
           "description": "Which model mode to use (toggle with F/S/B button)",
           "order": 6
         },
+        "grok.couchbaseConnectionMode": {
+          "type": "string",
+          "default": "rest",
+          "enum": [
+            "sdk",
+            "rest"
+          ],
+          "enumDescriptions": [
+            "SDK - Native Couchbase Node.js SDK (faster KV ops, requires native module)",
+            "REST - HTTP/REST API (default, works everywhere)"
+          ],
+          "description": "Connection mode: SDK uses native Couchbase client (faster), REST uses HTTP APIs (more compatible)",
+          "order": 8
+        },
         "grok.couchbaseDeployment": {
           "type": "string",
           "default": "self-hosted",
@@ -191,10 +207,10 @@
             "capella"
           ],
           "enumDescriptions": [
-            "Self-hosted Couchbase Server (uses N1QL query service)",
-            "Couchbase Capella DBaaS (uses Data API)"
+            "Self-hosted Couchbase Server",
+            "Couchbase Capella DBaaS"
           ],
-          "description": "Couchbase deployment type",
+          "description": "Couchbase deployment type (affects connection string format for SDK mode)",
           "order": 9
         },
         "grok.couchbaseUrl": {
@@ -541,7 +557,7 @@
     "vscode:prepublish": "npm run esbuild-base -- --minify",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:couchbase --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "lint": "eslint src --ext ts",
@@ -563,6 +579,7 @@
     "typescript": "^5.3.2"
   },
   "dependencies": {
+    "couchbase": "^4.6.0",
     "highlight.js": "^11.9.0",
     "marked": "^11.1.0",
     "uuid": "^9.0.1"

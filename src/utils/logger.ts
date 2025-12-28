@@ -208,6 +208,7 @@ export function getConfig() {
         defaultModelType: config.get<ModelType>('defaultModelType') || 'fast',
         
         // Couchbase settings
+        couchbaseConnectionMode: config.get<'sdk' | 'rest'>('couchbaseConnectionMode') || 'rest',
         couchbaseDeployment: config.get<'self-hosted' | 'capella'>('couchbaseDeployment') || 'self-hosted',
         couchbaseUrl: config.get<string>('couchbaseUrl') || 'http://localhost',
         capellaDataApiUrl: config.get<string>('capellaDataApiUrl') || '',

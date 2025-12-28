@@ -159,9 +159,10 @@ For MODIFYING existing files, use lineOperations for precise, validated changes:
 
 **⚠️ LINE NUMBERS ARE 1-INDEXED:**
 - Line 1 is the FIRST line of the file (not line 0)
-- When file content is shown with \`1: code\`, \`2: code\`, etc., those ARE the line numbers to use
+- **USE THE EXACT LINE NUMBERS SHOWN** in the file content (e.g., \`10: original_document = {\` means line 10)
+- Files are displayed with numbered lines like \`1: ...\`, \`2: ...\` - use these numbers directly
+- DO NOT count lines yourself - rely on the prefixed line numbers
 - Count ALL lines from the start of the file: comments, imports, blank lines, docstrings
-- Do NOT count from the start of a function or class - count from the START OF THE FILE
 
 **⚠️ CRITICAL: PRESERVE TRAILING PUNCTUATION IN DICT/LIST EDITS:**
 When replacing a line that is an item in a dict, list, or tuple:

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ChatViewProvider } from './views/ChatViewProvider';
+import { initSetupWizard } from './views/SetupWizardProvider';
 import { shutdownCouchbase, getCouchbaseClient } from './storage/couchbaseClient';
 import { initLogger, info, debug, getConfig, showOutput, exportLogsToFile, exportDiagnosticsReport } from './utils/logger';
 import { initStatusBar, showUsageSummary } from './usage/tokenTracker';
@@ -229,6 +230,9 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     info('All commands registered');
+    
+    // Initialize setup wizard (shows on first run)
+    initSetupWizard(context);
 }
 
 export async function deactivate() {
