@@ -11,6 +11,10 @@ rollback_multi_file/
 ├── base.py       # Contains the shared hello() function
 ├── greeter.py    # Imports and uses hello() for greeting
 ├── welcomer.py   # Imports and uses hello() for welcoming
+├── original/     # Backup copies for manual reset
+│   ├── base.original.py
+│   ├── greeter.original.py
+│   └── welcomer.original.py
 └── README.md     # This file
 ```
 
@@ -106,4 +110,21 @@ After AI updates:
 ```bash
 python greeter.py   # Output: Hello World\n42
 python welcomer.py  # Output: Welcome Guest\n100
+```
+
+## Utility Commands
+
+**Reset files to original state (manual rollback):**
+```bash
+cp original/base.original.py base.py && cp original/greeter.original.py greeter.py && cp original/welcomer.original.py welcomer.py
+```
+
+**Check MD5 checksums of all files:**
+```bash
+md5 base.py greeter.py welcomer.py
+```
+
+**Compare current vs original checksums:**
+```bash
+md5 base.py greeter.py welcomer.py original/*.py
 ```
