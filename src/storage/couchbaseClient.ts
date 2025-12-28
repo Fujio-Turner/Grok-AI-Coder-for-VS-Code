@@ -28,10 +28,104 @@ export interface CouchbaseDocument<T> {
     cas?: string;
 }
 
+/**
+ * Result from a CAS-aware replace operation
+ */
+export interface ReplaceResult {
+    success: boolean;
+    cas?: string;
+    error?: CouchbaseErrorType;
+}
+
+/**
+ * Subdocument operation types for mutateIn
+ */
+export type SubdocOp = 
+    | { type: 'upsert'; path: string; value: unknown }
+    | { type: 'insert'; path: string; value: unknown }
+    | { type: 'arrayAppend'; path: string; value: unknown }
+    | { type: 'arrayPrepend'; path: string; value: unknown }
+    | { type: 'remove'; path: string };
+
+/**
+ * Couchbase error types for proper exception handling
+ * Mirrors Python SDK exception types from 05_cb_exception_handling.py
+ */
+export type CouchbaseErrorType = 
+    | 'DocumentNotFound'
+    | 'DocumentExists'
+    | 'CasMismatch'
+    | 'Timeout'
+    | 'ServiceUnavailable'
+    | 'ParsingFailed'
+    | 'PathNotFound'
+    | 'PathExists'
+    | 'Unknown';
+
+/**
+ * Classify an error into a CouchbaseErrorType for consistent handling
+ */
+export function classifyCouchbaseError(err: unknown): CouchbaseErrorType {
+    if (!err) return 'Unknown';
+    
+    const errName = (err as Error)?.name || '';
+    const errMessage = (err as Error)?.message || '';
+    
+    if (errName.includes('DocumentNotFound') || errMessage.includes('document not found')) {
+        return 'DocumentNotFound';
+    }
+    if (errName.includes('DocumentExists') || errMessage.includes('already exists')) {
+        return 'DocumentExists';
+    }
+    if (errName.includes('CasMismatch') || errMessage.includes('cas mismatch')) {
+        return 'CasMismatch';
+    }
+    if (errName.includes('Timeout') || errMessage.includes('timeout')) {
+        return 'Timeout';
+    }
+    if (errName.includes('ServiceUnavailable') || errMessage.includes('service unavailable')) {
+        return 'ServiceUnavailable';
+    }
+    if (errName.includes('ParsingFailed') || errMessage.includes('parsing failed')) {
+        return 'ParsingFailed';
+    }
+    if (errName.includes('PathNotFound') || errMessage.includes('path not found')) {
+        return 'PathNotFound';
+    }
+    if (errName.includes('PathExists') || errMessage.includes('path exists')) {
+        return 'PathExists';
+    }
+    
+    return 'Unknown';
+}
+
+/**
+ * Result from an insert operation
+ */
+export interface InsertResult {
+    success: boolean;
+    cas?: string;
+    error?: CouchbaseErrorType;
+}
+
 export interface ICouchbaseClient {
     get<T>(key: string): Promise<CouchbaseDocument<T> | null>;
-    insert<T>(key: string, doc: T): Promise<boolean>;
+    /**
+     * Insert a new document (fails if document already exists).
+     * Following 05_cb_exception_handling.py pattern - returns specific error type.
+     */
+    insert<T>(key: string, doc: T): Promise<InsertResult>;
     replace<T>(key: string, doc: T): Promise<boolean>;
+    /**
+     * Replace with CAS for optimistic locking (01b_cb_get_update_w_cas.py pattern)
+     * Returns detailed result including new CAS or error type
+     */
+    replaceWithCas<T>(key: string, doc: T, cas: string): Promise<ReplaceResult>;
+    /**
+     * Subdocument mutation for atomic array appends (04_cb_sub_doc_ops.py pattern)
+     * Max 16 operations per call
+     */
+    mutateIn(key: string, ops: SubdocOp[], cas?: string): Promise<ReplaceResult>;
     remove(key: string): Promise<boolean>;
     query<T>(statement: string, namedParams?: Record<string, unknown>): Promise<T[]>;
     ping(): Promise<boolean>;
@@ -138,7 +232,7 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
         }
     }
 
-    async insert<T>(key: string, doc: T): Promise<boolean> {
+    async insert<T>(key: string, doc: T): Promise<InsertResult> {
         try {
             debug('Couchbase INSERT (self-hosted):', key);
             
@@ -161,21 +255,28 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
             if (!response.ok) {
                 const errorText = await response.text();
                 error('Couchbase INSERT HTTP error:', { status: response.status, error: errorText });
-                return false;
+                return { success: false, error: 'Unknown' };
             }
 
-            const result = await response.json() as { status?: string; errors?: Array<{msg: string}> };
+            const result = await response.json() as { status?: string; errors?: Array<{msg: string; code?: number}> };
             debug('Couchbase INSERT result:', JSON.stringify(result));
             
             if (result.status !== 'success') {
-                error('Couchbase INSERT failed:', result.errors?.[0]?.msg || 'Unknown error');
-                return false;
+                const errMsg = result.errors?.[0]?.msg || '';
+                // N1QL error 12009 = "Duplicate Key" (document already exists)
+                if (errMsg.includes('Duplicate') || errMsg.includes('already exists') || result.errors?.[0]?.code === 12009) {
+                    warn('Couchbase INSERT: Document already exists:', key);
+                    return { success: false, error: 'DocumentExists' };
+                }
+                error('Couchbase INSERT failed:', errMsg);
+                return { success: false, error: 'Unknown' };
             }
             
-            return true;
+            return { success: true };
         } catch (err) {
-            error('Couchbase INSERT exception:', err);
-            return false;
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase INSERT exception:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 
@@ -217,6 +318,101 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
         } catch (err) {
             error('Couchbase REPLACE exception:', err);
             return false;
+        }
+    }
+
+    /**
+     * REST API does not support CAS-based operations directly via N1QL.
+     * This implementation falls back to regular upsert with a warning.
+     * For true CAS support, use SDK connection mode.
+     */
+    async replaceWithCas<T>(key: string, doc: T, cas: string): Promise<ReplaceResult> {
+        warn('CAS-based replace not fully supported in REST mode, falling back to upsert', { key, cas });
+        const success = await this.replace(key, doc);
+        return { success, error: success ? undefined : 'Unknown' };
+    }
+
+    /**
+     * REST API subdocument operations via N1QL UPDATE with ARRAY_APPEND.
+     * Note: N1QL doesn't support true subdoc atomicity - for that, use SDK mode.
+     */
+    async mutateIn(key: string, ops: SubdocOp[], cas?: string): Promise<ReplaceResult> {
+        try {
+            debug('Couchbase MUTATE_IN (self-hosted):', { key, opCount: ops.length });
+            
+            if (ops.length > 16) {
+                error('Couchbase MUTATE_IN: Max 16 operations per call');
+                return { success: false, error: 'Unknown' };
+            }
+
+            // Build SET clauses for each operation
+            const setClauses: string[] = [];
+            for (const op of ops) {
+                switch (op.type) {
+                    case 'upsert':
+                        setClauses.push(`\`${op.path}\` = $${op.path.replace(/[.\[\]]/g, '_')}`);
+                        break;
+                    case 'arrayAppend':
+                        setClauses.push(`\`${op.path}\` = ARRAY_APPEND(IFMISSINGORNULL(\`${op.path}\`, []), $${op.path.replace(/[.\[\]]/g, '_')})`);
+                        break;
+                    case 'arrayPrepend':
+                        setClauses.push(`\`${op.path}\` = ARRAY_PREPEND($${op.path.replace(/[.\[\]]/g, '_')}, IFMISSINGORNULL(\`${op.path}\`, []))`);
+                        break;
+                    case 'remove':
+                        // N1QL doesn't have direct remove - would need OBJECT_REMOVE
+                        warn('REMOVE operation not fully supported in REST mode');
+                        break;
+                    case 'insert':
+                        // Insert fails if exists - N1QL doesn't support this directly
+                        setClauses.push(`\`${op.path}\` = $${op.path.replace(/[.\[\]]/g, '_')}`);
+                        break;
+                }
+            }
+
+            if (setClauses.length === 0) {
+                return { success: true };
+            }
+
+            const query = `UPDATE ${this.getFullPath()} SET ${setClauses.join(', ')} WHERE META().id = $key`;
+            
+            // Build params
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const params: Record<string, any> = { $key: key };
+            for (const op of ops) {
+                if (op.type !== 'remove') {
+                    params[`$${op.path.replace(/[.\[\]]/g, '_')}`] = op.value;
+                }
+            }
+
+            const response = await fetch(this.getQueryUrl(), {
+                method: 'POST',
+                headers: {
+                    'Authorization': this.getAuthHeader(),
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ statement: query, ...params }),
+                signal: this.createTimeoutSignal()
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                error('Couchbase MUTATE_IN HTTP error:', { status: response.status, error: errorText });
+                return { success: false, error: 'Unknown' };
+            }
+
+            const result = await response.json() as { status?: string; errors?: Array<{msg: string}> };
+            debug('Couchbase MUTATE_IN result:', JSON.stringify(result));
+            
+            if (result.status !== 'success') {
+                error('Couchbase MUTATE_IN failed:', result.errors?.[0]?.msg || 'Unknown error');
+                return { success: false, error: 'Unknown' };
+            }
+            
+            return { success: true };
+        } catch (err) {
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase MUTATE_IN exception:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 
@@ -397,7 +593,7 @@ class CapellaDataApiClient implements ICouchbaseClient {
         }
     }
 
-    async insert<T>(key: string, doc: T): Promise<boolean> {
+    async insert<T>(key: string, doc: T): Promise<InsertResult> {
         try {
             debug('Couchbase INSERT (Capella):', key);
             
@@ -414,17 +610,25 @@ class CapellaDataApiClient implements ICouchbaseClient {
                 signal: this.createTimeoutSignal()
             });
 
+            // Capella Data API returns 409 Conflict if document exists
+            if (response.status === 409) {
+                warn('Couchbase INSERT: Document already exists (Capella):', key);
+                return { success: false, error: 'DocumentExists' };
+            }
+
             if (!response.ok) {
                 const errorText = await response.text();
                 error('Couchbase INSERT HTTP error:', { status: response.status, error: errorText });
-                return false;
+                return { success: false, error: 'Unknown' };
             }
 
-            debug('Couchbase INSERT success');
-            return true;
+            const cas = response.headers.get('ETag') || undefined;
+            debug('Couchbase INSERT success (Capella):', { key, cas });
+            return { success: true, cas };
         } catch (err) {
-            error('Couchbase INSERT exception:', err);
-            return false;
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase INSERT exception:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 
@@ -456,6 +660,141 @@ class CapellaDataApiClient implements ICouchbaseClient {
         } catch (err) {
             error('Couchbase REPLACE exception:', err);
             return false;
+        }
+    }
+
+    /**
+     * Capella Data API supports CAS via ETag/If-Match header.
+     * Follows 01b_cb_get_update_w_cas.py pattern.
+     */
+    async replaceWithCas<T>(key: string, doc: T, cas: string): Promise<ReplaceResult> {
+        try {
+            debug('Couchbase REPLACE with CAS (Capella):', { key, cas });
+            
+            const baseUrl = this.getBaseUrl();
+            const url = `${baseUrl}${this.getDocumentPath(key)}`;
+            
+            const response = await fetch(url, {
+                method: 'PUT',
+                headers: {
+                    'Authorization': this.getAuthHeader(),
+                    'Content-Type': 'application/json',
+                    'If-Match': cas
+                },
+                body: JSON.stringify(doc),
+                signal: this.createTimeoutSignal()
+            });
+
+            if (response.status === 412) {
+                warn('Couchbase REPLACE CAS mismatch (Capella):', { key, cas });
+                return { success: false, error: 'CasMismatch' };
+            }
+
+            if (response.status === 404) {
+                warn('Couchbase REPLACE document not found (Capella):', key);
+                return { success: false, error: 'DocumentNotFound' };
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                error('Couchbase REPLACE with CAS HTTP error:', { status: response.status, error: errorText });
+                return { success: false, error: 'Unknown' };
+            }
+
+            const newCas = response.headers.get('ETag') || undefined;
+            debug('Couchbase REPLACE with CAS success:', { key, newCas });
+            return { success: true, cas: newCas };
+        } catch (err) {
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase REPLACE with CAS exception:', { error: err, errorType });
+            return { success: false, error: errorType };
+        }
+    }
+
+    /**
+     * Capella Data API doesn't support subdoc directly - falls back to N1QL.
+     * For true subdoc atomicity, use SDK mode.
+     */
+    async mutateIn(key: string, ops: SubdocOp[], cas?: string): Promise<ReplaceResult> {
+        try {
+            debug('Couchbase MUTATE_IN (Capella):', { key, opCount: ops.length });
+            
+            if (ops.length > 16) {
+                error('Couchbase MUTATE_IN: Max 16 operations per call');
+                return { success: false, error: 'Unknown' };
+            }
+
+            // Use N1QL UPDATE for subdoc-like operations
+            const config = getConfig();
+            const fullPath = `\`${config.couchbaseBucket}\`.\`${config.couchbaseScope}\`.\`${config.couchbaseCollection}\``;
+
+            const setClauses: string[] = [];
+            for (const op of ops) {
+                switch (op.type) {
+                    case 'upsert':
+                        setClauses.push(`\`${op.path}\` = $${op.path.replace(/[.\[\]]/g, '_')}`);
+                        break;
+                    case 'arrayAppend':
+                        setClauses.push(`\`${op.path}\` = ARRAY_APPEND(IFMISSINGORNULL(\`${op.path}\`, []), $${op.path.replace(/[.\[\]]/g, '_')})`);
+                        break;
+                    case 'arrayPrepend':
+                        setClauses.push(`\`${op.path}\` = ARRAY_PREPEND($${op.path.replace(/[.\[\]]/g, '_')}, IFMISSINGORNULL(\`${op.path}\`, []))`);
+                        break;
+                    case 'remove':
+                        warn('REMOVE operation not fully supported in Capella REST mode');
+                        break;
+                    case 'insert':
+                        setClauses.push(`\`${op.path}\` = $${op.path.replace(/[.\[\]]/g, '_')}`);
+                        break;
+                }
+            }
+
+            if (setClauses.length === 0) {
+                return { success: true };
+            }
+
+            const query = `UPDATE ${fullPath} SET ${setClauses.join(', ')} WHERE META().id = $key`;
+            
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const params: Record<string, any> = { $key: key };
+            for (const op of ops) {
+                if (op.type !== 'remove') {
+                    params[`$${op.path.replace(/[.\[\]]/g, '_')}`] = op.value;
+                }
+            }
+
+            const baseUrl = this.getBaseUrl();
+            const url = `${baseUrl}${this.getQueryPath()}`;
+
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': this.getAuthHeader(),
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ statement: query, ...params }),
+                signal: this.createTimeoutSignal()
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                error('Couchbase MUTATE_IN HTTP error:', { status: response.status, error: errorText });
+                return { success: false, error: 'Unknown' };
+            }
+
+            const result = await response.json() as { status?: string; errors?: Array<{msg: string}> };
+            debug('Couchbase MUTATE_IN result:', JSON.stringify(result));
+            
+            if (result.status !== 'success') {
+                error('Couchbase MUTATE_IN failed:', result.errors?.[0]?.msg || 'Unknown error');
+                return { success: false, error: 'Unknown' };
+            }
+            
+            return { success: true };
+        } catch (err) {
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase MUTATE_IN exception:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 
@@ -692,24 +1031,27 @@ class SdkCouchbaseClient implements ICouchbaseClient {
         }
     }
 
-    async insert<T>(key: string, doc: T): Promise<boolean> {
+    async insert<T>(key: string, doc: T): Promise<InsertResult> {
         try {
             debug('Couchbase SDK INSERT:', key);
             await this.ensureSDK();
             const collection = await this.getCollection();
-            await collection.insert(key, doc);
-            debug('Couchbase SDK INSERT success:', key);
-            return true;
+            const result = await collection.insert(key, doc);
+            debug('Couchbase SDK INSERT success:', { key, cas: result.cas?.toString() });
+            return { success: true, cas: result.cas?.toString() };
         } catch (err) {
             const sdk = this.sdk;
-            if (sdk && err instanceof sdk.DocumentExistsError) {
-                error('Couchbase SDK INSERT: Document already exists:', key);
-            } else if ((err as Error)?.name === 'DocumentExistsError') {
-                error('Couchbase SDK INSERT: Document already exists:', key);
-            } else {
-                error('Couchbase SDK INSERT failed:', err);
+            const errName = (err as Error)?.name || '';
+            
+            // Following 05_cb_exception_handling.py - specific DocumentExistsException handling
+            if (sdk && err instanceof sdk.DocumentExistsError || errName === 'DocumentExistsError') {
+                warn('Couchbase SDK INSERT: Document already exists:', key);
+                return { success: false, error: 'DocumentExists' };
             }
-            return false;
+            
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase SDK INSERT failed:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 
@@ -718,13 +1060,123 @@ class SdkCouchbaseClient implements ICouchbaseClient {
             debug('Couchbase SDK UPSERT:', key);
             await this.ensureSDK();
             const collection = await this.getCollection();
-            // Use upsert for replace to match REST behavior (creates if not exists)
             await collection.upsert(key, doc);
             debug('Couchbase SDK UPSERT success:', key);
             return true;
         } catch (err) {
             error('Couchbase SDK UPSERT failed:', err);
             return false;
+        }
+    }
+
+    /**
+     * CAS-based replace following 01b_cb_get_update_w_cas.py pattern.
+     * Uses SDK's native replace with CAS for optimistic locking.
+     * On CasMismatchError, caller should retry with fresh document.
+     */
+    async replaceWithCas<T>(key: string, doc: T, cas: string): Promise<ReplaceResult> {
+        try {
+            debug('Couchbase SDK REPLACE with CAS:', { key, cas });
+            const sdk = await this.ensureSDK();
+            const collection = await this.getCollection();
+            
+            const result = await collection.replace(key, doc, { cas: BigInt(cas) });
+            
+            debug('Couchbase SDK REPLACE with CAS success:', { key, newCas: result.cas?.toString() });
+            return { 
+                success: true, 
+                cas: result.cas?.toString() 
+            };
+        } catch (err) {
+            const sdk = this.sdk;
+            const errName = (err as Error)?.name || '';
+            
+            if (sdk && err instanceof sdk.CasMismatchError || errName === 'CasMismatchError') {
+                warn('Couchbase SDK CAS mismatch - document modified by another writer:', { key, cas });
+                return { success: false, error: 'CasMismatch' };
+            }
+            if (sdk && err instanceof sdk.DocumentNotFoundError || errName === 'DocumentNotFoundError') {
+                warn('Couchbase SDK REPLACE: Document not found:', key);
+                return { success: false, error: 'DocumentNotFound' };
+            }
+            
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase SDK REPLACE with CAS failed:', { error: err, errorType });
+            return { success: false, error: errorType };
+        }
+    }
+
+    /**
+     * Subdocument mutation following 04_cb_sub_doc_ops.py pattern.
+     * Uses SDK's mutateIn for atomic array operations.
+     * Max 16 operations per call.
+     */
+    async mutateIn(key: string, ops: SubdocOp[], cas?: string): Promise<ReplaceResult> {
+        try {
+            debug('Couchbase SDK MUTATE_IN:', { key, opCount: ops.length, hasCas: !!cas });
+            const sdk = await this.ensureSDK();
+            const collection = await this.getCollection();
+            
+            if (ops.length > 16) {
+                error('Couchbase SDK MUTATE_IN: Max 16 operations per call');
+                return { success: false, error: 'Unknown' };
+            }
+
+            // Build subdoc specs
+            const specs: unknown[] = [];
+            for (const op of ops) {
+                switch (op.type) {
+                    case 'upsert':
+                        specs.push(sdk.MutateInSpec.upsert(op.path, op.value));
+                        break;
+                    case 'insert':
+                        specs.push(sdk.MutateInSpec.insert(op.path, op.value));
+                        break;
+                    case 'arrayAppend':
+                        specs.push(sdk.MutateInSpec.arrayAppend(op.path, op.value));
+                        break;
+                    case 'arrayPrepend':
+                        specs.push(sdk.MutateInSpec.arrayPrepend(op.path, op.value));
+                        break;
+                    case 'remove':
+                        specs.push(sdk.MutateInSpec.remove(op.path));
+                        break;
+                }
+            }
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const options: any = {};
+            if (cas) {
+                options.cas = BigInt(cas);
+            }
+
+            const result = await collection.mutateIn(key, specs, options);
+            
+            debug('Couchbase SDK MUTATE_IN success:', { key, newCas: result.cas?.toString() });
+            return { 
+                success: true, 
+                cas: result.cas?.toString() 
+            };
+        } catch (err) {
+            const sdk = this.sdk;
+            const errName = (err as Error)?.name || '';
+            
+            if (sdk && err instanceof sdk.CasMismatchError || errName === 'CasMismatchError') {
+                warn('Couchbase SDK MUTATE_IN CAS mismatch:', { key, cas });
+                return { success: false, error: 'CasMismatch' };
+            }
+            if (sdk && err instanceof sdk.DocumentNotFoundError || errName === 'DocumentNotFoundError') {
+                warn('Couchbase SDK MUTATE_IN: Document not found:', key);
+                return { success: false, error: 'DocumentNotFound' };
+            }
+            if (errName === 'PathNotFoundError' || errName.includes('PathNotFound')) {
+                warn('Couchbase SDK MUTATE_IN: Path not found:', key);
+                return { success: false, error: 'PathNotFound' };
+            }
+            
+            const errorType = classifyCouchbaseError(err);
+            error('Couchbase SDK MUTATE_IN failed:', { error: err, errorType });
+            return { success: false, error: errorType };
         }
     }
 

@@ -278,11 +278,15 @@ DASHBOARD_HTML = """
         <label>Category:</label>
         <select id="categoryFilter" onchange="filterTable()">
             <option value="all">All categories</option>
-            <option value="truncation">Truncation</option>
-            <option value="json">JSON parsing</option>
             <option value="api">API errors</option>
-            <option value="file">File operations</option>
             <option value="cli">CLI commands</option>
+            <option value="file">File operations</option>
+            <option value="json">JSON parsing</option>
+            <option value="other">Other</option>
+            <option value="terminated">Terminated</option>
+            <option value="timeout">Timeout</option>
+            <option value="truncation">Truncation</option>
+            <option value="validation">Validation</option>
         </select>
         <label>Session Type:</label>
         <select id="sessionTypeFilter" onchange="filterTable()">
@@ -425,7 +429,7 @@ DASHBOARD_HTML = """
             
             // Type Pie Chart
             const typeCounts = { bug: 0, failure: 0, error: 0, cli: 0 };
-            const categoryCounts = { truncation: 0, json: 0, api: 0, file: 0, cli: 0, other: 0 };
+            const categoryCounts = { truncation: 0, json: 0, api: 0, timeout: 0, terminated: 0, validation: 0, file: 0, cli: 0, other: 0 };
             data.errors.forEach(e => { 
                 if (typeCounts[e.type] !== undefined) typeCounts[e.type]++;
                 const cat = categorizeError(e);
@@ -466,6 +470,9 @@ DASHBOARD_HTML = """
                         { value: categoryCounts.truncation, name: 'Truncation', itemStyle: { color: '#c94eb0' } },
                         { value: categoryCounts.json, name: 'JSON', itemStyle: { color: '#4ec9b0' } },
                         { value: categoryCounts.api, name: 'API', itemStyle: { color: '#ccaa00' } },
+                        { value: categoryCounts.timeout, name: 'Timeout', itemStyle: { color: '#ff6b6b' } },
+                        { value: categoryCounts.terminated, name: 'Terminated', itemStyle: { color: '#ffa94d' } },
+                        { value: categoryCounts.validation, name: 'Validation', itemStyle: { color: '#69db7c' } },
                         { value: categoryCounts.file, name: 'File', itemStyle: { color: '#6ab0de' } },
                         { value: categoryCounts.cli, name: 'CLI', itemStyle: { color: '#c586c0' } },
                         { value: categoryCounts.other, name: 'Other', itemStyle: { color: '#888888' } }
@@ -698,7 +705,10 @@ DASHBOARD_HTML = """
             if (error.type === 'cli') return 'cli';
             if (desc.includes('truncat')) return 'truncation';
             if (desc.includes('json') || error.bugType === 'JSON') return 'json';
-            if (desc.includes('api error') || desc.includes('fetch failed')) return 'api';
+            if (desc.includes('timeout') || desc.includes('connection dropped')) return 'timeout';
+            if (desc.includes('terminated')) return 'terminated';
+            if (desc.includes('invalid argument') || desc.includes('validation')) return 'validation';
+            if (desc.includes('api error') || desc.includes('fetch failed') || desc.includes('retry failed') || desc.includes('failed fetch')) return 'api';
             if (error.type === 'failure' || desc.includes('line') || desc.includes('diff')) return 'file';
             return 'other';
         }

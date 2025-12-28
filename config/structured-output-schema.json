@@ -105,7 +105,8 @@
                     "required": ["type", "line"],
                     "additionalProperties": false
                   }
-                }
+                },
+                "todoIndex": { "type": "integer", "description": "0-indexed reference to todos array item this change completes" }
               },
               "required": ["path", "content"],
               "additionalProperties": false

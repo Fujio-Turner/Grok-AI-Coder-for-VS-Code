@@ -1,9 +1,13 @@
 import { v4 as uuidv4 } from 'uuid';
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { getCouchbaseClient } from './couchbaseClient';
+import { getCouchbaseClient, SubdocOp, CouchbaseErrorType, classifyCouchbaseError } from './couchbaseClient';
 import { GrokUsage } from '../api/grokClient';
 import { NextStepItem } from '../prompts/responseSchema';
+import { debug, warn, error as logError, info } from '../utils/logger';
+
+const MAX_CAS_RETRIES = 3;
+const CAS_RETRY_DELAY_MS = 50;
 
 const MAX_PAYLOAD_SIZE_MB = 15; // Conservative limit (Couchbase max is 20MB)
 
@@ -467,6 +471,11 @@ export function getProjectName(): string {
     return workspaceFolders[0].name;
 }
 
+/**
+ * Create a new chat session.
+ * Uses insert which fails if document exists (05_cb_exception_handling.py pattern).
+ * On DocumentExists error (extremely rare with UUIDs), fetches existing session with CAS.
+ */
 export async function createSession(parentSessionId?: string): Promise<ChatSessionDocument> {
     const client = getCouchbaseClient();
     const id = uuidv4();
@@ -490,13 +499,26 @@ export async function createSession(parentSessionId?: string): Promise<ChatSessi
         modelUsed: []
     };
 
-    const success = await client.insert(id, doc);
-    if (!success) {
-        throw new Error('Failed to create session in Couchbase');
+    const result = await client.insert(id, doc);
+    
+    if (result.success) {
+        info('Created new session', { id, projectName, parentSessionId });
+        return doc;
     }
     
-    console.log('Created new session:', id, 'for project:', projectName, parentSessionId ? `(handoff from ${parentSessionId})` : '');
-    return doc;
+    // Insert failed - check specific error type (following 05_cb_exception_handling.py)
+    if (result.error === 'DocumentExists') {
+        // UUID collision - extremely rare, but handle gracefully
+        warn('Session already exists (UUID collision), fetching existing with CAS', { id });
+        const existing = await client.get<ChatSessionDocument>(id);
+        if (existing && existing.content) {
+            return existing.content;
+        }
+    }
+    
+    // Other error - timeout, connection issue, etc.
+    logError('Failed to create session in Couchbase', { id, projectName, error: result.error });
+    throw new Error(`Failed to create session in Couchbase: ${result.error}`);
 }
 
 export async function getSession(id: string): Promise<ChatSessionDocument | null> {
@@ -633,7 +655,34 @@ export async function updateSessionTodos(sessionId: string, todos: TodoItem[]): 
 }
 
 /**
- * Update session usage totals (cost, tokensIn, tokensOut)
+ * Mark a single TODO as completed using subdocument API.
+ * Uses upsert at specific array index path for efficiency on large documents.
+ * 
+ * @param sessionId - The session document ID
+ * @param todoIndex - 0-indexed position in the todos array
+ */
+export async function markTodoCompleted(sessionId: string, todoIndex: number): Promise<boolean> {
+    const client = getCouchbaseClient();
+    
+    const ops: SubdocOp[] = [
+        { type: 'upsert', path: `todos[${todoIndex}].completed`, value: true },
+        { type: 'upsert', path: 'updatedAt', value: new Date().toISOString() }
+    ];
+    
+    const result = await client.mutateIn(sessionId, ops);
+    
+    if (!result.success) {
+        debug('Failed to mark todo completed via subdoc', { sessionId, todoIndex, error: result.error });
+        return false;
+    }
+    
+    debug('Marked todo completed', { sessionId, todoIndex });
+    return true;
+}
+
+/**
+ * Update session usage totals (cost, tokensIn, tokensOut).
+ * Uses CAS-based retry logic (01b_cb_get_update_w_cas.py pattern) for concurrent safety.
  */
 export async function updateSessionUsage(
     sessionId: string, 
@@ -644,13 +693,6 @@ export async function updateSessionUsage(
     const client = getCouchbaseClient();
     const now = new Date().toISOString();
 
-    const result = await client.get<ChatSessionDocument>(sessionId);
-    if (!result || !result.content) {
-        throw new Error(`Session not found: ${sessionId}`);
-    }
-    
-    const doc = result.content;
-    
     // Calculate cost based on model
     const pricing: Record<string, { inputPer1M: number; outputPer1M: number }> = {
         'grok-3-mini': { inputPer1M: 0.30, outputPer1M: 0.50 },
@@ -659,18 +701,38 @@ export async function updateSessionUsage(
     const rates = pricing[model] || pricing['grok-3-mini'];
     const cost = (promptTokens / 1_000_000) * rates.inputPer1M + 
                  (completionTokens / 1_000_000) * rates.outputPer1M;
-    
-    doc.tokensIn = (doc.tokensIn || 0) + promptTokens;
-    doc.tokensOut = (doc.tokensOut || 0) + completionTokens;
-    doc.cost = (doc.cost || 0) + cost;
-    doc.updatedAt = now;
-    
-    const success = await client.replace(sessionId, doc);
-    if (!success) {
+
+    // CAS-based retry loop (following 01b_cb_get_update_w_cas.py pattern)
+    for (let attempt = 1; attempt <= MAX_CAS_RETRIES; attempt++) {
+        const result = await client.get<ChatSessionDocument>(sessionId);
+        if (!result || !result.content) {
+            throw new Error(`Session not found: ${sessionId}`);
+        }
+        
+        const doc = result.content;
+        const cas = result.cas;
+        
+        doc.tokensIn = (doc.tokensIn || 0) + promptTokens;
+        doc.tokensOut = (doc.tokensOut || 0) + completionTokens;
+        doc.cost = (doc.cost || 0) + cost;
+        doc.updatedAt = now;
+        
+        const replaceResult = await client.replaceWithCas(sessionId, doc, cas!);
+        
+        if (replaceResult.success) {
+            debug('Updated usage for session', { sessionId, cost: doc.cost.toFixed(6) });
+            return;
+        }
+        
+        if (replaceResult.error === 'CasMismatch' && attempt < MAX_CAS_RETRIES) {
+            warn('CAS mismatch on usage update, retrying', { sessionId, attempt });
+            await new Promise(resolve => setTimeout(resolve, CAS_RETRY_DELAY_MS * attempt));
+            continue;
+        }
+        
+        logError('Failed to update session usage', { sessionId, error: replaceResult.error, attempt });
         throw new Error('Failed to update session usage');
     }
-    
-    console.log('Updated usage for session:', sessionId, '- cost:', doc.cost.toFixed(6));
 }
 
 /**
@@ -878,7 +940,8 @@ export async function getSessionChangeHistory(sessionId: string): Promise<Change
 }
 
 /**
- * Append a bug report to a session
+ * Append a bug report to a session.
+ * Uses subdocument API (04_cb_sub_doc_ops.py pattern) for atomic array append.
  */
 export async function appendSessionBug(
     sessionId: string,
@@ -887,18 +950,6 @@ export async function appendSessionBug(
     const client = getCouchbaseClient();
     const now = new Date().toISOString();
 
-    const result = await client.get<ChatSessionDocument>(sessionId);
-    if (!result || !result.content) {
-        throw new Error(`Session not found: ${sessionId}`);
-    }
-    
-    const doc = result.content;
-    
-    // Initialize bugs array if not present
-    if (!doc.bugs) {
-        doc.bugs = [];
-    }
-    
     const fullBug: BugReport = {
         id: uuidv4(),
         ...bug,
@@ -906,15 +957,39 @@ export async function appendSessionBug(
         resolved: false
     };
     
-    doc.bugs.push(fullBug);
-    doc.updatedAt = now;
+    // Use subdocument API for atomic array append (appends to bottom of array)
+    const ops: SubdocOp[] = [
+        { type: 'arrayAppend', path: 'bugs', value: fullBug },
+        { type: 'upsert', path: 'updatedAt', value: now }
+    ];
     
-    const success = await client.replace(sessionId, doc);
-    if (!success) {
-        throw new Error('Failed to append bug report');
+    const result = await client.mutateIn(sessionId, ops);
+    
+    if (!result.success) {
+        // Handle PathNotFound - bugs array doesn't exist yet
+        if (result.error === 'PathNotFound') {
+            debug('bugs array not found, initializing with first bug');
+            // Fall back to get/replace to initialize the array
+            const getResult = await client.get<ChatSessionDocument>(sessionId);
+            if (!getResult || !getResult.content) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const doc = getResult.content;
+            doc.bugs = [fullBug];
+            doc.updatedAt = now;
+            
+            const replaceResult = await client.replaceWithCas(sessionId, doc, getResult.cas!);
+            if (!replaceResult.success) {
+                logError('Failed to initialize bugs array', { sessionId, error: replaceResult.error });
+                throw new Error('Failed to append bug report');
+            }
+        } else {
+            logError('Failed to append bug report via subdoc', { sessionId, error: result.error });
+            throw new Error('Failed to append bug report');
+        }
     }
     
-    console.log('Added bug report to session:', sessionId, '- type:', bug.type, 'pairIndex:', bug.pairIndex);
+    info('Added bug report to session', { sessionId, type: bug.type, pairIndex: bug.pairIndex });
     return fullBug;
 }
 
@@ -927,7 +1002,8 @@ export async function getSessionBugs(sessionId: string): Promise<BugReport[]> {
 }
 
 /**
- * Append an operation failure to a session for debugging
+ * Append an operation failure to a session for debugging.
+ * Uses subdocument API for atomic array append.
  */
 export async function appendOperationFailure(
     sessionId: string,
@@ -936,38 +1012,43 @@ export async function appendOperationFailure(
     const client = getCouchbaseClient();
     const now = new Date().toISOString();
 
-    const result = await client.get<ChatSessionDocument>(sessionId);
-    if (!result || !result.content) {
-        throw new Error(`Session not found: ${sessionId}`);
-    }
-    
-    const doc = result.content;
-    
-    // Initialize operationFailures array if not present
-    if (!doc.operationFailures) {
-        doc.operationFailures = [];
-    }
-    
     const fullFailure: OperationFailure = {
         id: uuidv4(),
         ...failure,
         timestamp: now
     };
     
-    // Keep only last 50 failures to prevent unbounded growth
-    if (doc.operationFailures.length >= 50) {
-        doc.operationFailures = doc.operationFailures.slice(-49);
+    // Use subdocument API for atomic array append
+    const ops: SubdocOp[] = [
+        { type: 'arrayAppend', path: 'operationFailures', value: fullFailure },
+        { type: 'upsert', path: 'updatedAt', value: now }
+    ];
+    
+    const result = await client.mutateIn(sessionId, ops);
+    
+    if (!result.success) {
+        if (result.error === 'PathNotFound') {
+            debug('operationFailures array not found, initializing');
+            const getResult = await client.get<ChatSessionDocument>(sessionId);
+            if (!getResult || !getResult.content) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const doc = getResult.content;
+            doc.operationFailures = [fullFailure];
+            doc.updatedAt = now;
+            
+            const replaceResult = await client.replaceWithCas(sessionId, doc, getResult.cas!);
+            if (!replaceResult.success) {
+                logError('Failed to initialize operationFailures array', { sessionId, error: replaceResult.error });
+                throw new Error('Failed to append operation failure');
+            }
+        } else {
+            logError('Failed to append operation failure via subdoc', { sessionId, error: result.error });
+            throw new Error('Failed to append operation failure');
+        }
     }
     
-    doc.operationFailures.push(fullFailure);
-    doc.updatedAt = now;
-    
-    const success = await client.replace(sessionId, doc);
-    if (!success) {
-        throw new Error('Failed to append operation failure');
-    }
-    
-    console.log('Logged operation failure to session:', sessionId, '- file:', failure.filePath, 'error:', failure.error);
+    debug('Logged operation failure to session', { sessionId, file: failure.filePath, error: failure.error });
     return fullFailure;
 }
 
@@ -980,7 +1061,8 @@ export async function getOperationFailures(sessionId: string): Promise<Operation
 }
 
 /**
- * Append a CLI execution record to a session
+ * Append a CLI execution record to a session.
+ * Uses subdocument API for atomic array append.
  */
 export async function appendCliExecution(
     sessionId: string,
@@ -989,39 +1071,44 @@ export async function appendCliExecution(
     const client = getCouchbaseClient();
     const now = new Date().toISOString();
 
-    const result = await client.get<ChatSessionDocument>(sessionId);
-    if (!result || !result.content) {
-        throw new Error(`Session not found: ${sessionId}`);
-    }
-    
-    const doc = result.content;
-    
-    // Initialize cliExecutions array if not present
-    if (!doc.cliExecutions) {
-        doc.cliExecutions = [];
-    }
-    
     const fullExecution: CliExecution = {
         id: uuidv4(),
         ...execution,
         timestamp: now
     };
     
-    // Keep only last 100 executions to prevent unbounded growth
-    if (doc.cliExecutions.length >= 100) {
-        doc.cliExecutions = doc.cliExecutions.slice(-99);
-    }
+    // Use subdocument API for atomic array append
+    const ops: SubdocOp[] = [
+        { type: 'arrayAppend', path: 'cliExecutions', value: fullExecution },
+        { type: 'upsert', path: 'updatedAt', value: now }
+    ];
     
-    doc.cliExecutions.push(fullExecution);
-    doc.updatedAt = now;
+    const result = await client.mutateIn(sessionId, ops);
     
-    const success = await client.replace(sessionId, doc);
-    if (!success) {
-        throw new Error('Failed to append CLI execution');
+    if (!result.success) {
+        if (result.error === 'PathNotFound') {
+            debug('cliExecutions array not found, initializing');
+            const getResult = await client.get<ChatSessionDocument>(sessionId);
+            if (!getResult || !getResult.content) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const doc = getResult.content;
+            doc.cliExecutions = [fullExecution];
+            doc.updatedAt = now;
+            
+            const replaceResult = await client.replaceWithCas(sessionId, doc, getResult.cas!);
+            if (!replaceResult.success) {
+                logError('Failed to initialize cliExecutions array', { sessionId, error: replaceResult.error });
+                throw new Error('Failed to append CLI execution');
+            }
+        } else {
+            logError('Failed to append CLI execution via subdoc', { sessionId, error: result.error });
+            throw new Error('Failed to append CLI execution');
+        }
     }
     
     const status = execution.success ? '✓' : '✗';
-    console.log(`Logged CLI execution to session: ${sessionId} - ${status} ${execution.command.slice(0, 50)}`);
+    debug(`Logged CLI execution: ${status} ${execution.command.slice(0, 50)}`, { sessionId });
     return fullExecution;
 }
 
@@ -1035,6 +1122,7 @@ export async function getCliExecutions(sessionId: string): Promise<CliExecution[
 
 /**
  * Append a response remediation record to a session.
+ * Uses subdocument API for atomic array append.
  * Tracks auto-corrections for later analysis and potential removal.
  */
 export async function appendRemediation(
@@ -1044,39 +1132,44 @@ export async function appendRemediation(
     const client = getCouchbaseClient();
     const now = new Date().toISOString();
 
-    const result = await client.get<ChatSessionDocument>(sessionId);
-    if (!result || !result.content) {
-        throw new Error(`Session not found: ${sessionId}`);
-    }
-    
-    const doc = result.content;
-    
-    // Initialize remediations array if not present
-    if (!doc.remediations) {
-        doc.remediations = [];
-    }
-    
     const fullRemediation: ResponseRemediation = {
         id: uuidv4(),
         ...remediation,
         timestamp: now
     };
     
-    // Keep only last 100 remediations to prevent unbounded growth
-    if (doc.remediations.length >= 100) {
-        doc.remediations = doc.remediations.slice(-99);
-    }
+    // Use subdocument API for atomic array append
+    const ops: SubdocOp[] = [
+        { type: 'arrayAppend', path: 'remediations', value: fullRemediation },
+        { type: 'upsert', path: 'updatedAt', value: now }
+    ];
     
-    doc.remediations.push(fullRemediation);
-    doc.updatedAt = now;
+    const result = await client.mutateIn(sessionId, ops);
     
-    const success = await client.replace(sessionId, doc);
-    if (!success) {
-        throw new Error('Failed to append remediation');
+    if (!result.success) {
+        if (result.error === 'PathNotFound') {
+            debug('remediations array not found, initializing');
+            const getResult = await client.get<ChatSessionDocument>(sessionId);
+            if (!getResult || !getResult.content) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const doc = getResult.content;
+            doc.remediations = [fullRemediation];
+            doc.updatedAt = now;
+            
+            const replaceResult = await client.replaceWithCas(sessionId, doc, getResult.cas!);
+            if (!replaceResult.success) {
+                logError('Failed to initialize remediations array', { sessionId, error: replaceResult.error });
+                throw new Error('Failed to append remediation');
+            }
+        } else {
+            logError('Failed to append remediation via subdoc', { sessionId, error: result.error });
+            throw new Error('Failed to append remediation');
+        }
     }
     
     const status = remediation.success ? '✓' : '✗';
-    console.log(`[Remediation] ${status} ${remediation.type} for ${remediation.filePath || 'response'}: ${remediation.description.slice(0, 80)}`);
+    debug(`[Remediation] ${status} ${remediation.type} for ${remediation.filePath || 'response'}`, { description: remediation.description.slice(0, 80) });
     return fullRemediation;
 }
 
@@ -1278,12 +1371,16 @@ export async function getOrCreateAuditDocument(
     };
     
     // Try insert first, fall back to replace if document exists
-    const inserted = await client.insert(auditKey, auditDoc);
-    if (!inserted) {
-        // Document already exists, this shouldn't happen but handle it
-        await client.replace(auditKey, auditDoc);
+    const result = await client.insert(auditKey, auditDoc);
+    if (!result.success) {
+        if (result.error === 'DocumentExists') {
+            // Document already exists, replace it
+            await client.replace(auditKey, auditDoc);
+        } else {
+            logError('Failed to create audit document', { sessionId, error: result.error });
+        }
     }
-    console.log(`[Audit] Created audit document for session: ${sessionId}`);
+    debug(`[Audit] Created audit document for session: ${sessionId}`);
     return auditDoc;
 }
 
@@ -1753,9 +1850,10 @@ export async function createSessionExtension(sessionId: string): Promise<Session
     };
     
     // Insert the extension document
-    const insertSuccess = await client.insert(extensionKey, extensionDoc);
-    if (!insertSuccess) {
-        throw new Error(`Failed to create extension document: ${extensionKey}`);
+    const insertResult = await client.insert(extensionKey, extensionDoc);
+    if (!insertResult.success) {
+        logError('Failed to create extension document', { extensionKey, error: insertResult.error });
+        throw new Error(`Failed to create extension document: ${extensionKey} (${insertResult.error})`);
     }
     
     const extDocSize = getDocumentSize(extensionDoc);
@@ -2216,9 +2314,9 @@ export async function createFileBackup(
         encoding: 'gzip+base64'
     };
     
-    const success = await client.insert(backupId, backupDoc);
-    if (success) {
-        console.log('Created file backup:', backupId, `(${content.length} bytes → ${contentBase64.length} base64)`);
+    const result = await client.insert(backupId, backupDoc);
+    if (result.success) {
+        debug('Created file backup', { backupId, originalBytes: content.length, base64Bytes: contentBase64.length });
         return {
             backupId,
             originalMd5,
@@ -2226,7 +2324,17 @@ export async function createFileBackup(
         };
     }
     
-    console.error('Failed to create file backup:', backupId);
+    // If document exists, backup already exists - that's fine
+    if (result.error === 'DocumentExists') {
+        debug('File backup already exists, reusing', { backupId });
+        return {
+            backupId,
+            originalMd5,
+            filePath
+        };
+    }
+    
+    logError('Failed to create file backup', { backupId, error: result.error });
     return null;
 }
 

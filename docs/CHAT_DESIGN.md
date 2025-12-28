@@ -130,6 +130,143 @@ Shows progress: "🧠 Planning..." → "🔍 Searching..." → "✅ Loaded X fil
 
 ---
 
+## TODO Tracking & Completion
+
+### Overview
+
+TODOs are tracked server-side in Couchbase and linked to file changes via `todoIndex`. When a file change is applied, the linked TODO is automatically marked complete - eliminating the previous mis-sync between UI and actual work done.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    subgraph AIResponse["🤖 AI Response"]
+        A[AI generates todos array] --> B[AI generates fileChanges]
+        B --> C[Each fileChange includes<br/>todoIndex: N]
+    end
+    
+    subgraph Apply["⚡ Apply Changes"]
+        D[User clicks Apply] --> E[ChatViewProvider.applyEdits]
+        E --> F[Extract todoIndex from<br/>each fileChange]
+        F --> G[Apply file changes to disk]
+    end
+    
+    subgraph Persist["💾 Couchbase Update"]
+        G --> H{File apply<br/>successful?}
+        H -->|Yes| I[markTodoCompleted<br/>Sub-doc API]
+        I --> J[Update todos N .completed = true]
+        J --> K[Collect completedTodoIndexes]
+    end
+    
+    subgraph Webview["🖥️ UI Update"]
+        K --> L[Post editsApplied message<br/>with completedTodoIndexes]
+        L --> M[Webview marks specific<br/>TODOs as complete]
+        M --> N[renderTodos updates UI<br/>with correct count]
+    end
+    
+    style AIResponse fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Apply fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+    style Persist fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Webview fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### Schema Changes
+
+**FileChange interface** (`src/prompts/responseSchema.ts`):
+```typescript
+export interface FileChange {
+    path: string;
+    language: string;
+    content: string;
+    lineRange?: { start: number; end: number };
+    isDiff?: boolean;
+    lineOperations?: LineOperation[];
+    todoIndex?: number;  // 0-indexed link to todos array
+}
+```
+
+**AI Response Example**:
+```json
+{
+  "todos": [
+    { "text": "Update greet function", "completed": false },
+    { "text": "Update add function", "completed": false },
+    { "text": "Run tests", "completed": false }
+  ],
+  "fileChanges": [
+    {
+      "path": "src/utils.py",
+      "content": "...",
+      "todoIndex": 0
+    }
+  ]
+}
+```
+
+### Sub-Document API for TODO Updates
+
+To efficiently update a single TODO without fetching the entire document (which can grow to 15MB+), we use the Couchbase sub-document API:
+
+```typescript
+// chatSessionRepository.ts
+export async function markTodoCompleted(
+    sessionId: string, 
+    todoIndex: number
+): Promise<boolean> {
+    const client = getCouchbaseClient();
+    
+    const ops: SubdocOp[] = [
+        { type: 'upsert', path: `todos[${todoIndex}].completed`, value: true },
+        { type: 'upsert', path: 'updatedAt', value: new Date().toISOString() }
+    ];
+    
+    const result = await client.mutateIn(sessionId, ops);
+    return result.success;
+}
+```
+
+**Benefits**:
+- Only 2 sub-doc operations (within 16 element limit)
+- No full document fetch/replace cycle
+- Atomic update at specific array index
+
+### Message Flow
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 1 | AI | Returns `fileChanges` with `todoIndex` linking to `todos` array |
+| 2 | ChatViewProvider | Extracts `todoIndex` from each fileChange during apply |
+| 3 | ChatViewProvider | After successful apply, calls `markTodoCompleted(sessionId, todoIndex)` |
+| 4 | Couchbase | Sub-doc API updates `todos[N].completed = true` |
+| 5 | ChatViewProvider | Posts `editsApplied` with `completedTodoIndexes: [0, 1, ...]` |
+| 6 | Webview | Receives message, marks those specific TODOs complete in `currentTodos` |
+| 7 | Webview | Calls `renderTodos()` to update UI with correct count |
+
+### System Prompt Instructions
+
+The AI is instructed (in `config/system-prompt.json`):
+
+```
+**LINK fileChanges to todos using todoIndex.**
+
+- Each fileChange SHOULD include a `todoIndex` field (0-indexed) pointing to the todo it completes
+- When a file change is applied, the linked todo will automatically be marked complete
+- Example: `{"path": "src/foo.py", "content": "...", "todoIndex": 0}` links to todos[0]
+- Do NOT set `completed: true` on todos - the UI marks them complete when the change is applied
+- If a fileChange doesn't relate to a specific todo, omit todoIndex
+```
+
+### Before vs After
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| TODO tracking | Webview only (client-side) | Couchbase + Webview (server-side) |
+| Completion logic | Mark "next uncompleted" TODO | Mark specific TODO by `todoIndex` |
+| Sync accuracy | Often mis-synced | Always accurate |
+| Persistence | Lost on refresh | Persisted in session document |
+
+---
+
 ## Sticky Summary Bar
 
 When AI responses are long and the user scrolls down, the summary and next-step buttons can scroll out of view. The **Sticky Summary Bar** ensures users always know what happened and can take action.

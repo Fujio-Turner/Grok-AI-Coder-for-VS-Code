@@ -21,7 +21,7 @@
       "path/to/file.py": "md5_hash_of_file_content"
     },
     "fileChanges": [
-      { "path": "src/file.py", "language": "python", "content": "-old line\\n+new line", "isDiff": true, "lineRange": { "start": 10, "end": 15 } }
+      { "path": "src/file.py", "language": "python", "content": "-old line\\n+new line", "isDiff": true, "lineRange": { "start": 10, "end": 15 }, "todoIndex": 0 }
     ],
     "commands": [
       { "command": "npm test", "description": "Run tests" }

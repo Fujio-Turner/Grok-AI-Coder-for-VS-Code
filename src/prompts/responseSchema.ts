@@ -28,6 +28,8 @@ export interface FileChange {
     isDiff?: boolean;
     // NEW: Safer line-level operations (preferred over content/isDiff)
     lineOperations?: LineOperation[];
+    // Links this file change to a TODO item (0-indexed into todos array)
+    todoIndex?: number;
 }
 
 export interface TerminalCommand {
@@ -373,7 +375,8 @@ export const STRUCTURED_OUTPUT_SCHEMA = {
                                     required: ["type", "line"],
                                     additionalProperties: false
                                 }
-                            }
+                            },
+                            todoIndex: { type: "integer", description: "0-indexed reference to todos array item this change completes" }
                         },
                         required: ["path", "content"],
                         additionalProperties: false

@@ -312,7 +312,10 @@ The dashboard auto-categorizes bugs based on description keywords:
 | `cli` | Type is "cli" (CLI command execution failure) |
 | `truncation` | Description contains "truncat" |
 | `json` | Description contains "json" OR `bugType === 'JSON'` |
-| `api` | Description contains "api error" or "fetch failed" |
+| `timeout` | Description contains "timeout" or "connection dropped" |
+| `terminated` | Description contains "terminated" |
+| `validation` | Description contains "invalid argument" or "validation" |
+| `api` | Description contains "api error", "fetch failed", "retry failed", or "failed fetch" |
 | `file` | Type is "failure" OR description contains "line" or "diff" |
 | `other` | Everything else |
 

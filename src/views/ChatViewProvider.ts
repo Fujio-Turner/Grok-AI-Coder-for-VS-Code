@@ -12,6 +12,7 @@ import {
     updateSessionModelUsage,
     updateSessionHandoff,
     updateSessionTodos,
+    markTodoCompleted,
     updateSessionChangeHistory,
     getSessionChangeHistory,
     appendSessionBug,
@@ -2924,7 +2925,7 @@ ${cliSummary}
                         return true;
                     });
                 
-                const editResults = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean; lineOperations?: LineOperation[] }, idx: number) => {
+                const editResults = await Promise.all(validFileChanges.map(async (fc: { path: string; content: string; lineRange?: { start: number; end: number }; isDiff?: boolean; lineOperations?: LineOperation[]; todoIndex?: number }, idx: number) => {
                     const filePath = fc.path.trim();
                     const fileUri = resolveFilePathToUri(filePath);
                     if (!fileUri) {
@@ -2981,16 +2982,17 @@ ${cliSummary}
                         }
                     }
                     
-                    debug(`Processing fileChange: path="${filePath}", content length=${newText?.length}`);
+                    debug(`Processing fileChange: path="${filePath}", content length=${newText?.length}, todoIndex=${fc.todoIndex}`);
                     
                     return {
                         id: `edit-${idx}`,
                         fileUri,
                         range: fc.lineRange ? new vscode.Range(fc.lineRange.start - 1, 0, fc.lineRange.end, 0) : undefined,
-                        newText
+                        newText,
+                        todoIndex: fc.todoIndex
                     };
                 }));
-                edits = editResults.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as ProposedEdit[];
+                edits = editResults.filter((edit): edit is NonNullable<typeof edit> => edit !== null) as (ProposedEdit & { todoIndex?: number })[];
                 debug('Using structured fileChanges:', edits.length);
             }
             
@@ -3091,10 +3093,39 @@ ${cliSummary}
                 }
             }
             
+            // Mark linked TODOs as complete in Couchbase and collect indexes for UI update
+            const completedTodoIndexes: number[] = [];
+            let hasExplicitTodoIndex = false;
+            
+            for (const edit of editsToApply) {
+                const todoIdx = (edit as any).todoIndex;
+                if (typeof todoIdx === 'number' && todoIdx >= 0) {
+                    hasExplicitTodoIndex = true;
+                    try {
+                        const success = await markTodoCompleted(this._currentSessionId!, todoIdx);
+                        if (success) {
+                            completedTodoIndexes.push(todoIdx);
+                            debug(`Marked TODO ${todoIdx} as completed for file: ${edit.fileUri.fsPath}`);
+                        }
+                    } catch (todoErr) {
+                        debug('Failed to mark TODO completed:', todoErr);
+                    }
+                }
+            }
+            
+            // Fallback: If AI didn't provide todoIndex, mark N todos as complete (old behavior)
+            // where N = number of successfully applied edits
+            if (!hasExplicitTodoIndex && editsToApply.length > 0) {
+                debug('No todoIndex provided by AI, using fallback: marking next N todos as complete');
+                // Signal webview to use fallback behavior
+                completedTodoIndexes.push(-1); // -1 signals "use fallback" 
+            }
+            
             this._postMessage({
                 type: 'editsApplied',
                 editId,
                 count: editsToApply.length,
+                completedTodoIndexes,
                 changeSet: result.changeSet ? {
                     id: result.changeSet.id,
                     totalStats: result.changeSet.totalStats,
@@ -5438,9 +5469,22 @@ case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSumm
 case'cliSummaryUpdate':updateCliSummary(m);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;isAtOriginalState=m.isAtOriginal||false;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
-// Mark next uncompleted todo as done
-const nextIdx=currentTodos.findIndex(t=>!t.completed);
-if(nextIdx>=0){currentTodos[nextIdx].completed=true;}
+// Mark specific todos as complete based on todoIndex linkage from TS
+if(m.completedTodoIndexes&&m.completedTodoIndexes.length>0){
+    if(m.completedTodoIndexes[0]===-1){
+        // Fallback: AI didn't provide todoIndex, mark next N uncompleted todos
+        const count=m.count||1;
+        let marked=0;
+        for(let i=0;i<currentTodos.length&&marked<count;i++){
+            if(!currentTodos[i].completed){currentTodos[i].completed=true;marked++;}
+        }
+    }else{
+        // Explicit todoIndex: mark specific todos
+        for(const idx of m.completedTodoIndexes){
+            if(idx>=0&&idx<currentTodos.length){currentTodos[idx].completed=true;}
+        }
+    }
+}
 renderTodos();updateActionSummary('applies',m.count||1);}break;
 case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;autoApplyFiles=m.autoApplyFiles!==false;autoApplyCli=m.autoApplyCli||false;modelMode=m.modelMode||'fast';if(m.activeModel)currentModel=m.activeModel;updateAutoBtn();updateModelBtn();break;
 case'fullConfig':if(m.settings)populateSettings(m.settings);break;
