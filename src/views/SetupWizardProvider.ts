@@ -100,6 +100,7 @@ export class SetupWizardProvider {
         password: string;
         bucket: string;
         deployment: string;
+        capellaDataApiUrl?: string;
     }): Promise<void> {
         try {
             const config = vscode.workspace.getConfiguration('grok');
@@ -108,6 +109,9 @@ export class SetupWizardProvider {
             await config.update('couchbasePassword', settings.password, vscode.ConfigurationTarget.Global);
             await config.update('couchbaseBucket', settings.bucket, vscode.ConfigurationTarget.Global);
             await config.update('couchbaseDeployment', settings.deployment, vscode.ConfigurationTarget.Global);
+            if (settings.capellaDataApiUrl) {
+                await config.update('capellaDataApiUrl', settings.capellaDataApiUrl, vscode.ConfigurationTarget.Global);
+            }
             
             this.sendMessage({ type: 'couchbaseSettingsSaved', success: true });
             info('Couchbase settings saved via setup wizard');
@@ -585,14 +589,21 @@ export class SetupWizardProvider {
                 <label for="cbDeployment">Deployment Type</label>
                 <select id="cbDeployment" onchange="updateDeploymentFields()">
                     <option value="self-hosted">Self-Hosted (local Couchbase Server)</option>
-                    <option value="capella">Couchbase Capella (cloud)</option>
+                    <option value="capella-sdk">Couchbase Capella - SDK</option>
+                    <option value="capella-data-api">Couchbase Capella - Data API</option>
                 </select>
             </div>
             
-            <div class="form-group">
+            <div class="form-group" id="row-cbUrl">
                 <label for="cbUrl">Server URL</label>
                 <input type="text" id="cbUrl" placeholder="http://localhost" value="http://localhost" />
                 <small id="cbUrlHint">For self-hosted: http://localhost or your server address</small>
+            </div>
+            
+            <div class="form-group" id="row-capellaDataApiUrl" style="display:none">
+                <label for="capellaDataApiUrl">Capella Data API URL</label>
+                <input type="text" id="capellaDataApiUrl" placeholder="https://your-cluster.data.cloud.couchbase.com" />
+                <small>Capella Data API endpoint URL</small>
             </div>
             
             <div class="form-group">
@@ -694,17 +705,28 @@ export class SetupWizardProvider {
         }
         
         function saveCouchbaseSettings() {
+            const deployment = document.getElementById('cbDeployment').value;
+            const capellaDataApiUrlEl = document.getElementById('capellaDataApiUrl');
             const settings = {
                 url: document.getElementById('cbUrl').value.trim(),
                 username: document.getElementById('cbUsername').value.trim(),
                 password: document.getElementById('cbPassword').value,
                 bucket: document.getElementById('cbBucket').value.trim(),
-                deployment: document.getElementById('cbDeployment').value
+                deployment: deployment,
+                capellaDataApiUrl: capellaDataApiUrlEl ? capellaDataApiUrlEl.value.trim() : ''
             };
             
-            if (!settings.url || !settings.username || !settings.bucket) {
-                showStatus('couchbaseStatus', 'Please fill in all required fields', 'error');
-                return;
+            // Validate based on deployment type
+            if (deployment === 'capella-data-api') {
+                if (!settings.capellaDataApiUrl || !settings.username || !settings.bucket) {
+                    showStatus('couchbaseStatus', 'Please fill in all required fields', 'error');
+                    return;
+                }
+            } else {
+                if (!settings.url || !settings.username || !settings.bucket) {
+                    showStatus('couchbaseStatus', 'Please fill in all required fields', 'error');
+                    return;
+                }
             }
             
             document.getElementById('saveCouchbaseBtn').disabled = true;
@@ -735,11 +757,20 @@ export class SetupWizardProvider {
             const deployment = document.getElementById('cbDeployment').value;
             const urlHint = document.getElementById('cbUrlHint');
             const urlInput = document.getElementById('cbUrl');
+            const urlRow = document.getElementById('row-cbUrl');
+            const dataApiRow = document.getElementById('row-capellaDataApiUrl');
             
-            if (deployment === 'capella') {
-                urlHint.textContent = 'For Capella: your-cluster.dp.cloud.couchbase.com';
-                urlInput.placeholder = 'your-cluster.dp.cloud.couchbase.com';
+            if (deployment === 'capella-sdk') {
+                urlRow.style.display = 'block';
+                dataApiRow.style.display = 'none';
+                urlHint.textContent = 'Capella SDK connection string hostname (e.g., cb.xxxxx.cloud.couchbase.com)';
+                urlInput.placeholder = 'cb.xxxxx.cloud.couchbase.com';
+            } else if (deployment === 'capella-data-api') {
+                urlRow.style.display = 'none';
+                dataApiRow.style.display = 'block';
             } else {
+                urlRow.style.display = 'block';
+                dataApiRow.style.display = 'none';
                 urlHint.textContent = 'For self-hosted: http://localhost or your server address';
                 urlInput.placeholder = 'http://localhost';
             }

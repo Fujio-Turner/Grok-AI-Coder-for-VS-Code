@@ -354,14 +354,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({
             type: 'fullConfig',
             settings: {
-                // Database (Couchbase)
+                // Database (Couchbase) - deployment type
                 couchbaseDeployment: config.get<string>('couchbaseDeployment', 'self-hosted'),
-                couchbaseUrl: config.get<string>('couchbaseUrl', 'http://localhost'),
+                
+                // Self-hosted settings
+                selfHostedUrl: config.get<string>('selfHostedUrl', 'http://localhost'),
+                selfHostedPort: config.get<number>('selfHostedPort', 8091),
+                selfHostedQueryPort: config.get<number>('selfHostedQueryPort', 8093),
+                selfHostedUsername: config.get<string>('selfHostedUsername', 'Administrator'),
+                selfHostedPassword: config.get<string>('selfHostedPassword', 'password'),
+                
+                // Capella SDK settings
+                capellaSdkUrl: config.get<string>('capellaSdkUrl', ''),
+                capellaSdkUsername: config.get<string>('capellaSdkUsername', ''),
+                capellaSdkPassword: config.get<string>('capellaSdkPassword', ''),
+                
+                // Capella Data API settings
                 capellaDataApiUrl: config.get<string>('capellaDataApiUrl', ''),
-                couchbasePort: config.get<number>('couchbasePort', 8091),
-                couchbaseQueryPort: config.get<number>('couchbaseQueryPort', 8093),
-                couchbaseUsername: config.get<string>('couchbaseUsername', 'Administrator'),
-                couchbasePassword: config.get<string>('couchbasePassword', 'password'),
+                capellaDataApiUsername: config.get<string>('capellaDataApiUsername', ''),
+                capellaDataApiPassword: config.get<string>('capellaDataApiPassword', ''),
+                
+                // Shared settings
                 couchbaseBucket: config.get<string>('couchbaseBucket', 'grokCoder'),
                 couchbaseScope: config.get<string>('couchbaseScope', '_default'),
                 couchbaseCollection: config.get<string>('couchbaseCollection', '_default'),
@@ -419,14 +432,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
             // Update each setting
             const settingsMap: Record<string, string> = {
-                // Database
+                // Database - deployment type
                 couchbaseDeployment: 'couchbaseDeployment',
-                couchbaseUrl: 'couchbaseUrl',
+                
+                // Self-hosted settings
+                selfHostedUrl: 'selfHostedUrl',
+                selfHostedPort: 'selfHostedPort',
+                selfHostedQueryPort: 'selfHostedQueryPort',
+                selfHostedUsername: 'selfHostedUsername',
+                selfHostedPassword: 'selfHostedPassword',
+                
+                // Capella SDK settings
+                capellaSdkUrl: 'capellaSdkUrl',
+                capellaSdkUsername: 'capellaSdkUsername',
+                capellaSdkPassword: 'capellaSdkPassword',
+                
+                // Capella Data API settings
                 capellaDataApiUrl: 'capellaDataApiUrl',
-                couchbasePort: 'couchbasePort',
-                couchbaseQueryPort: 'couchbaseQueryPort',
-                couchbaseUsername: 'couchbaseUsername',
-                couchbasePassword: 'couchbasePassword',
+                capellaDataApiUsername: 'capellaDataApiUsername',
+                capellaDataApiPassword: 'capellaDataApiPassword',
+                
+                // Shared settings
                 couchbaseBucket: 'couchbaseBucket',
                 couchbaseScope: 'couchbaseScope',
                 couchbaseCollection: 'couchbaseCollection',
@@ -4098,35 +4124,71 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 <label>Deployment Type</label>
                 <select id="set-couchbaseDeployment">
                     <option value="self-hosted">Self-hosted</option>
-                    <option value="capella">Couchbase Capella</option>
+                    <option value="capella-sdk">Couchbase Capella - SDK</option>
+                    <option value="capella-data-api">Couchbase Capella - Data API</option>
                 </select>
                 <div class="desc">Choose between self-hosted Couchbase Server or Couchbase Capella DBaaS</div>
             </div>
-            <div class="setting-row" id="row-couchbaseUrl">
-                <label>Server URL</label>
-                <input type="text" id="set-couchbaseUrl" placeholder="http://localhost">
-                <div class="desc">Base URL for self-hosted Couchbase (e.g., http://localhost)</div>
-            </div>
-            <div class="setting-row" id="row-capellaDataApiUrl" style="display:none">
-                <label>Capella Data API URL</label>
-                <input type="text" id="set-capellaDataApiUrl" placeholder="https://your-cluster.data.cloud.couchbase.com">
-                <div class="desc">Capella Data API endpoint URL</div>
-            </div>
-            <div class="setting-row" id="row-ports">
-                <label>Ports</label>
-                <div style="display:flex;gap:8px">
-                    <div style="flex:1"><input type="number" id="set-couchbasePort" placeholder="8091"><div class="desc">REST API</div></div>
-                    <div style="flex:1"><input type="number" id="set-couchbaseQueryPort" placeholder="8093"><div class="desc">Query Service</div></div>
+            
+            <!-- Self-hosted fields -->
+            <div id="section-self-hosted">
+                <div class="setting-row">
+                    <label>Server URL</label>
+                    <input type="text" id="set-selfHostedUrl" placeholder="http://localhost">
+                    <div class="desc">Base URL for self-hosted Couchbase (e.g., http://localhost)</div>
+                </div>
+                <div class="setting-row">
+                    <label>Ports</label>
+                    <div style="display:flex;gap:8px">
+                        <div style="flex:1"><input type="number" id="set-selfHostedPort" placeholder="8091"><div class="desc">REST API</div></div>
+                        <div style="flex:1"><input type="number" id="set-selfHostedQueryPort" placeholder="8093"><div class="desc">Query Service</div></div>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <label>Username</label>
+                    <input type="text" id="set-selfHostedUsername" placeholder="Administrator">
+                </div>
+                <div class="setting-row">
+                    <label>Password</label>
+                    <input type="password" id="set-selfHostedPassword" placeholder="password">
                 </div>
             </div>
-            <div class="setting-row">
-                <label>Username</label>
-                <input type="text" id="set-couchbaseUsername" placeholder="Administrator">
+            
+            <!-- Capella SDK fields -->
+            <div id="section-capella-sdk" style="display:none">
+                <div class="setting-row">
+                    <label>SDK Connection URL</label>
+                    <input type="text" id="set-capellaSdkUrl" placeholder="cb.xxxxx.cloud.couchbase.com">
+                    <div class="desc">Capella SDK hostname (e.g., cb.xxxxx.cloud.couchbase.com)</div>
+                </div>
+                <div class="setting-row">
+                    <label>Username</label>
+                    <input type="text" id="set-capellaSdkUsername" placeholder="database_user">
+                </div>
+                <div class="setting-row">
+                    <label>Password</label>
+                    <input type="password" id="set-capellaSdkPassword" placeholder="password">
+                </div>
             </div>
-            <div class="setting-row">
-                <label>Password</label>
-                <input type="password" id="set-couchbasePassword" placeholder="password">
+            
+            <!-- Capella Data API fields -->
+            <div id="section-capella-data-api" style="display:none">
+                <div class="setting-row">
+                    <label>Data API URL</label>
+                    <input type="text" id="set-capellaDataApiUrl" placeholder="https://xxxxx.data.cloud.couchbase.com">
+                    <div class="desc">Capella Data API URL (e.g., https://xxxxx.data.cloud.couchbase.com)</div>
+                </div>
+                <div class="setting-row">
+                    <label>Username</label>
+                    <input type="text" id="set-capellaDataApiUsername" placeholder="database_user">
+                </div>
+                <div class="setting-row">
+                    <label>Password</label>
+                    <input type="password" id="set-capellaDataApiPassword" placeholder="password">
+                </div>
             </div>
+            
+            <!-- Shared fields -->
             <div class="setting-row">
                 <label>Bucket</label>
                 <input type="text" id="set-couchbaseBucket" placeholder="grokCoder">
@@ -4903,9 +4965,13 @@ function renderCharts(data){
 function updateDeploymentFields(){
     const deployment=document.getElementById('set-couchbaseDeployment').value;
     const isSelfHosted=deployment==='self-hosted';
-    document.getElementById('row-couchbaseUrl').style.display=isSelfHosted?'flex':'none';
-    document.getElementById('row-capellaDataApiUrl').style.display=isSelfHosted?'none':'flex';
-    document.getElementById('row-ports').style.display=isSelfHosted?'flex':'none';
+    const isCapellaSdk=deployment==='capella-sdk';
+    const isCapellaDataApi=deployment==='capella-data-api';
+    
+    // Show/hide deployment-specific sections
+    document.getElementById('section-self-hosted').style.display=isSelfHosted?'block':'none';
+    document.getElementById('section-capella-sdk').style.display=isCapellaSdk?'block':'none';
+    document.getElementById('section-capella-data-api').style.display=isCapellaDataApi?'block':'none';
 }
 document.getElementById('set-couchbaseDeployment').onchange=updateDeploymentFields;
 
@@ -4919,14 +4985,27 @@ document.getElementById('toggle-api-key').onclick=function(){
 // Populate settings form
 function populateSettings(s){
     currentSettings=s;
-    // Database
+    // Database - deployment type
     document.getElementById('set-couchbaseDeployment').value=s.couchbaseDeployment||'self-hosted';
-    document.getElementById('set-couchbaseUrl').value=s.couchbaseUrl||'';
+    
+    // Self-hosted settings
+    document.getElementById('set-selfHostedUrl').value=s.selfHostedUrl||'http://localhost';
+    document.getElementById('set-selfHostedPort').value=s.selfHostedPort||8091;
+    document.getElementById('set-selfHostedQueryPort').value=s.selfHostedQueryPort||8093;
+    document.getElementById('set-selfHostedUsername').value=s.selfHostedUsername||'';
+    document.getElementById('set-selfHostedPassword').value=s.selfHostedPassword||'';
+    
+    // Capella SDK settings
+    document.getElementById('set-capellaSdkUrl').value=s.capellaSdkUrl||'';
+    document.getElementById('set-capellaSdkUsername').value=s.capellaSdkUsername||'';
+    document.getElementById('set-capellaSdkPassword').value=s.capellaSdkPassword||'';
+    
+    // Capella Data API settings
     document.getElementById('set-capellaDataApiUrl').value=s.capellaDataApiUrl||'';
-    document.getElementById('set-couchbasePort').value=s.couchbasePort||8091;
-    document.getElementById('set-couchbaseQueryPort').value=s.couchbaseQueryPort||8093;
-    document.getElementById('set-couchbaseUsername').value=s.couchbaseUsername||'';
-    document.getElementById('set-couchbasePassword').value=s.couchbasePassword||'';
+    document.getElementById('set-capellaDataApiUsername').value=s.capellaDataApiUsername||'';
+    document.getElementById('set-capellaDataApiPassword').value=s.capellaDataApiPassword||'';
+    
+    // Shared settings
     document.getElementById('set-couchbaseBucket').value=s.couchbaseBucket||'';
     document.getElementById('set-couchbaseScope').value=s.couchbaseScope||'';
     document.getElementById('set-couchbaseCollection').value=s.couchbaseCollection||'';
@@ -4973,14 +5052,27 @@ function populateSettings(s){
 // Collect settings from form
 function collectSettings(){
     return {
-        // Database
+        // Database - deployment type
         couchbaseDeployment:document.getElementById('set-couchbaseDeployment').value,
-        couchbaseUrl:document.getElementById('set-couchbaseUrl').value,
+        
+        // Self-hosted settings
+        selfHostedUrl:document.getElementById('set-selfHostedUrl').value,
+        selfHostedPort:parseInt(document.getElementById('set-selfHostedPort').value)||8091,
+        selfHostedQueryPort:parseInt(document.getElementById('set-selfHostedQueryPort').value)||8093,
+        selfHostedUsername:document.getElementById('set-selfHostedUsername').value,
+        selfHostedPassword:document.getElementById('set-selfHostedPassword').value,
+        
+        // Capella SDK settings
+        capellaSdkUrl:document.getElementById('set-capellaSdkUrl').value,
+        capellaSdkUsername:document.getElementById('set-capellaSdkUsername').value,
+        capellaSdkPassword:document.getElementById('set-capellaSdkPassword').value,
+        
+        // Capella Data API settings
         capellaDataApiUrl:document.getElementById('set-capellaDataApiUrl').value,
-        couchbasePort:parseInt(document.getElementById('set-couchbasePort').value)||8091,
-        couchbaseQueryPort:parseInt(document.getElementById('set-couchbaseQueryPort').value)||8093,
-        couchbaseUsername:document.getElementById('set-couchbaseUsername').value,
-        couchbasePassword:document.getElementById('set-couchbasePassword').value,
+        capellaDataApiUsername:document.getElementById('set-capellaDataApiUsername').value,
+        capellaDataApiPassword:document.getElementById('set-capellaDataApiPassword').value,
+        
+        // Shared settings
         couchbaseBucket:document.getElementById('set-couchbaseBucket').value,
         couchbaseScope:document.getElementById('set-couchbaseScope').value,
         couchbaseCollection:document.getElementById('set-couchbaseCollection').value,

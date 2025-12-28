@@ -155,8 +155,10 @@ export async function generateDiagnosticsReport(
         modelReasoning: config.modelReasoning,
         modelVision: config.modelVision,
         defaultModelType: config.defaultModelType,
-        couchbaseUrl: config.couchbaseUrl,
-        couchbasePort: config.couchbasePort,
+        couchbaseDeployment: config.couchbaseDeployment,
+        selfHostedUrl: config.selfHostedUrl,
+        capellaSdkUrl: config.capellaSdkUrl,
+        capellaDataApiUrl: config.capellaDataApiUrl,
         couchbaseBucket: config.couchbaseBucket,
         debug: config.debug,
         enableSound: config.enableSound,
@@ -209,13 +211,26 @@ export function getConfig() {
         
         // Couchbase settings
         couchbaseConnectionMode: config.get<'sdk' | 'rest'>('couchbaseConnectionMode') || 'rest',
-        couchbaseDeployment: config.get<'self-hosted' | 'capella'>('couchbaseDeployment') || 'self-hosted',
-        couchbaseUrl: config.get<string>('couchbaseUrl') || 'http://localhost',
+        couchbaseDeployment: config.get<'self-hosted' | 'capella-sdk' | 'capella-data-api'>('couchbaseDeployment') || 'self-hosted',
+        
+        // Self-hosted settings
+        selfHostedUrl: config.get<string>('selfHostedUrl') || 'http://localhost',
+        selfHostedUsername: config.get<string>('selfHostedUsername') || 'Administrator',
+        selfHostedPassword: config.get<string>('selfHostedPassword') || 'password',
+        selfHostedPort: config.get<number>('selfHostedPort') || 8091,
+        selfHostedQueryPort: config.get<number>('selfHostedQueryPort') || 8093,
+        
+        // Capella SDK settings
+        capellaSdkUrl: config.get<string>('capellaSdkUrl') || '',
+        capellaSdkUsername: config.get<string>('capellaSdkUsername') || '',
+        capellaSdkPassword: config.get<string>('capellaSdkPassword') || '',
+        
+        // Capella Data API settings
         capellaDataApiUrl: config.get<string>('capellaDataApiUrl') || '',
-        couchbasePort: config.get<number>('couchbasePort') || 8091,
-        couchbaseQueryPort: config.get<number>('couchbaseQueryPort') || 8093,
-        couchbaseUsername: config.get<string>('couchbaseUsername') || 'Administrator',
-        couchbasePassword: config.get<string>('couchbasePassword') || 'password',
+        capellaDataApiUsername: config.get<string>('capellaDataApiUsername') || '',
+        capellaDataApiPassword: config.get<string>('capellaDataApiPassword') || '',
+        
+        // Shared bucket/scope/collection
         couchbaseBucket: config.get<string>('couchbaseBucket') || 'grokCoder',
         couchbaseScope: config.get<string>('couchbaseScope') || '_default',
         couchbaseCollection: config.get<string>('couchbaseCollection') || '_default',

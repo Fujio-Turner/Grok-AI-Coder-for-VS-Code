@@ -138,14 +138,14 @@ export interface ICouchbaseClient {
 class SelfHostedCouchbaseClient implements ICouchbaseClient {
     private getAuthHeader(): string {
         const config = getConfig();
-        const credentials = Buffer.from(`${config.couchbaseUsername}:${config.couchbasePassword}`).toString('base64');
+        const credentials = Buffer.from(`${config.selfHostedUsername}:${config.selfHostedPassword}`).toString('base64');
         return `Basic ${credentials}`;
     }
 
     private getBaseUrl(): string {
         const config = getConfig();
         // Support full URL with protocol (http:// or https://)
-        let url = config.couchbaseUrl || 'http://localhost';
+        let url = config.selfHostedUrl || 'http://localhost';
         // Strip trailing slash if present
         url = url.replace(/\/$/, '');
         // Add http:// if no protocol specified (backwards compatibility)
@@ -157,12 +157,12 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
 
     private getQueryUrl(): string {
         const config = getConfig();
-        return `${this.getBaseUrl()}:${config.couchbaseQueryPort}/query/service`;
+        return `${this.getBaseUrl()}:${config.selfHostedQueryPort}/query/service`;
     }
 
     private getManagementUrl(): string {
         const config = getConfig();
-        return `${this.getBaseUrl()}:${config.couchbasePort}`;
+        return `${this.getBaseUrl()}:${config.selfHostedPort}`;
     }
 
     private getFullPath(): string {
@@ -495,8 +495,10 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
     async ping(): Promise<boolean> {
         try {
             debug('Couchbase PING (self-hosted)');
+            const url = `${this.getManagementUrl()}/pools`;
+            debug('Couchbase PING URL:', url);
             
-            const response = await fetch(`${this.getManagementUrl()}/pools`, {
+            const response = await fetch(url, {
                 headers: {
                     'Authorization': this.getAuthHeader()
                 },
@@ -504,15 +506,19 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
             });
             
             const success = response.ok;
-            debug('Couchbase PING result:', success);
+            debug('Couchbase PING result:', { success, status: response.status });
             
             if (success) {
                 info('Couchbase connection successful (self-hosted)');
+            } else {
+                const errorText = await response.text().catch(() => '');
+                error('Couchbase PING failed:', { status: response.status, statusText: response.statusText, error: errorText });
             }
             
             return success;
         } catch (err) {
-            error('Couchbase PING failed:', err);
+            const errMsg = err instanceof Error ? err.message : String(err);
+            error('Couchbase PING failed:', errMsg);
             return false;
         }
     }
@@ -524,17 +530,30 @@ class SelfHostedCouchbaseClient implements ICouchbaseClient {
 class CapellaDataApiClient implements ICouchbaseClient {
     private getAuthHeader(): string {
         const config = getConfig();
-        const credentials = Buffer.from(`${config.couchbaseUsername}:${config.couchbasePassword}`).toString('base64');
+        debug('Capella Data API auth using username:', config.capellaDataApiUsername || '(empty)');
+        if (!config.capellaDataApiUsername || !config.capellaDataApiPassword) {
+            warn('Capella Data API credentials not configured');
+        }
+        const credentials = Buffer.from(`${config.capellaDataApiUsername}:${config.capellaDataApiPassword}`).toString('base64');
         return `Basic ${credentials}`;
     }
 
     private getBaseUrl(): string {
         const config = getConfig();
-        const url = config.capellaDataApiUrl;
+        let url = config.capellaDataApiUrl;
+        
         if (!url) {
             throw new Error('Capella Data API URL not configured. Set grok.capellaDataApiUrl in settings.');
         }
-        return url.replace(/\/$/, '');
+        
+        // Strip any protocols and normalize
+        url = url.replace(/^couchbases?:\/\//, '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+        
+        // Always use https
+        url = `https://${url}`;
+        
+        debug('Using Capella Data API URL:', url);
+        return url;
     }
 
     private getDocumentPath(key: string): string {
@@ -874,10 +893,11 @@ class CapellaDataApiClient implements ICouchbaseClient {
 
     async ping(): Promise<boolean> {
         try {
-            debug('Couchbase PING (Capella)');
+            debug('Couchbase PING (Capella Data API)');
             
             const baseUrl = this.getBaseUrl();
-            const url = `${baseUrl}/v1/scopes`;
+            const url = `${baseUrl}/v1/callerIdentity`;
+            debug('Couchbase PING URL:', url);
             
             const response = await fetch(url, {
                 headers: {
@@ -887,15 +907,19 @@ class CapellaDataApiClient implements ICouchbaseClient {
             });
             
             const success = response.ok;
-            debug('Couchbase PING result:', success);
+            debug('Couchbase PING result:', { success, status: response.status });
             
             if (success) {
-                info('Couchbase connection successful (Capella)');
+                info('Couchbase connection successful (Capella Data API)');
+            } else {
+                const errorText = await response.text().catch(() => '');
+                error('Couchbase PING failed:', { status: response.status, statusText: response.statusText, error: errorText });
             }
             
             return success;
         } catch (err) {
-            error('Couchbase PING failed:', err);
+            const errMsg = err instanceof Error ? err.message : String(err);
+            error('Couchbase PING failed:', errMsg);
             return false;
         }
     }
@@ -916,22 +940,41 @@ class SdkCouchbaseClient implements ICouchbaseClient {
 
     private getConnectionString(): string {
         const config = getConfig();
-        let url = config.couchbaseUrl || 'localhost';
         
-        // Remove http:// or https:// prefix if present (SDK uses couchbase:// or couchbases://)
-        url = url.replace(/^https?:\/\//, '');
-        // Remove trailing slash
-        url = url.replace(/\/$/, '');
+        // Use deployment-specific URL
+        let url: string;
+        if (config.couchbaseDeployment === 'capella-sdk') {
+            url = config.capellaSdkUrl || '';
+            if (!url) {
+                throw new Error('Capella SDK URL not configured. Set grok.capellaSdkUrl in settings.');
+            }
+        } else {
+            url = config.selfHostedUrl || 'localhost';
+        }
         
-        // For Capella, use couchbases:// (TLS)
-        if (config.couchbaseDeployment === 'capella' && config.capellaDataApiUrl) {
-            // Extract hostname from Capella Data API URL
-            const capellaHost = config.capellaDataApiUrl.replace(/^https?:\/\//, '').replace(/\/$/, '').split('/')[0];
-            // Convert data API URL to connection string (e.g., data.cloud.couchbase.com -> cb.xxx.cloud.couchbase.com)
-            return `couchbases://${capellaHost}`;
+        // Remove any protocol prefix
+        url = url.replace(/^https?:\/\//, '').replace(/^couchbases?:\/\//, '').replace(/\/$/, '');
+        
+        // For Capella SDK, use couchbases:// (TLS)
+        if (config.couchbaseDeployment === 'capella-sdk') {
+            return `couchbases://${url}`;
         }
         
         return `couchbase://${url}`;
+    }
+    
+    private getCredentials(): { username: string; password: string } {
+        const config = getConfig();
+        if (config.couchbaseDeployment === 'capella-sdk') {
+            return {
+                username: config.capellaSdkUsername,
+                password: config.capellaSdkPassword
+            };
+        }
+        return {
+            username: config.selfHostedUsername,
+            password: config.selfHostedPassword
+        };
     }
 
     private async ensureSDK(): Promise<typeof import('couchbase')> {
@@ -969,14 +1012,15 @@ class SdkCouchbaseClient implements ICouchbaseClient {
         const sdk = await this.ensureSDK();
         const config = getConfig();
         const connectionString = this.getConnectionString();
+        const credentials = this.getCredentials();
         const timeoutMs = (config.couchbaseTimeout || 30) * 1000;
 
         debug('Couchbase SDK connecting to:', connectionString);
 
         try {
             const cluster = await sdk.connect(connectionString, {
-                username: config.couchbaseUsername,
-                password: config.couchbasePassword,
+                username: credentials.username,
+                password: credentials.password,
                 configProfile: 'wanDevelopment', // Optimized for cloud/WAN
                 timeouts: {
                     kvTimeout: timeoutMs,
@@ -1261,13 +1305,27 @@ let currentConnectionMode: string | null = null;
 
 export function getCouchbaseClient(): ICouchbaseClient {
     const config = getConfig();
-    const deployment = config.couchbaseDeployment;
+    let deployment = config.couchbaseDeployment;
     let connectionMode = config.couchbaseConnectionMode || 'rest'; // Default to REST for compatibility
     
-    // If SDK load already failed, force REST mode
-    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
-        warn('Couchbase SDK not available, using REST mode');
+    // Capella-SDK deployment forces SDK mode
+    if (deployment === 'capella-sdk') {
+        connectionMode = 'sdk';
+    }
+    // Capella Data API deployment forces REST mode
+    if (deployment === 'capella-data-api') {
         connectionMode = 'rest';
+    }
+    
+    // If SDK load already failed, force REST mode and adjust deployment for Capella
+    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
+        warn('Couchbase SDK not available, falling back to REST mode');
+        connectionMode = 'rest';
+        // If Capella SDK was requested, fall back to Data API
+        if (deployment === 'capella-sdk') {
+            warn('Capella SDK not available, falling back to Capella Data API. Please configure the Data API URL.');
+            deployment = 'capella-data-api';
+        }
     }
     
     // Recreate client if deployment mode or connection mode changed
@@ -1286,16 +1344,18 @@ export function getCouchbaseClient(): ICouchbaseClient {
     }
     
     if (!clientInstance) {
-        // SDK mode - uses native Couchbase SDK for all operations
+        // SDK mode - uses native Couchbase SDK for all operations (self-hosted or capella-sdk)
         if (connectionMode === 'sdk') {
-            info('Creating Couchbase SDK client');
+            info('Creating Couchbase SDK client', { deployment });
             clientInstance = new SdkCouchbaseClient();
         }
-        // REST mode - legacy HTTP/REST-based clients
-        else if (deployment === 'capella') {
+        // Capella Data API - uses REST-based client
+        else if (deployment === 'capella-data-api') {
             info('Creating Capella Data API client (REST)');
             clientInstance = new CapellaDataApiClient();
-        } else {
+        } 
+        // Self-hosted REST mode
+        else {
             info('Creating self-hosted Couchbase client (REST)');
             clientInstance = new SelfHostedCouchbaseClient();
         }

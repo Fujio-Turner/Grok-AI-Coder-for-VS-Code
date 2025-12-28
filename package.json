@@ -204,50 +204,82 @@
           "default": "self-hosted",
           "enum": [
             "self-hosted",
-            "capella"
+            "capella-sdk",
+            "capella-data-api"
           ],
           "enumDescriptions": [
             "Self-hosted Couchbase Server",
-            "Couchbase Capella DBaaS"
+            "Couchbase Capella - SDK (uses native SDK with TLS)",
+            "Couchbase Capella - Data API (uses REST API)"
           ],
-          "description": "Couchbase deployment type (affects connection string format for SDK mode)",
+          "description": "Couchbase deployment type (affects connection method)",
           "order": 9
         },
-        "grok.couchbaseUrl": {
+        "grok.selfHostedUrl": {
           "type": "string",
           "default": "http://localhost",
-          "description": "Self-hosted: Couchbase server base URL with protocol (e.g., http://localhost or https://couchbase.example.com). Capella: Not used.",
+          "description": "Self-hosted: Couchbase server base URL (e.g., http://localhost)",
           "order": 10
+        },
+        "grok.selfHostedUsername": {
+          "type": "string",
+          "default": "Administrator",
+          "description": "Self-hosted: Couchbase username",
+          "order": 11
+        },
+        "grok.selfHostedPassword": {
+          "type": "string",
+          "default": "password",
+          "description": "Self-hosted: Couchbase password",
+          "order": 12
+        },
+        "grok.selfHostedPort": {
+          "type": "number",
+          "default": 8091,
+          "description": "Self-hosted: Couchbase management port (8091 for REST API)",
+          "order": 13
+        },
+        "grok.selfHostedQueryPort": {
+          "type": "number",
+          "default": 8093,
+          "description": "Self-hosted: Couchbase N1QL query service port",
+          "order": 14
+        },
+        "grok.capellaSdkUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Capella SDK: Connection string hostname (e.g., cb.xxxxx.cloud.couchbase.com)",
+          "order": 15
+        },
+        "grok.capellaSdkUsername": {
+          "type": "string",
+          "default": "",
+          "description": "Capella SDK: Database access username",
+          "order": 16
+        },
+        "grok.capellaSdkPassword": {
+          "type": "string",
+          "default": "",
+          "description": "Capella SDK: Database access password",
+          "order": 17
         },
         "grok.capellaDataApiUrl": {
           "type": "string",
           "default": "",
-          "description": "Capella Data API URL (e.g., https://your-cluster-id.data.cloud.couchbase.com). Required for Capella deployment.",
-          "order": 10
+          "description": "Capella Data API: URL (e.g., https://xxxxx.data.cloud.couchbase.com)",
+          "order": 18
         },
-        "grok.couchbasePort": {
-          "type": "number",
-          "default": 8091,
-          "description": "Self-hosted: Couchbase management port (8091 for REST API). Capella: Not used.",
-          "order": 11
-        },
-        "grok.couchbaseQueryPort": {
-          "type": "number",
-          "default": 8093,
-          "description": "Self-hosted: Couchbase N1QL query service port. Capella: Not used.",
-          "order": 12
-        },
-        "grok.couchbaseUsername": {
+        "grok.capellaDataApiUsername": {
           "type": "string",
-          "default": "Administrator",
-          "description": "Couchbase username (for both self-hosted and Capella cluster access credentials)",
-          "order": 13
+          "default": "",
+          "description": "Capella Data API: Database access username",
+          "order": 19
         },
-        "grok.couchbasePassword": {
+        "grok.capellaDataApiPassword": {
           "type": "string",
-          "default": "password",
-          "description": "Couchbase password (for both self-hosted and Capella cluster access secret)",
-          "order": 14
+          "default": "",
+          "description": "Capella Data API: Database access password",
+          "order": 20
         },
         "grok.couchbaseBucket": {
           "type": "string",
