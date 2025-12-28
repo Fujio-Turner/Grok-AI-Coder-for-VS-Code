@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { changeTracker, FileChange, ChangeSet, DiffStats } from './changeTracker';
 import { createFileBackup, getOriginalBackup, restoreFromBackup, FileBackupReference } from '../storage/chatSessionRepository';
+import { debug } from '../utils/logger';
 
 /**
  * Resolves a file path (absolute, relative, or file:// URI) to a vscode.Uri.
@@ -495,6 +496,68 @@ export async function revertToOriginalBackup(filePath: string, save: boolean = t
 }
 
 /**
+ * Revert ALL modified files to their original state (before any AI changes).
+ * This restores files from Couchbase backups and sets the tracker to position -1 ("Original").
+ * @returns Object with success count and failure count
+ */
+export async function revertAllToOriginal(): Promise<{ success: number; failed: number; files: string[] }> {
+    const history = changeTracker.getHistory();
+    const result = { success: 0, failed: 0, files: [] as string[] };
+    
+    // Collect all unique file paths that were modified
+    const modifiedFiles = new Set<string>();
+    for (const cs of history) {
+        for (const file of cs.files) {
+            // Don't try to revert new files - they didn't exist before
+            if (!file.isNewFile) {
+                modifiedFiles.add(file.filePath);
+            }
+        }
+    }
+    
+    console.log(`[Grok] Reverting ${modifiedFiles.size} file(s) to original state`);
+    
+    // Revert each file to its original backup
+    for (const filePath of modifiedFiles) {
+        const success = await revertToOriginalBackup(filePath, true);
+        if (success) {
+            result.success++;
+            result.files.push(filePath);
+            console.log(`[Grok] ✓ Reverted to original: ${filePath}`);
+        } else {
+            result.failed++;
+            console.warn(`[Grok] ✗ Failed to revert: ${filePath} (no backup found)`);
+        }
+    }
+    
+    // Handle new files - delete them
+    for (const cs of history) {
+        for (const file of cs.files) {
+            if (file.isNewFile) {
+                try {
+                    const uri = vscode.Uri.file(file.filePath);
+                    await vscode.workspace.fs.delete(uri, { useTrash: true });
+                    result.success++;
+                    result.files.push(file.filePath);
+                    console.log(`[Grok] ✓ Deleted new file: ${file.filePath}`);
+                } catch (err) {
+                    // File might not exist anymore - that's fine
+                    console.log(`[Grok] Could not delete ${file.filePath} (may not exist)`);
+                }
+            }
+        }
+    }
+    
+    // Mark all changesets as reverted and set position to -1 (original)
+    for (const cs of history) {
+        changeTracker.markReverted(cs.id);
+    }
+    changeTracker.setToOriginal();
+    
+    return result;
+}
+
+/**
  * Fallback revert using stored oldContent from changeSet.
  * Use this when editSnapshots are not available (e.g., after extension reload).
  */
@@ -503,36 +566,35 @@ export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath
     let filesReverted = 0;
     let filesSkipped = 0;
 
-    console.log(`[Grok] Direct revert starting for ${changeSet.files.length} file(s)`);
+    debug(`Direct revert starting for ${changeSet.files.length} file(s)`);
 
     for (const fileChange of changeSet.files) {
         try {
             const uri = vscode.Uri.file(fileChange.filePath);
             
+            // Check if oldContent is available
+            if (!fileChange.oldContent && !fileChange.isNewFile) {
+                debug(`Skipping ${fileChange.filePath} - no oldContent stored (cannot revert)`);
+                filesSkipped++;
+                continue;
+            }
+            
             if (fileChange.isNewFile) {
-                // File was created - delete it
-                console.log(`[Grok] Deleting new file: ${fileChange.filePath}`);
+                debug(`Deleting new file: ${fileChange.filePath}`);
                 workspaceEdit.deleteFile(uri, { ignoreIfNotExists: true });
                 filesReverted++;
             } else {
-                // Verify the file exists and check if revert is needed
                 try {
                     const doc = await vscode.workspace.openTextDocument(uri);
                     const currentContent = doc.getText();
                     
-                    // Skip if already at old content (already reverted or never changed)
                     if (currentContent === fileChange.oldContent) {
-                        console.log(`[Grok] Skipping ${fileChange.filePath} - already at original content`);
+                        debug(`Skipping ${fileChange.filePath} - already at original content`);
                         filesSkipped++;
                         continue;
                     }
                     
-                    // Verify we're reverting expected content (optional but helpful for debugging)
-                    if (fileChange.newContent && currentContent !== fileChange.newContent) {
-                        console.warn(`[Grok] Warning: ${fileChange.filePath} content differs from expected newContent - reverting anyway`);
-                    }
-                    
-                    console.log(`[Grok] Restoring ${fileChange.filePath} to original content (${fileChange.oldContent.length} chars)`);
+                    debug(`Restoring ${fileChange.filePath} to original content (${fileChange.oldContent.length} chars)`);
                     const fullRange = new vscode.Range(
                         doc.positionAt(0),
                         doc.positionAt(currentContent.length)
@@ -540,37 +602,37 @@ export async function revertChangeSetDirect(changeSet: { files: Array<{ filePath
                     workspaceEdit.replace(uri, fullRange, fileChange.oldContent);
                     filesReverted++;
                 } catch (docErr) {
-                    console.error(`[Grok] Failed to open file for revert: ${fileChange.filePath}`, docErr);
+                    debug(`Failed to open file for revert: ${fileChange.filePath} - ${docErr}`);
                 }
             }
         } catch (error) {
-            console.error('[Grok] Failed to revert file directly:', fileChange.filePath, error);
+            debug(`Failed to revert file directly: ${fileChange.filePath} - ${error}`);
         }
     }
 
     if (filesReverted === 0) {
-        console.log(`[Grok] No files to revert (${filesSkipped} already at original)`);
-        return true; // Consider success if nothing to do
+        debug(`No files to revert (${filesSkipped} skipped)`);
+        return true;
     }
 
     const success = await vscode.workspace.applyEdit(workspaceEdit);
     
     if (success) {
-        // Save all modified files
         for (const fileChange of changeSet.files) {
             if (!fileChange.isNewFile) {
                 try {
                     const uri = vscode.Uri.file(fileChange.filePath);
                     const doc = await vscode.workspace.openTextDocument(uri);
                     await doc.save();
+                    debug(`Saved reverted file: ${fileChange.filePath}`);
                 } catch (saveErr) {
-                    console.error('[Grok] Failed to save reverted file:', fileChange.filePath, saveErr);
+                    debug(`Failed to save reverted file: ${fileChange.filePath} - ${saveErr}`);
                 }
             }
         }
-        console.log(`[Grok] Direct revert complete: ${filesReverted} file(s) restored, ${filesSkipped} skipped`);
+        debug(`Direct revert complete: ${filesReverted} file(s) restored, ${filesSkipped} skipped`);
     } else {
-        console.error(`[Grok] Direct revert failed: workspace edit not applied`);
+        debug(`Direct revert failed: workspace edit not applied`);
     }
     
     return success;
@@ -580,10 +642,10 @@ export async function revertToChangeSet(targetChangeSetId: string): Promise<bool
     const history = changeTracker.getHistory();
     const targetIndex = history.findIndex(cs => cs.id === targetChangeSetId);
     
-    console.log(`[Grok] revertToChangeSet called: targetId=${targetChangeSetId}, targetIndex=${targetIndex}, historyLength=${history.length}`);
+    debug(`revertToChangeSet called: targetId=${targetChangeSetId}, targetIndex=${targetIndex}, historyLength=${history.length}`);
     
     if (targetIndex === -1) {
-        console.error(`[Grok] Target changeset not found in history: ${targetChangeSetId}`);
+        debug(`Target changeset not found in history: ${targetChangeSetId}`);
         return false;
     }
 
@@ -594,63 +656,77 @@ export async function revertToChangeSet(targetChangeSetId: string): Promise<bool
         const cs = history[i];
         
         // Check if this changeset has actual changes to revert
-        const hasActualChanges = cs.files.some(f => f.oldContent !== f.newContent || f.isNewFile);
+        // Note: If oldContent/newContent are undefined, treat as no changes
+        const hasActualChanges = cs.files.some(f => {
+            const hasOldContent = f.oldContent !== undefined && f.oldContent !== null && f.oldContent.length > 0;
+            const hasNewContent = f.newContent !== undefined && f.newContent !== null && f.newContent.length > 0;
+            return (hasOldContent && hasNewContent && f.oldContent !== f.newContent) || f.isNewFile;
+        });
+        
+        debug(`Checking changeset ${cs.id}: files=${cs.files.length}, hasActualChanges=${hasActualChanges}`);
+        cs.files.forEach((f, idx) => {
+            debug(`  File ${idx}: ${f.fileName}, oldContent=${f.oldContent?.length || 0} chars, newContent=${f.newContent?.length || 0} chars, isNewFile=${f.isNewFile}`);
+        });
         
         if (!hasActualChanges) {
-            console.warn(`[Grok] Skipping changeset ${cs.id} - no actual changes were made (line operations may have failed)`);
+            debug(`Skipping changeset ${cs.id} - no actual changes (oldContent/newContent missing or identical)`);
             toRevert.push({ cs, reason: 'no_actual_changes' });
             continue;
         }
         
-        // Always include changesets with actual changes - the `applied` flag may be out of sync
-        // with reality. We'll verify the actual file content when reverting.
-        console.log(`[Grok] Adding changeset ${cs.id} to revert list (applied=${cs.applied}, files=${cs.files.length})`);
+        debug(`Adding changeset ${cs.id} to revert list (applied=${cs.applied}, files=${cs.files.length})`);
         toRevert.push({ cs });
     }
     
-    console.log(`[Grok] Collected ${toRevert.length} changeset(s) to revert`);
+    debug(`Collected ${toRevert.length} changeset(s) to revert`);
     
     // Count how many have issues
     const problematic = toRevert.filter(r => r.reason === 'no_actual_changes');
     if (problematic.length > 0) {
-        console.warn(`[Grok] ${problematic.length} changeset(s) have no actual changes - rollback may be incomplete`);
+        debug(`${problematic.length} changeset(s) have no actual changes - rollback may be incomplete`);
         vscode.window.showWarningMessage(
-            `⚠️ ${problematic.length} change(s) failed to apply originally (AI hallucinated file content). These cannot be rolled back.`
+            `⚠️ ${problematic.length} change(s) cannot be rolled back (missing file content in history).`
         );
     }
     
     // Revert the ones that have actual changes
     for (const { cs, reason } of toRevert) {
         if (reason === 'no_actual_changes') {
-            // Mark as reverted even though nothing to do
             changeTracker.markReverted(cs.id);
             continue;
         }
         
         const editGroupId = changeSetToEditGroup.get(cs.id);
+        debug(`Reverting changeset ${cs.id}: editGroupId=${editGroupId || 'none'}`);
+        
         if (editGroupId) {
             try {
                 await revertEdits(editGroupId);
+                debug(`Reverted via editGroup: ${cs.id}`);
             } catch (error) {
-                console.error('Failed to revert change set via editGroup:', cs.id, error);
-                // Fallback: use stored oldContent directly
-                console.log('Attempting direct revert using stored oldContent...');
+                debug(`Failed to revert via editGroup, trying direct revert: ${cs.id}`);
                 const success = await revertChangeSetDirect(cs);
                 if (success) {
                     changeTracker.markReverted(cs.id);
+                    debug(`Direct revert succeeded: ${cs.id}`);
+                } else {
+                    debug(`Direct revert failed: ${cs.id}`);
                 }
             }
         } else {
-            // No editGroup mapping - use direct revert
-            console.log('No editGroup mapping, using direct revert for:', cs.id);
+            debug(`No editGroup mapping, using direct revert for: ${cs.id}`);
             const success = await revertChangeSetDirect(cs);
             if (success) {
                 changeTracker.markReverted(cs.id);
+                debug(`Direct revert succeeded: ${cs.id}`);
+            } else {
+                debug(`Direct revert failed: ${cs.id}`);
             }
         }
     }
 
     changeTracker.setPosition(targetIndex);
+    debug(`Set tracker position to ${targetIndex}`);
     return true;
 }
 

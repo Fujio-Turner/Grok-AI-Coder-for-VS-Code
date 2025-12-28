@@ -230,6 +230,7 @@ export async function sendChatCompletion(
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        let buffer = ''; // Buffer for incomplete lines across chunk boundaries
 
         try {
             while (true) {
@@ -237,11 +238,19 @@ export async function sendChatCompletion(
                 if (done) break;
 
                 const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split('\n').filter(line => line.trim() !== '');
+                buffer += chunk;
+                
+                // Split by newlines but keep tracking incomplete lines
+                const lines = buffer.split('\n');
+                // Last element may be incomplete - keep it in buffer
+                buffer = lines.pop() || '';
 
                 for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const data = line.slice(6);
+                    const trimmedLine = line.trim();
+                    if (!trimmedLine) continue;
+                    
+                    if (trimmedLine.startsWith('data: ')) {
+                        const data = trimmedLine.slice(6);
                         if (data === '[DONE]') continue;
 
                         try {
@@ -278,12 +287,42 @@ export async function sendChatCompletion(
                             if (parseErr.message && !parseErr.message.includes('JSON')) {
                                 throw parseErr;
                             }
-                            // Skip malformed JSON chunks
+                            // Skip malformed JSON chunks (should be rare with buffering)
                             log.warn(`Skipping malformed chunk: ${data.substring(0, 100)}`);
                         }
-                    } else if (line.trim() && !line.startsWith(':')) {
+                    } else if (!trimmedLine.startsWith(':')) {
                         // Log unexpected non-data lines for debugging
-                        log.warn(`Unexpected stream line: ${line.substring(0, 200)}`);
+                        log.warn(`Unexpected stream line: ${trimmedLine.substring(0, 200)}`);
+                    }
+                }
+            }
+            
+            // Process any remaining buffered content
+            if (buffer.trim()) {
+                const trimmedLine = buffer.trim();
+                if (trimmedLine.startsWith('data: ')) {
+                    const data = trimmedLine.slice(6);
+                    if (data !== '[DONE]') {
+                        try {
+                            const parsed = JSON.parse(data);
+                            const delta = parsed.choices?.[0]?.delta?.content;
+                            if (delta) {
+                                fullText += delta;
+                                chunkCallback(delta);
+                            }
+                            if (parsed.choices?.[0]?.finish_reason) {
+                                finishReason = parsed.choices[0].finish_reason;
+                            }
+                            if (parsed.usage) {
+                                usage = {
+                                    promptTokens: parsed.usage.prompt_tokens || 0,
+                                    completionTokens: parsed.usage.completion_tokens || 0,
+                                    totalTokens: parsed.usage.total_tokens || 0
+                                };
+                            }
+                        } catch {
+                            log.warn(`Skipping final malformed chunk: ${data.substring(0, 100)}`);
+                        }
                     }
                 }
             }

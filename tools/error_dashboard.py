@@ -306,28 +306,34 @@ DASHBOARD_HTML = """
     
     <!-- Charts Row 1 -->
     <div class="charts-row">
-        <div class="chart-card" style="max-width: 250px;">
-            <h4>📊 Errors by Type</h4>
+        <div class="chart-card" style="max-width: 200px;">
+            <h4>📊 By Type</h4>
             <div id="pieChart" class="chart-container"></div>
         </div>
-        <div class="chart-card" style="max-width: 250px;">
+        <div class="chart-card" style="max-width: 200px;">
+            <h4>🏷️ By Category</h4>
+            <div id="categoryPie" class="chart-container"></div>
+        </div>
+        <div class="chart-card" style="max-width: 200px;">
             <h4>📦 Session Types</h4>
             <div id="sessionTypePie" class="chart-container"></div>
         </div>
-        <div class="chart-card">
-            <h4>📈 Errors Over Time (by Type)</h4>
+        <div class="chart-card" style="flex: 2;">
+            <h4>📈 Errors Over Time & Avg/Session</h4>
             <div id="stackedBarChart" class="chart-container"></div>
-        </div>
-        <div class="chart-card">
-            <h4>📉 Avg Errors per Session</h4>
-            <div id="lineChart" class="chart-container"></div>
         </div>
     </div>
     
     <!-- Charts Row 2 - Token & Session Analysis -->
     <div class="charts-row">
         <div class="chart-card">
-            <h4>🔤 Tokens: Request vs Response</h4>
+            <h4 style="display: flex; justify-content: space-between; align-items: center;">
+                <span>🔤 Tokens: Request vs Response</span>
+                <span style="font-size: 0.8em; font-weight: normal;">
+                    <label style="margin-right: 10px; cursor: pointer;"><input type="radio" name="tokenScale" value="log" checked onchange="updateTokensChart()"> Log</label>
+                    <label style="cursor: pointer;"><input type="radio" name="tokenScale" value="linear" onchange="updateTokensChart()"> Linear</label>
+                </span>
+            </h4>
             <div id="tokensChart" class="chart-container"></div>
         </div>
         <div class="chart-card">
@@ -383,9 +389,10 @@ DASHBOARD_HTML = """
         let sessionCache = {};
         let currentSession = null;
         let currentPairIndex = 0;
+        let currentTimeData = [];  // Store time series data for chart updates
         
         // ECharts instances
-        let pieChart, sessionTypePie, stackedBarChart, lineChart, tokensChart, sessionSizeChart;
+        let pieChart, categoryPie, sessionTypePie, stackedBarChart, tokensChart, sessionSizeChart;
         
         // Session type lookup cache
         let sessionTypeCache = {};
@@ -393,21 +400,21 @@ DASHBOARD_HTML = """
         // Initialize charts
         function initCharts() {
             pieChart = echarts.init(document.getElementById('pieChart'));
+            categoryPie = echarts.init(document.getElementById('categoryPie'));
             sessionTypePie = echarts.init(document.getElementById('sessionTypePie'));
             stackedBarChart = echarts.init(document.getElementById('stackedBarChart'));
-            lineChart = echarts.init(document.getElementById('lineChart'));
             tokensChart = echarts.init(document.getElementById('tokensChart'));
             sessionSizeChart = echarts.init(document.getElementById('sessionSizeChart'));
             
             // Connect charts for synchronized crosshair/tooltip
-            echarts.connect([stackedBarChart, lineChart, tokensChart, sessionSizeChart]);
+            echarts.connect([stackedBarChart, tokensChart, sessionSizeChart]);
             
             // Handle resize
             window.addEventListener('resize', () => {
                 pieChart.resize();
+                categoryPie.resize();
                 sessionTypePie.resize();
                 stackedBarChart.resize();
-                lineChart.resize();
                 tokensChart.resize();
                 sessionSizeChart.resize();
             });
@@ -416,26 +423,53 @@ DASHBOARD_HTML = """
         function updateCharts(data) {
             const timeRange = document.getElementById('timeRange').value;
             
-            // Pie Chart - Errors by Type
-            const typeCounts = { bug: 0, failure: 0, error: 0 };
-            data.errors.forEach(e => { if (typeCounts[e.type] !== undefined) typeCounts[e.type]++; });
+            // Type Pie Chart
+            const typeCounts = { bug: 0, failure: 0, error: 0, cli: 0 };
+            const categoryCounts = { truncation: 0, json: 0, api: 0, file: 0, cli: 0, other: 0 };
+            data.errors.forEach(e => { 
+                if (typeCounts[e.type] !== undefined) typeCounts[e.type]++;
+                const cat = categorizeError(e);
+                if (categoryCounts[cat] !== undefined) categoryCounts[cat]++;
+            });
             
             pieChart.setOption({
                 backgroundColor: 'transparent',
                 tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
-                legend: { orient: 'vertical', left: 'left', textStyle: { color: '#888' } },
+                legend: { show: false },
                 series: [{
                     type: 'pie',
-                    radius: ['40%', '70%'],
-                    avoidLabelOverlap: false,
+                    radius: ['35%', '70%'],
                     itemStyle: { borderRadius: 4, borderColor: '#252526', borderWidth: 2 },
                     label: { show: false },
-                    emphasis: { label: { show: true, fontSize: 14, fontWeight: 'bold' } },
+                    emphasis: { label: { show: true, fontSize: 12, fontWeight: 'bold' } },
                     data: [
                         { value: typeCounts.bug, name: 'Bugs', itemStyle: { color: '#f14c4c' } },
                         { value: typeCounts.failure, name: 'Failures', itemStyle: { color: '#cca700' } },
-                        { value: typeCounts.error, name: 'Errors', itemStyle: { color: '#cc6633' } }
-                    ]
+                        { value: typeCounts.error, name: 'Errors', itemStyle: { color: '#cc6633' } },
+                        { value: typeCounts.cli, name: 'CLI', itemStyle: { color: '#c586c0' } }
+                    ].filter(d => d.value > 0)
+                }]
+            });
+            
+            // Category Pie Chart
+            categoryPie.setOption({
+                backgroundColor: 'transparent',
+                tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+                legend: { show: false },
+                series: [{
+                    type: 'pie',
+                    radius: ['35%', '70%'],
+                    itemStyle: { borderRadius: 4, borderColor: '#252526', borderWidth: 2 },
+                    label: { show: false },
+                    emphasis: { label: { show: true, fontSize: 11, fontWeight: 'bold' } },
+                    data: [
+                        { value: categoryCounts.truncation, name: 'Truncation', itemStyle: { color: '#c94eb0' } },
+                        { value: categoryCounts.json, name: 'JSON', itemStyle: { color: '#4ec9b0' } },
+                        { value: categoryCounts.api, name: 'API', itemStyle: { color: '#ccaa00' } },
+                        { value: categoryCounts.file, name: 'File', itemStyle: { color: '#6ab0de' } },
+                        { value: categoryCounts.cli, name: 'CLI', itemStyle: { color: '#c586c0' } },
+                        { value: categoryCounts.other, name: 'Other', itemStyle: { color: '#888888' } }
+                    ].filter(d => d.value > 0)
                 }]
             });
             
@@ -463,82 +497,62 @@ DASHBOARD_HTML = """
                 }]
             });
             
-            // Stacked Bar Chart - Errors Over Time by Type
+            // Combined Chart - Stacked Bars (left axis) + Line (right axis)
             const timeData = data.timeSeries || [];
+            currentTimeData = timeData;  // Store for chart updates
             stackedBarChart.setOption({
                 backgroundColor: 'transparent',
-                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                legend: { data: ['Bugs', 'Failures', 'Errors'], textStyle: { color: '#888' }, top: 0 },
-                grid: { left: '3%', right: '4%', bottom: '3%', top: '40px', containLabel: true },
-                xAxis: { type: 'category', data: timeData.map(t => t.period), axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } } },
-                yAxis: { type: 'value', axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#333' } } },
+                tooltip: { 
+                    trigger: 'axis', 
+                    axisPointer: { type: 'cross', crossStyle: { color: '#999' } }
+                },
+                legend: { data: ['Bugs', 'Failures', 'Errors', 'Avg/Session'], textStyle: { color: '#888' }, top: 0 },
+                grid: { left: '3%', right: '8%', bottom: '3%', top: '40px', containLabel: true },
+                xAxis: { 
+                    type: 'category', 
+                    data: timeData.map(t => t.period), 
+                    axisLabel: { color: '#888' }, 
+                    axisLine: { lineStyle: { color: '#444' } },
+                    axisPointer: { type: 'shadow' }
+                },
+                yAxis: [
+                    { 
+                        type: 'value', 
+                        name: 'Error Count',
+                        nameTextStyle: { color: '#888' },
+                        axisLabel: { color: '#888' }, 
+                        axisLine: { lineStyle: { color: '#444' } }, 
+                        splitLine: { lineStyle: { color: '#333' } }
+                    },
+                    { 
+                        type: 'value', 
+                        name: 'Avg/Session',
+                        nameTextStyle: { color: '#4ec9b0' },
+                        axisLabel: { color: '#4ec9b0', formatter: '{value}' }, 
+                        axisLine: { lineStyle: { color: '#4ec9b0' } }, 
+                        splitLine: { show: false }
+                    }
+                ],
                 series: [
                     { name: 'Bugs', type: 'bar', stack: 'total', emphasis: { focus: 'series' }, data: timeData.map(t => t.bugs), itemStyle: { color: '#f14c4c' } },
                     { name: 'Failures', type: 'bar', stack: 'total', emphasis: { focus: 'series' }, data: timeData.map(t => t.failures), itemStyle: { color: '#cca700' } },
-                    { name: 'Errors', type: 'bar', stack: 'total', emphasis: { focus: 'series' }, data: timeData.map(t => t.errors), itemStyle: { color: '#cc6633' } }
-                ]
-            });
-            
-            // Line Chart - Avg Errors per Session
-            lineChart.setOption({
-                backgroundColor: 'transparent',
-                tooltip: { trigger: 'axis' },
-                grid: { left: '3%', right: '4%', bottom: '3%', top: '20px', containLabel: true },
-                xAxis: { type: 'category', data: timeData.map(t => t.period), axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } }, boundaryGap: false },
-                yAxis: { type: 'value', name: 'Avg Errors/Session', nameTextStyle: { color: '#888' }, axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#333' } } },
-                series: [{
-                    name: 'Avg Errors/Session',
-                    type: 'line',
-                    smooth: true,
-                    symbol: 'circle',
-                    symbolSize: 8,
-                    data: timeData.map(t => t.avgPerSession),
-                    lineStyle: { color: '#4ec9b0', width: 3 },
-                    itemStyle: { color: '#4ec9b0' },
-                    areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                        { offset: 0, color: 'rgba(78, 201, 176, 0.4)' },
-                        { offset: 1, color: 'rgba(78, 201, 176, 0.05)' }
-                    ])}
-                }]
-            });
-            
-            // Tokens Chart - Stacked Area (Request vs Response)
-            tokensChart.setOption({
-                backgroundColor: 'transparent',
-                tooltip: { trigger: 'axis', axisPointer: { type: 'cross', label: { backgroundColor: '#333' } } },
-                legend: { data: ['Tokens In (Request)', 'Tokens Out (Response)'], textStyle: { color: '#888' }, top: 0 },
-                grid: { left: '3%', right: '4%', bottom: '3%', top: '40px', containLabel: true },
-                xAxis: { type: 'category', data: timeData.map(t => t.period), axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } }, boundaryGap: false },
-                yAxis: { type: 'value', name: 'Tokens', nameTextStyle: { color: '#888' }, axisLabel: { color: '#888', formatter: v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : v }, axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#333' } } },
-                series: [
-                    {
-                        name: 'Tokens In (Request)',
-                        type: 'line',
-                        stack: 'tokens',
+                    { name: 'Errors', type: 'bar', stack: 'total', emphasis: { focus: 'series' }, data: timeData.map(t => t.errors), itemStyle: { color: '#cc6633' } },
+                    { 
+                        name: 'Avg/Session', 
+                        type: 'line', 
+                        yAxisIndex: 1,
                         smooth: true,
-                        symbol: 'none',
-                        data: timeData.map(t => t.tokensIn || 0),
-                        lineStyle: { width: 2, color: '#569cd6' },
-                        areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            { offset: 0, color: 'rgba(86, 156, 214, 0.5)' },
-                            { offset: 1, color: 'rgba(86, 156, 214, 0.1)' }
-                        ])}
-                    },
-                    {
-                        name: 'Tokens Out (Response)',
-                        type: 'line',
-                        stack: 'tokens',
-                        smooth: true,
-                        symbol: 'none',
-                        data: timeData.map(t => t.tokensOut || 0),
-                        lineStyle: { width: 2, color: '#c586c0' },
-                        areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            { offset: 0, color: 'rgba(197, 134, 192, 0.5)' },
-                            { offset: 1, color: 'rgba(197, 134, 192, 0.1)' }
-                        ])}
+                        symbol: 'circle',
+                        symbolSize: 6,
+                        data: timeData.map(t => t.avgPerSession),
+                        lineStyle: { color: '#4ec9b0', width: 3, type: 'dashed' },
+                        itemStyle: { color: '#4ec9b0' }
                     }
                 ]
             });
+            
+            // Tokens Chart - Stacked Area (Request vs Response)
+            updateTokensChart();
             
             // Session Size Chart - Avg KB per Session
             sessionSizeChart.setOption({
@@ -567,6 +581,98 @@ DASHBOARD_HTML = """
                         label: { color: '#f14c4c', formatter: '500KB limit' }
                     }
                 }]
+            });
+        }
+        
+        function updateTokensChart() {
+            const scaleType = document.querySelector('input[name="tokenScale"]:checked')?.value || 'log';
+            const isLog = scaleType === 'log';
+            const timeData = currentTimeData;
+            
+            // Calculate response/request ratio as percentage
+            const ratioData = timeData.map(t => {
+                const reqTokens = t.tokensIn || 0;
+                const respTokens = t.tokensOut || 0;
+                if (reqTokens === 0) return 0;
+                return Math.round((respTokens / reqTokens) * 100);
+            });
+            
+            tokensChart.setOption({
+                backgroundColor: 'transparent',
+                tooltip: { 
+                    trigger: 'axis', 
+                    axisPointer: { type: 'cross', label: { backgroundColor: '#333' } },
+                    formatter: function(params) {
+                        let html = params[0].axisValue + '<br/>';
+                        params.forEach(p => {
+                            const value = p.seriesName === 'Resp/Req %' ? p.value + '%' : 
+                                (p.value >= 1000 ? (p.value/1000).toFixed(1) + 'k' : p.value);
+                            html += `${p.marker} ${p.seriesName}: ${value}<br/>`;
+                        });
+                        return html;
+                    }
+                },
+                legend: { data: ['Tokens In (Request)', 'Tokens Out (Response)', 'Resp/Req %'], textStyle: { color: '#888' }, top: 0 },
+                grid: { left: '3%', right: '8%', bottom: '3%', top: '40px', containLabel: true },
+                xAxis: { type: 'category', data: timeData.map(t => t.period), axisLabel: { color: '#888' }, axisLine: { lineStyle: { color: '#444' } }, boundaryGap: false },
+                yAxis: [
+                    { 
+                        type: isLog ? 'log' : 'value', 
+                        name: 'Tokens', 
+                        nameTextStyle: { color: '#888' }, 
+                        axisLabel: { color: '#888', formatter: v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : v }, 
+                        axisLine: { lineStyle: { color: '#444' } }, 
+                        splitLine: { lineStyle: { color: '#333' } },
+                        min: isLog ? 1 : 0
+                    },
+                    {
+                        type: 'value',
+                        name: 'Ratio %',
+                        nameTextStyle: { color: '#4ec9b0' },
+                        axisLabel: { color: '#4ec9b0', formatter: '{value}%' },
+                        axisLine: { lineStyle: { color: '#4ec9b0' } },
+                        splitLine: { show: false },
+                        min: 0,
+                        max: 100
+                    }
+                ],
+                series: [
+                    {
+                        name: 'Tokens In (Request)',
+                        type: 'line',
+                        smooth: true,
+                        symbol: 'none',
+                        data: timeData.map(t => Math.max(t.tokensIn || 0, isLog ? 1 : 0)),
+                        lineStyle: { width: 2, color: '#569cd6' },
+                        areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: 'rgba(86, 156, 214, 0.5)' },
+                            { offset: 1, color: 'rgba(86, 156, 214, 0.1)' }
+                        ])}
+                    },
+                    {
+                        name: 'Tokens Out (Response)',
+                        type: 'line',
+                        smooth: true,
+                        symbol: 'none',
+                        data: timeData.map(t => Math.max(t.tokensOut || 0, isLog ? 1 : 0)),
+                        lineStyle: { width: 2, color: '#c586c0' },
+                        areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: 'rgba(197, 134, 192, 0.5)' },
+                            { offset: 1, color: 'rgba(197, 134, 192, 0.1)' }
+                        ])}
+                    },
+                    {
+                        name: 'Resp/Req %',
+                        type: 'line',
+                        yAxisIndex: 1,
+                        smooth: true,
+                        symbol: 'circle',
+                        symbolSize: 4,
+                        data: ratioData,
+                        lineStyle: { width: 2, color: '#4ec9b0', type: 'dashed' },
+                        itemStyle: { color: '#4ec9b0' }
+                    }
+                ]
             });
         }
         
@@ -618,6 +724,64 @@ DASHBOARD_HTML = """
             filterTable();
         }
         
+        // Rebuild time series data from filtered errors
+        function rebuildTimeSeries(errors, originalTimeSeries) {
+            // Use the same time buckets as the original, but recalculate counts
+            const buckets = {};
+            originalTimeSeries.forEach(t => {
+                buckets[t.period] = { 
+                    period: t.period, 
+                    bugs: 0, failures: 0, errors: 0, 
+                    avgPerSession: 0, 
+                    tokensIn: t.tokensIn || 0,  // Keep token data (not filterable)
+                    tokensOut: t.tokensOut || 0,
+                    avgSessionSizeKB: t.avgSessionSizeKB || 0,
+                    sessions: new Set()
+                };
+            });
+            
+            // Get time range format from first entry
+            const timeRange = document.getElementById('timeRange').value;
+            const bucketFormat = timeRange === 'hour' ? 'HH:MM' : 
+                                 timeRange === 'day' ? 'HH:00' : 'MM/DD';
+            
+            errors.forEach(e => {
+                if (!e.timestamp) return;
+                const dt = new Date(e.timestamp);
+                let key;
+                if (timeRange === 'hour') {
+                    key = dt.toTimeString().slice(0, 5);
+                } else if (timeRange === 'day') {
+                    key = dt.getHours().toString().padStart(2, '0') + ':00';
+                } else {
+                    key = (dt.getMonth() + 1).toString().padStart(2, '0') + '/' + 
+                          dt.getDate().toString().padStart(2, '0');
+                }
+                
+                if (buckets[key]) {
+                    if (e.type === 'bug') buckets[key].bugs++;
+                    else if (e.type === 'failure') buckets[key].failures++;
+                    else if (e.type === 'error') buckets[key].errors++;
+                    buckets[key].sessions.add(e.sessionId);
+                }
+            });
+            
+            // Calculate avgPerSession
+            Object.values(buckets).forEach(b => {
+                const total = b.bugs + b.failures + b.errors;
+                const sessionCount = b.sessions.size || 1;
+                b.avgPerSession = Math.round((total / sessionCount) * 100) / 100;
+            });
+            
+            return originalTimeSeries.map(t => ({
+                ...t,
+                bugs: buckets[t.period]?.bugs || 0,
+                failures: buckets[t.period]?.failures || 0,
+                errors: buckets[t.period]?.errors || 0,
+                avgPerSession: buckets[t.period]?.avgPerSession || 0
+            }));
+        }
+        
         function filterTable() {
             const typeFilter = document.getElementById('typeFilter').value;
             const categoryFilter = document.getElementById('categoryFilter').value;
@@ -646,36 +810,38 @@ DASHBOARD_HTML = """
                 );
             }
             
-            // Update charts if session type filter is applied
-            if (rawData && sessionTypeFilter !== 'all') {
-                // Filter errors for charts
+            // Update charts based on filtered data
+            const hasFilter = typeFilter !== 'all' || categoryFilter !== 'all' || sessionTypeFilter !== 'all' || search;
+            
+            if (rawData) {
+                // Rebuild timeSeries from filtered errors
+                const filteredTimeSeries = hasFilter ? rebuildTimeSeries(filtered, rawData.timeSeries) : rawData.timeSeries;
+                
+                // Build chart data from filtered errors
                 const chartData = {
                     ...rawData,
                     errors: filtered,
-                    // Recalculate session types for the filter (show only selected type)
-                    sessionTypes: {
-                        single: sessionTypeFilter === 'single' ? rawData.sessionTypes.single : 0,
-                        extended: sessionTypeFilter === 'extended' ? rawData.sessionTypes.extended : 0,
-                        handoff: sessionTypeFilter === 'handoff' ? rawData.sessionTypes.handoff : 0
-                    }
+                    timeSeries: filteredTimeSeries,
+                    sessionTypes: hasFilter ? {
+                        single: sessionTypeFilter === 'all' || sessionTypeFilter === 'single' ? 
+                            filtered.filter(e => (sessionTypeCache[e.sessionId] || 'single') === 'single').length : 0,
+                        extended: sessionTypeFilter === 'all' || sessionTypeFilter === 'extended' ? 
+                            filtered.filter(e => sessionTypeCache[e.sessionId] === 'extended').length : 0,
+                        handoff: sessionTypeFilter === 'all' || sessionTypeFilter === 'handoff' ? 
+                            filtered.filter(e => sessionTypeCache[e.sessionId] === 'handoff').length : 0
+                    } : rawData.sessionTypes
                 };
                 updateCharts(chartData);
                 
                 // Update stat cards to reflect filtered data
-                const typeCounts = { bug: 0, failure: 0, error: 0 };
+                const typeCounts = { bug: 0, failure: 0, error: 0, cli: 0 };
                 filtered.forEach(e => { if (typeCounts[e.type] !== undefined) typeCounts[e.type]++; });
                 document.getElementById('bugCount').textContent = typeCounts.bug;
                 document.getElementById('failureCount').textContent = typeCounts.failure;
                 document.getElementById('errorCount').textContent = typeCounts.error;
+                document.getElementById('cliCount').textContent = typeCounts.cli;
                 const uniqueSessions = new Set(filtered.map(e => e.sessionId)).size;
                 document.getElementById('sessionCount').textContent = uniqueSessions;
-            } else if (rawData) {
-                // Reset to full data
-                updateCharts(rawData);
-                document.getElementById('bugCount').textContent = rawData.stats.bugs;
-                document.getElementById('failureCount').textContent = rawData.stats.failures;
-                document.getElementById('errorCount').textContent = rawData.stats.errors;
-                document.getElementById('sessionCount').textContent = rawData.stats.uniqueSessions;
             }
             
             if (groupBy) renderGroupedTable(filtered);

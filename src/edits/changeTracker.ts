@@ -162,17 +162,34 @@ class ChangeTracker {
     }
 
     canRewind(): boolean {
-        return this.currentPosition > 0;
+        // Can rewind if we have any history AND we're not already at "original" (-1)
+        return this.changeHistory.length > 0 && this.currentPosition >= 0;
+    }
+    
+    /**
+     * Check if we're at the "original" position (before any AI changes)
+     */
+    isAtOriginal(): boolean {
+        return this.currentPosition === -1;
     }
 
     canForward(): boolean {
+        // Can forward if we're at -1 (original) or below the last changeset
         return this.currentPosition < this.changeHistory.length - 1;
     }
 
+    /**
+     * Rewind one step. Returns null if already at original (-1).
+     * When rewinding from position 0, we go to -1 (original state).
+     */
     rewind(): ChangeSet | null {
         if (!this.canRewind()) return null;
         this.currentPosition--;
         this.notifyChange();
+        // If we're now at -1, return null to indicate "original" state
+        if (this.currentPosition === -1) {
+            return null;
+        }
         return this.changeHistory[this.currentPosition];
     }
 
@@ -201,10 +218,20 @@ class ChangeTracker {
     }
 
     setPosition(position: number): ChangeSet | null {
-        if (position < 0 || position >= this.changeHistory.length) return null;
+        // Allow position -1 for "original" state
+        if (position < -1 || position >= this.changeHistory.length) return null;
         this.currentPosition = position;
         this.notifyChange();
+        if (position === -1) return null; // "Original" state
         return this.changeHistory[this.currentPosition];
+    }
+    
+    /**
+     * Set position to -1 (original state before any AI changes)
+     */
+    setToOriginal(): void {
+        this.currentPosition = -1;
+        this.notifyChange();
     }
 
     onChange(callback: (changes: ChangeSet[], position: number) => void): void {

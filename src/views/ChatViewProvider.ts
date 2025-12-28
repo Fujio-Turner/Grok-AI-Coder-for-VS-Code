@@ -65,7 +65,8 @@ import {
     validateFileChange,
     resolveFilePathToUri,
     resolveFilePathToUriWithSearch,
-    revertToOriginalBackup
+    revertToOriginalBackup,
+    revertAllToOriginal
 } from '../edits/codeActions';
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
@@ -141,6 +142,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _sendChangesUpdate(changes: ChangeSet[], position: number) {
         const tracker = getChangeTracker();
+        const isAtOriginal = tracker.isAtOriginal();
         this._postMessage({
             type: 'changesUpdate',
             changes: changes.map(cs => ({
@@ -160,6 +162,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 description: cs.description
             })),
             currentPosition: position,
+            isAtOriginal: isAtOriginal,
             canRewind: tracker.canRewind(),
             canForward: tracker.canForward()
         });
@@ -286,6 +289,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'revertToOriginal':
                     await this._revertFileToOriginal(message.filePath);
+                    break;
+                case 'rewindToOriginalState':
+                    await this._rewindToOriginal();
                     break;
             }
         });
@@ -1339,14 +1345,53 @@ ${cliSummary}
         
         const tracker = getChangeTracker();
         if (!tracker.canRewind()) {
-            vscode.window.showInformationMessage('Nothing to rewind');
+            vscode.window.showInformationMessage('Already at original state');
             return;
         }
 
-        const current = tracker.getCurrentChange();
-        if (current) {
-            await this._rewindToChangeSet(current.id);
-            tracker.rewind();
+        const currentPosition = tracker.getCurrentPosition();
+        
+        // If at position 0, rewind to "Original" (position -1)
+        if (currentPosition === 0) {
+            await this._rewindToOriginal();
+            return;
+        }
+        
+        // Otherwise, revert to the PREVIOUS state (position - 1)
+        // revertToChangeSet reverts all changes AFTER the target, so we need to pass
+        // the previous changeset's ID to undo the current changeset
+        const previousChange = tracker.getChangeAt(currentPosition - 1);
+        if (previousChange) {
+            await this._rewindToChangeSet(previousChange.id);
+        }
+    }
+    
+    /**
+     * Rewind all files to their original state (before any AI changes).
+     * Sets tracker position to -1.
+     */
+    private async _rewindToOriginal() {
+        try {
+            const result = await revertAllToOriginal();
+            
+            if (result.success > 0) {
+                vscode.window.showInformationMessage(
+                    `Reverted ${result.success} file(s) to original state`
+                );
+            }
+            if (result.failed > 0) {
+                vscode.window.showWarningMessage(
+                    `${result.failed} file(s) could not be reverted (no backup found)`
+                );
+            }
+            
+            // Persist the updated change history
+            await this._persistChangeHistory();
+            // Refresh the UI
+            this._sendInitialChanges();
+        } catch (error: any) {
+            logError('Revert to original failed:', error);
+            vscode.window.showErrorMessage(`Revert to original failed: ${error.message}`);
         }
     }
 
@@ -1356,10 +1401,23 @@ ${cliSummary}
         
         const tracker = getChangeTracker();
         if (!tracker.canForward()) {
-            vscode.window.showInformationMessage('Nothing to forward');
+            vscode.window.showInformationMessage('Already at latest changes');
             return;
         }
 
+        const currentPosition = tracker.getCurrentPosition();
+        
+        // If at position -1 (original), forward to position 0
+        if (currentPosition === -1) {
+            tracker.forward(); // This moves to position 0
+            const first = tracker.getCurrentChange();
+            if (first) {
+                await this._forwardToChangeSet(first.id);
+            }
+            return;
+        }
+        
+        // Otherwise, forward to the next changeset
         tracker.forward();
         const next = tracker.getCurrentChange();
         if (next) {
@@ -1806,15 +1864,21 @@ ${cliSummary}
                         
                         const fileContents: string[] = [];
                         const attachedNames: string[] = [];
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        
                         for (const filePath of modifiedFiles.slice(0, 5)) { // Limit to 5 most recent
                             try {
                                 const content = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
                                 const textContent = Buffer.from(content).toString('utf8');
-                                const fileName = filePath.split('/').pop() || filePath;
+                                // Use relative path for consistency with fileChanges paths
+                                const relativePath = workspaceRoot && filePath.startsWith(workspaceRoot) 
+                                    ? filePath.slice(workspaceRoot.length + 1) // +1 for the trailing slash
+                                    : filePath;
                                 const md5Hash = computeFileHash(textContent);
-                                fileContents.push(`📄 ${fileName} (MD5: ${md5Hash}):\n\`\`\`\n${textContent}\n\`\`\``);
-                                attachedNames.push(fileName);
-                                info(`Auto-attached: ${fileName} (MD5: ${md5Hash.slice(0, 8)}...)`);
+                                // Include BOTH relative path (for fileHashes) and full path for clarity
+                                fileContents.push(`📄 ${relativePath} [MD5: ${md5Hash}]\nPath for fileHashes: "${relativePath}"\n\`\`\`\n${textContent}\n\`\`\``);
+                                attachedNames.push(relativePath);
+                                info(`Auto-attached: ${relativePath} (MD5: ${md5Hash.slice(0, 8)}...)`);
                                 
                                 // Track file read in pairFileHistory
                                 try {
@@ -1834,7 +1898,7 @@ ${cliSummary}
                         }
                         
                         if (fileContents.length > 0) {
-                            finalMessageText = `${messageText}\n\n**Current state of modified files (FRESH READ - use these MD5 hashes):**\n${fileContents.join('\n\n')}`;
+                            finalMessageText = `${messageText}\n\n**Current state of modified files (FRESH READ - use these MD5 hashes in your fileHashes response):**\n${fileContents.join('\n\n')}`;
                             const fileList = attachedNames.map(f => `   └─ ${f}`).join('\n');
                             this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} modified file(s)\n${fileList}\n\n` });
                         }
@@ -3584,7 +3648,8 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #changes-list{overflow-y:auto;flex:1}
 .change-item{padding:8px 10px;border-bottom:1px solid var(--vscode-panel-border);display:flex;flex-direction:column;gap:4px;cursor:pointer;transition:background .2s}
 .change-item:hover{background:var(--vscode-list-hoverBackground)}
-.change-item.current{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+.change-item.current{background:rgba(56,139,213,0.25);color:var(--vscode-foreground);border:1px solid rgba(56,139,213,0.5)}
+.change-item.original-state.current{background:rgba(106,169,154,0.25);border:1px solid rgba(106,169,154,0.5)}
 .change-item.applied{border-left:3px solid var(--vscode-testing-iconPassed)}
 .change-item.reverted{border-left:3px solid var(--vscode-descriptionForeground);opacity:.7}
 .change-files{display:flex;flex-direction:column;gap:4px;font-size:11px}
@@ -4454,7 +4519,7 @@ let lastResponseSummary='',lastResponseNextSteps=[],stickySummaryDismissed=false
 const autoBtn=document.getElementById('auto-btn');
 const modelBtn=document.getElementById('model-btn');
 let busy=0,curDiv=null,stream='',curSessId='',attachedImages=[],totalTokens=0,totalCost=0;
-let changeHistory=[],currentChangePos=-1,enterToSend=false,autoApply=true,autoApplyFiles=true,autoApplyCli=false,modelMode='fast';
+let changeHistory=[],currentChangePos=-1,isAtOriginalState=false,enterToSend=false,autoApply=true,autoApplyFiles=true,autoApplyCli=false,modelMode='fast';
 let currentTodos=[],todosCompleted=0,todoExpanded=true;
 // Track estimated context for next request (sum of all input tokens from history)
 let estimatedContextTokens=0;
@@ -5043,14 +5108,29 @@ function renderChanges(){
     // Calculate totals from all changes
     let totalFiles=0,totalAdd=0,totalRem=0,totalMod=0;
     changeHistory.forEach(cs=>{if(cs.applied){totalFiles+=cs.files.length;totalAdd+=cs.totalStats.added;totalRem+=cs.totalStats.removed;totalMod+=cs.totalStats.modified;}});
-    // Update stats bar left side
-    document.getElementById('stats-changes').textContent=totalFiles+' file'+(totalFiles!==1?'s':'');
-    const statsInfo=document.querySelector('#stats-left .changes-info');
-    statsInfo.innerHTML='<span class="stat-add">+'+totalAdd+'</span><span class="stat-rem">-'+totalRem+'</span>'+(totalMod>0?'<span class="stat-mod">~'+totalMod+'</span>':'');
+    // Update stats bar left side - show "Original" when at position -1
+    if(isAtOriginalState){
+        document.getElementById('stats-changes').textContent='Original';
+        const statsInfo=document.querySelector('#stats-left .changes-info');
+        statsInfo.innerHTML='<span style="color:#6a9">✓ All files at original state</span>';
+    } else {
+        document.getElementById('stats-changes').textContent=totalFiles+' file'+(totalFiles!==1?'s':'');
+        const statsInfo=document.querySelector('#stats-left .changes-info');
+        statsInfo.innerHTML='<span class="stat-add">+'+totalAdd+'</span><span class="stat-rem">-'+totalRem+'</span>'+(totalMod>0?'<span class="stat-mod">~'+totalMod+'</span>':'');
+    }
     // Render expanded list
     changesList.innerHTML='';
+    // If at original state, show a special "Original" item at the top
+    if(isAtOriginalState||changeHistory.length>0){
+        const origDiv=document.createElement('div');
+        origDiv.className='change-item original-state'+(isAtOriginalState?' current':'');
+        origDiv.innerHTML='<div class="change-files"><div class="change-file-row"><span class="change-file" style="color:#6a9">📄 Original (before AI changes)</span></div></div><div class="change-stats"></div><div class="change-meta"><span>Baseline</span></div>';
+        origDiv.onclick=()=>{if(!isAtOriginalState)vs.postMessage({type:'rewindToOriginalState'});};
+        origDiv.title='Click to revert all files to original state';
+        changesList.appendChild(origDiv);
+    }
     changeHistory.forEach((cs,i)=>{
-        const div=document.createElement('div');div.className='change-item'+(i===currentChangePos?' current':'')+(cs.applied?' applied':' reverted');
+        const div=document.createElement('div');div.className='change-item'+(i===currentChangePos&&!isAtOriginalState?' current':'')+(cs.applied?' applied':' reverted');
         div.dataset.id=cs.id;div.dataset.pos=i;
         // Render each file with a revert button
         const filesHtml=cs.files.map(f=>{
@@ -5063,8 +5143,8 @@ function renderChanges(){
         div.onclick=(e)=>{
             if(e.target.classList.contains('revert-original-btn'))return;
             const pos=parseInt(div.dataset.pos);
-            if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:cs.id});
-            else if(pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:cs.id});
+            if(isAtOriginalState||pos>currentChangePos)vs.postMessage({type:'forwardTo',changeSetId:cs.id});
+            else if(pos<currentChangePos)vs.postMessage({type:'rewindTo',changeSetId:cs.id});
         };
         changesList.appendChild(div);
     });
@@ -5347,7 +5427,7 @@ case'error':if(curDiv){curDiv.classList.add('e');curDiv.classList.remove('p');co
 case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSummary('commands',1);break;
 case'cliSummaryUpdate':updateCliSummary(m);break;
-case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;renderChanges();break;
+case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;isAtOriginalState=m.isAtOriginal||false;renderChanges();break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
 // Mark next uncompleted todo as done
 const nextIdx=currentTodos.findIndex(t=>!t.completed);
