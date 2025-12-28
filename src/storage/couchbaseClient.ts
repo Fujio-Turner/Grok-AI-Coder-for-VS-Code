@@ -562,7 +562,8 @@ class CapellaDataApiClient implements ICouchbaseClient {
     }
 
     private getQueryPath(): string {
-        return '/v1/_p/query/query/service';
+        // Data API query passthrough endpoint (no /v1 prefix)
+        return '/_p/query/query/service';
     }
 
     private getTimeoutMs(): number {
@@ -772,7 +773,7 @@ class CapellaDataApiClient implements ICouchbaseClient {
                 return { success: true };
             }
 
-            const query = `UPDATE ${fullPath} SET ${setClauses.join(', ')} WHERE META().id = $key`;
+            const query = `UPDATE ${fullPath} USE KEYS $key SET ${setClauses.join(', ')}`;
             
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const params: Record<string, any> = { $key: key };
@@ -1303,10 +1304,29 @@ let clientInstance: ICouchbaseClient | null = null;
 let currentDeploymentMode: string | null = null;
 let currentConnectionMode: string | null = null;
 
+/**
+ * Returns the current Couchbase client instance.
+ * The client maintains a persistent connection (especially for SDK mode).
+ * Only recreates the client if deployment mode changes.
+ */
 export function getCouchbaseClient(): ICouchbaseClient {
+    // Return cached client if available (fast path for normal operations)
+    if (clientInstance) {
+        return clientInstance;
+    }
+    
+    // Only read config when creating a new client
+    return createCouchbaseClient();
+}
+
+/**
+ * Forces a refresh of the client based on current config.
+ * Call this after saving settings to pick up new deployment/credentials.
+ */
+export function refreshCouchbaseClient(): ICouchbaseClient {
     const config = getConfig();
     let deployment = config.couchbaseDeployment;
-    let connectionMode = config.couchbaseConnectionMode || 'rest'; // Default to REST for compatibility
+    let connectionMode = config.couchbaseConnectionMode || 'rest';
     
     // Capella-SDK deployment forces SDK mode
     if (deployment === 'capella-sdk') {
@@ -1317,51 +1337,80 @@ export function getCouchbaseClient(): ICouchbaseClient {
         connectionMode = 'rest';
     }
     
-    // If SDK load already failed, force REST mode and adjust deployment for Capella
+    // If SDK load already failed, force REST mode
     if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
         warn('Couchbase SDK not available, falling back to REST mode');
         connectionMode = 'rest';
-        // If Capella SDK was requested, fall back to Data API
         if (deployment === 'capella-sdk') {
-            warn('Capella SDK not available, falling back to Capella Data API. Please configure the Data API URL.');
+            warn('Capella SDK not available, falling back to Capella Data API.');
             deployment = 'capella-data-api';
         }
     }
     
-    // Recreate client if deployment mode or connection mode changed
-    if (clientInstance && (currentDeploymentMode !== deployment || currentConnectionMode !== connectionMode)) {
+    // Check if mode actually changed
+    if (clientInstance && currentDeploymentMode === deployment && currentConnectionMode === connectionMode) {
+        debug('Couchbase client refresh: no mode change, keeping existing client');
+        return clientInstance;
+    }
+    
+    // Mode changed - disconnect old client and create new one
+    if (clientInstance) {
         info('Couchbase mode changed, recreating client', { 
             fromDeployment: currentDeploymentMode, 
             toDeployment: deployment,
             fromConnection: currentConnectionMode,
             toConnection: connectionMode 
         });
-        // Disconnect SDK client if switching away from it
         if (clientInstance.disconnect) {
             clientInstance.disconnect().catch(err => error('Error disconnecting:', err));
         }
         clientInstance = null;
     }
     
-    if (!clientInstance) {
-        // SDK mode - uses native Couchbase SDK for all operations (self-hosted or capella-sdk)
-        if (connectionMode === 'sdk') {
-            info('Creating Couchbase SDK client', { deployment });
-            clientInstance = new SdkCouchbaseClient();
-        }
-        // Capella Data API - uses REST-based client
-        else if (deployment === 'capella-data-api') {
-            info('Creating Capella Data API client (REST)');
-            clientInstance = new CapellaDataApiClient();
-        } 
-        // Self-hosted REST mode
-        else {
-            info('Creating self-hosted Couchbase client (REST)');
-            clientInstance = new SelfHostedCouchbaseClient();
-        }
-        currentDeploymentMode = deployment;
-        currentConnectionMode = connectionMode;
+    return createCouchbaseClient();
+}
+
+/**
+ * Internal: Creates the appropriate client based on current config.
+ */
+function createCouchbaseClient(): ICouchbaseClient {
+    const config = getConfig();
+    let deployment = config.couchbaseDeployment;
+    let connectionMode = config.couchbaseConnectionMode || 'rest';
+    
+    // Capella-SDK deployment forces SDK mode
+    if (deployment === 'capella-sdk') {
+        connectionMode = 'sdk';
     }
+    // Capella Data API deployment forces REST mode
+    if (deployment === 'capella-data-api') {
+        connectionMode = 'rest';
+    }
+    
+    // If SDK load already failed, force REST mode
+    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
+        warn('Couchbase SDK not available, falling back to REST mode');
+        connectionMode = 'rest';
+        if (deployment === 'capella-sdk') {
+            warn('Capella SDK not available, falling back to Capella Data API.');
+            deployment = 'capella-data-api';
+        }
+    }
+    
+    // Create the appropriate client
+    if (connectionMode === 'sdk') {
+        info('Creating Couchbase SDK client (persistent connection)', { deployment });
+        clientInstance = new SdkCouchbaseClient();
+    } else if (deployment === 'capella-data-api') {
+        info('Creating Capella Data API client (REST)');
+        clientInstance = new CapellaDataApiClient();
+    } else {
+        info('Creating self-hosted Couchbase client (REST)');
+        clientInstance = new SelfHostedCouchbaseClient();
+    }
+    
+    currentDeploymentMode = deployment;
+    currentConnectionMode = connectionMode;
     
     return clientInstance;
 }
