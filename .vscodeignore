@@ -8,6 +8,5 @@ vsc-extension-quickstart.md
 **/.eslintrc.json
 **/*.map
 **/*.ts
-# Exclude most node_modules but include couchbase SDK (native module)
 node_modules/**
-!node_modules/couchbase/**
+tools/**
