@@ -90,6 +90,233 @@ The agent uses a three-pass workflow to intelligently load files before the main
 
 Shows progress: "🧠 Planning..." → "🔍 Searching..." → "✅ Loaded X files"
 
+#### Large File Chunking System
+
+When files exceed 50KB, they are automatically split into smaller chunks to prevent API token limit issues and response truncation.
+
+```mermaid
+flowchart TD
+    A[Load File] --> B{Size > 50KB?}
+    B -->|No| C[Send full file to API]
+    B -->|Yes| D[Split into ~30KB chunks]
+    D --> E[Send Chunk 1]
+    E --> F[AI processes chunk]
+    F --> G{More chunks?}
+    G -->|Yes, Auto mode| H[Auto-continue after 1.5s]
+    H --> I[Inject next chunk]
+    I --> F
+    G -->|Yes, Manual mode| J[Show 'Continue' button]
+    J --> K[User clicks continue]
+    K --> I
+    G -->|No| L[Complete]
+    
+    style D fill:#7c3aed,stroke:#fff,color:#fff
+    style H fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+**Chunking Strategy:**
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| Chunk Threshold | 50KB | Files larger than this are chunked |
+| Chunk Size | ~30KB | Target size per chunk (leaves room for prompt + response) |
+| Overlap Lines | 20 | Lines repeated between chunks for context continuity |
+
+**Intelligent Boundary Detection:**
+
+The chunker prefers splitting at logical code boundaries rather than arbitrary line counts:
+
+- **Python**: `def`, `class`, `async def`, decorators (`@`)
+- **JavaScript/TypeScript**: `function`, `class`, `interface`, `type`, `const =`
+- **JSON**: Object/array property starts
+- **HTML**: Block elements (`<div>`, `<section>`, etc.)
+
+**Chunk Flow Example (79KB file → 3 chunks):**
+
+```
+1. File loaded: error_dashboard.py (79KB, 2100 lines)
+2. Split into 3 chunks:
+   - Chunk 1: lines 1-750 (~28KB)
+   - Chunk 2: lines 730-1450 (~27KB)  ← 20 line overlap
+   - Chunk 3: lines 1430-2100 (~24KB)
+3. Chunk 1 sent to API with summary:
+   📦 LARGE FILE CHUNKING ACTIVE: 3 chunks, 2100 lines
+4. AI processes chunk 1, returns file changes
+5. If autoApply=true: Auto-continues with chunk 2
+   If autoApply=false: User clicks "Continue to chunk 2"
+6. Repeat until all chunks processed
+```
+
+**Key Files:**
+- `src/agent/fileChunker.ts` - Chunking logic and boundary detection
+- `src/agent/agentOrchestrator.ts` - `buildAugmentedMessage()`, `getNextChunk()`
+- `src/views/ChatViewProvider.ts` - `_pendingChunks`, `_checkAutoContinue()`
+
+**Context Preservation Between Chunks:**
+
+The chunking system maintains context so the AI doesn't "forget" what it learned from previous chunks:
+
+```typescript
+interface ChunkProcessingContext {
+    extractedChanges: { path: string; description: string }[];  // Files created/modified
+    previousSummaries: string[];  // What AI did in each chunk
+    currentChunkNumber: number;
+    totalChunks: number;
+}
+```
+
+When continuing to the next chunk, the context is injected:
+
+```
+📋 CONTEXT FROM PREVIOUS CHUNKS (DO NOT RE-REQUEST THIS DATA):
+- Chunk 1: Extracted CSS styles into static/css/dashboard.css
+- Chunk 2: Extracted JavaScript functions, created static/js/dashboard.js
+
+Already planned/extracted:
+- static/css/dashboard.css: Created/Updated
+- static/js/dashboard.js: Created/Updated
+
+Continue from where you left off. Build on the work done in previous chunks.
+```
+
+**Auto-Continue Behavior:**
+
+When `autoApply` is enabled (default), chunk processing is fully automatic:
+
+```typescript
+// In _checkAutoContinue()
+if (this._pendingChunks && Object.keys(this._pendingChunks).length > 0) {
+    // Wait 1.5s for UI update, then auto-send next chunk
+    setTimeout(async () => {
+        await this.sendMessage('continue with next chunk');
+    }, 1500);
+}
+```
+
+User sees: `🔄 Auto-continuing with remaining 2 chunk(s)...`
+
+#### Local Analysis Mode (Alternative to Chunking)
+
+For even more efficiency, the AI can request **local analysis** instead of loading large files. This uses your local compute (grep, python, etc.) instead of API tokens.
+
+```mermaid
+flowchart LR
+    A[Large File Detected] --> B{Analysis Strategy}
+    B -->|Chunking| C[Split & Send Chunks]
+    B -->|Local Analysis| D[AI requests grep/analyze]
+    D --> E[Run locally]
+    E --> F[Return line numbers/structure]
+    F --> G[AI requests specific extract]
+    G --> H[Extract lines locally]
+    H --> I[AI makes targeted changes]
+    
+    style D fill:#7c3aed,stroke:#fff,color:#fff
+    style E fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+**New Action Types:**
+
+| Action | Purpose | Example |
+|--------|---------|---------|
+| `analyze` | Run local command (grep, awk, python -c) | Find where HTML starts in a Python file |
+| `extract` | Get specific line range | Extract lines 100-300 to a new file |
+
+**Example Workflow for 79KB Python file with embedded HTML:**
+
+```json
+{
+  "actions": [
+    {"type": "analyze", "command": "grep -n 'DASHBOARD_HTML' tools/error_dashboard.py", "reason": "Find HTML start"},
+    {"type": "analyze", "command": "grep -n '</html>' tools/error_dashboard.py", "reason": "Find HTML end"},
+    {"type": "extract", "sourceFile": "tools/error_dashboard.py", "startLine": 150, "endLine": 800, "destinationFile": "templates/dashboard.html", "reason": "Extract HTML"}
+  ]
+}
+```
+
+**Security - Whitelisted Commands (auto-execute):**
+- `grep`, `egrep`, `fgrep` - Pattern searching
+- `head`, `tail` - Line extraction
+- `wc` - Counting
+- `awk`, `sed -n`, `cut` - Text processing
+- `python -c`, `python3 -c` - Python one-liners
+
+**Non-whitelisted commands** trigger a user approval dialog:
+- "Run Once" - Execute this time only
+- "Add to Whitelist & Run" - Add command prefix to whitelist
+- "Skip" - Don't run
+
+**Key Files:**
+- `src/agent/actionTypes.ts` - `AnalyzeAction`, `ExtractAction` interfaces
+- `src/agent/agentOrchestrator.ts` - `executeLocalCommand()`, `extractFileLines()`
+- `config/planning-prompt.json` - AI instructions for using local analysis
+- `config/planning-schema.json` - Schema with new action types
+
+#### File Awareness System (Metadata-First Approach)
+
+Instead of auto-loading or auto-chunking large files (which can fail or waste tokens), the **file awareness** system gives AI metadata about large files and lets it choose how to access content.
+
+```mermaid
+flowchart TD
+    A[File Found >50KB] --> B[Collect Metadata]
+    B --> C[Extract Structure Hints]
+    C --> D[Send to AI: Size, Lines, Preview, Functions]
+    D --> E{AI Chooses}
+    E -->|Chunk it| F[Load full file in chunks]
+    E -->|Analyze it| G[Run grep/python command]
+    E -->|Extract lines| H[Get specific line range]
+    
+    style B fill:#7c3aed,stroke:#fff,color:#fff
+    style E fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+**What AI Sees (Metadata):**
+
+```
+📦 LARGE FILES DETECTED (Metadata Only - Request Content to Access):
+⚠️ These files exceed 50KB. You have metadata + preview, NOT full content.
+
+### 📄 tools/error_dashboard.py
+| Property | Value |
+|----------|-------|
+| Size | 79.2KB (2100 lines) |
+| Language | py |
+| MD5 Hash | 9a906fd5909d29c5f1d228db1eaa90c4 |
+| Functions | create_app, get_sessions, format_bug, render_dashboard... |
+
+**Preview (first 30 lines):**
+[code preview here]
+
+**To access this file's content, respond with nextSteps:**
+// Option 1: Chunk the entire file to me
+{"nextSteps": [{"html": "Load error_dashboard.py in chunks", "inputText": "request_content:chunk:tools/error_dashboard.py"}]}
+
+// Option 2: Run a local command to analyze
+{"nextSteps": [{"html": "Analyze error_dashboard.py", "inputText": "request_content:analyze:tools/error_dashboard.py:grep -n 'DASHBOARD_HTML' tools/error_dashboard.py"}]}
+
+// Option 3: Extract specific line range
+{"nextSteps": [{"html": "Extract lines 100-200", "inputText": "request_content:extract:tools/error_dashboard.py:100:200"}]}
+```
+
+**New Action Type: `request_content`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filePath` | string | Path to the large file |
+| `deliveryMethod` | enum | `chunk`, `analyze`, or `extract` |
+| `command` | string | For `analyze`: the command to run |
+| `startLine` | number | For `extract`: start line (1-indexed) |
+| `endLine` | number | For `extract`: end line (1-indexed) |
+
+**Persistence:**
+
+Large file metadata is stored in `session.pendingLargeFiles[]` so it persists across conversation turns. When AI requests content, the entry is marked with `contentRequested: true`.
+
+**Key Files:**
+- `src/agent/actionTypes.ts` - `FileMetadata`, `RequestContentAction` interfaces
+- `src/agent/agentOrchestrator.ts` - `collectFileMetadata()`, `extractStructureHints()`
+- `src/storage/chatSessionRepository.ts` - `storePendingLargeFiles()`, `LargeFileMetadataEntry`
+- `src/views/ChatViewProvider.ts` - Handles `request_content:*` messages
+
 ### 4. **Main API Call**
 - Builds messages array (system prompt + history + user message)
 - Calls `sendChatCompletion()` with streaming
@@ -673,6 +900,56 @@ flowchart TD
 | `create` | User applies new file | File now exists |
 | `delete` | User deletes file | File no longer exists |
 
+### Batch File Operations
+
+When the agent loads multiple files, they are tracked atomically using `appendPairFileOperationsBatch()` to prevent race conditions.
+
+**Problem Solved:**
+
+Previously, each file was tracked with a separate `appendPairFileOperation()` call. Each call performed a get-modify-replace on the session document. When loading multiple files (e.g., 5 files in one agent workflow), concurrent updates could cause some files to fail silently:
+
+```
+File 1: GET session → MODIFY → REPLACE ✓
+File 2: GET session (stale) → MODIFY → REPLACE ✗ (conflict)
+File 3: GET session → MODIFY → REPLACE ✓
+```
+
+This caused a mismatch where `fileRegistry` showed all files as "seen" but `pairFileHistory` was missing some files. The AI would then hallucinate content for files it never actually received.
+
+**Solution:**
+
+```typescript
+// Before: Sequential (race-prone)
+for (const file of filesLoaded) {
+    await appendPairFileOperation(sessionId, pairIndex, {...});  // ❌ Each is separate DB op
+}
+
+// After: Batch (atomic)
+const fileOps = filesLoaded.map(file => ({
+    file: file.path,
+    md5: file.md5Hash,
+    op: 'read',
+    size: file.content.length,
+    by: 'auto'
+}));
+await appendPairFileOperationsBatch(sessionId, pairIndex, fileOps);  // ✓ Single DB op
+```
+
+**API:**
+
+```typescript
+// chatSessionRepository.ts
+export async function appendPairFileOperationsBatch(
+    sessionId: string,
+    pairIndex: number,
+    operations: Array<Omit<PairFileOperation, 'dt'>>
+): Promise<PairFileOperation[]>
+```
+
+**When Used:**
+- Agent workflow loads multiple files from workspace
+- All files get the same timestamp for consistent ordering
+
 **System Prompt Injection:**
 
 The file history is summarized and injected into the system prompt:
@@ -811,6 +1088,115 @@ This prevents confusion when users try to rollback changes that were blocked by 
   }
 }
 ```
+
+### Line-Level Revision Tracking (New)
+
+In addition to the change set history, every file change now creates a **file revision** document in Couchbase that tracks line-level changes for precise rollback.
+
+```mermaid
+flowchart TD
+    A[File Change Applied] --> B[computeLineDiff]
+    B --> C[Track: insert/delete/replace per line]
+    C --> D[Store FileRevisionDocument]
+    D --> E[Update FileRevisionIndex]
+    E --> F[Revision chain: 1 → 2 → 3 → ...]
+    
+    G[Rollback Request] --> H{Select revision}
+    H --> I[restoreFromRevision]
+    I --> J[Decompress snapshot]
+    J --> K[Write to disk]
+    
+    style D fill:#7c3aed,stroke:#fff,color:#fff
+    style I fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+```
+
+**Revision Document Schema:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `revisionNumber` | number | Sequential (1, 2, 3...) |
+| `md5Before` | string | Hash before change |
+| `md5After` | string | Hash after change |
+| `changes` | LineChange[] | Per-line changes |
+| `changeStats` | object | `{linesAdded, linesDeleted, linesModified}` |
+| `contentSnapshotBefore` | string | Gzipped base64 content (if <100KB) |
+| `contentSnapshotAfter` | string | Gzipped base64 content (if <100KB) |
+| `sessionId` | string | Which session made the change |
+| `pairIndex` | number | Which conversation turn |
+
+**LineChange Types:**
+
+```typescript
+type LineChangeType = 'insert' | 'delete' | 'replace' | 'unchanged';
+
+interface LineChange {
+    type: LineChangeType;
+    lineNumber: number;       // 1-indexed
+    oldContent?: string;      // For delete/replace
+    newContent?: string;      // For insert/replace
+}
+```
+
+**Example Revision Document (Couchbase):**
+
+```json
+{
+  "id": "file-rev::a1b2c3d4e5f6::3",
+  "docType": "file-revision",
+  "filePath": "src/utils/helper.ts",
+  "revisionNumber": 3,
+  "previousRevisionId": "file-rev::a1b2c3d4e5f6::2",
+  "md5Before": "abc123...",
+  "md5After": "def456...",
+  "lineCountBefore": 150,
+  "lineCountAfter": 165,
+  "changes": [
+    { "type": "insert", "lineNumber": 45, "newContent": "    const result = processData();" },
+    { "type": "replace", "lineNumber": 52, "oldContent": "return null;", "newContent": "return result;" },
+    { "type": "delete", "lineNumber": 60, "oldContent": "// TODO: remove this" }
+  ],
+  "changeStats": { "linesAdded": 10, "linesDeleted": 5, "linesModified": 3 },
+  "changeSource": "ai",
+  "sessionId": "session-uuid",
+  "pairIndex": 5,
+  "createdAt": "2025-12-29T12:00:00.000Z"
+}
+```
+
+**Revision Index (Quick Lookup):**
+
+Each file has a `file-rev-index::` document that lists all revisions for fast navigation:
+
+```json
+{
+  "id": "file-rev-index::a1b2c3d4e5f6",
+  "docType": "file-revision-index",
+  "filePath": "src/utils/helper.ts",
+  "currentRevision": 3,
+  "revisions": [
+    { "revisionNumber": 1, "revisionId": "file-rev::a1b2c3d4e5f6::1", "md5After": "...", "createdAt": "..." },
+    { "revisionNumber": 2, "revisionId": "file-rev::a1b2c3d4e5f6::2", "md5After": "...", "createdAt": "..." },
+    { "revisionNumber": 3, "revisionId": "file-rev::a1b2c3d4e5f6::3", "md5After": "...", "createdAt": "..." }
+  ],
+  "firstSeenAt": "2025-12-29T10:00:00.000Z",
+  "lastModifiedAt": "2025-12-29T12:00:00.000Z"
+}
+```
+
+**Rollback API:**
+
+```typescript
+// Get all revisions for a file
+const revisions = await getFileRevisions('/abs/path/to/file.ts');
+
+// Rollback to a specific revision (before that change was applied)
+const result = await rollbackFileToRevision('/abs/path/to/file.ts', 2, 'before');
+```
+
+**Key Files:**
+- `src/storage/chatSessionRepository.ts` - `FileRevisionDocument`, `storeFileRevision()`, `rollbackFileToRevision()`
+- `src/edits/codeActions.ts` - Calls `storeFileRevision()` after applying changes
+- `src/edits/changeTracker.ts` - In-memory change history (fast rollback)
 
 ---
 
@@ -2343,6 +2729,284 @@ These files were modified since you last saw them. Request re-attachment before 
 - **Stale file detection**: Files needing refresh are highlighted
 - **Reduced hallucination**: Completed work is explicitly listed
 - **Efficient tokens**: Only injected on "continue", not every turn
+
+---
+
+## Context File Auto-Attachment on Continue
+
+When the user sends a "continue" message, the system automatically re-attaches files from the session's file registry. This prevents the AI from losing context and asking for files it already had.
+
+### How It Works
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Continue Detection"]
+        A[User sends 'continue'] --> B{Is continue message?}
+        B -->|Yes| C[Get session from Couchbase]
+    end
+    
+    subgraph FileGathering["📂 File Gathering"]
+        C --> D[Get modified files from ChangeTracker]
+        C --> E[Get working files from fileRegistry]
+        D --> F[Combine: modified + working files]
+        E --> F
+        F --> G{Any files to attach?}
+    end
+    
+    subgraph Attachment["📎 Auto-Attachment"]
+        G -->|Yes| H[Read up to 5 files from disk]
+        H --> I[Compute fresh MD5 hashes]
+        I --> J[Append to message text]
+        J --> K[Track file read in pairFileHistory]
+        K --> L[Show 'Attached X context files' message]
+    end
+    
+    G -->|No| M[Proceed without attachment]
+    L --> N[Send to AI with file context]
+    M --> N
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style FileGathering fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Attachment fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### File Sources
+
+| Source | Description | Priority |
+|--------|-------------|----------|
+| **Modified files** | Files changed in this session (from ChangeTracker) | High - attached first |
+| **Working files** | Files in fileRegistry seen in last 3 turns | Lower - fills remaining slots |
+
+### Threshold Logic
+
+```typescript
+// For early turns (1-3), include all files from session
+const recentThreshold = currentTurn <= 3 ? 0 : currentTurn - 3;
+
+// Files with lastSeenTurn >= threshold are included
+for (const [path, entry] of Object.entries(session.fileRegistry)) {
+    if (entry.lastSeenTurn >= recentThreshold && !modifiedFiles.includes(path)) {
+        workingFiles.push(path);
+    }
+}
+```
+
+### Limits
+
+- Maximum 5 files auto-attached (to avoid token explosion)
+- Modified files are prioritized over working files
+- Each file includes fresh MD5 hash for verification
+
+### Debug Output
+
+```
+[DEBUG] Continue message: found 0 modified files in tracker: []
+[DEBUG] Continue message: found 2 working files from fileRegistry (threshold: 0): [
+  "/path/to/error_dashboard.py",
+  "/path/to/config.json"
+]
+```
+
+---
+
+## Execution Mode (Auto vs Manual)
+
+The extension supports two execution modes that control how the AI proceeds through multi-step tasks:
+
+### Mode Detection
+
+The execution mode is injected into every system prompt so the AI knows how to behave:
+
+```mermaid
+flowchart TD
+    A[User sends message] --> B[_buildMessages called]
+    B --> C[Read grok.autoApply setting]
+    C --> D{autoApply enabled?}
+    D -->|true| E[Inject AUTO mode instruction]
+    D -->|false| F[Inject MANUAL mode instruction]
+    E --> G[AI sees: Mode AUTO - complete all todos]
+    F --> H[AI sees: Mode MANUAL - stop after each step]
+```
+
+### Mode Descriptions
+
+| Mode | Setting | AI Behavior |
+|------|---------|-------------|
+| **AUTO (A)** | `autoApply: true` | Complete ALL todos in single response. Do NOT stop to ask user to "continue". Changes auto-applied. |
+| **MANUAL (M)** | `autoApply: false` | Stop after each fileChange/command. Include `nextSteps` with "continue" so user can review before proceeding. |
+
+### System Prompt Injection
+
+**AUTO Mode:**
+```markdown
+## ⚙️ EXECUTION MODE
+
+**Mode: AUTO (A)** - Complete ALL todos in a single response. Do NOT stop to ask user to "continue". User has auto-apply enabled, so changes will be applied automatically.
+- Auto-apply files: ON
+- Auto-apply CLI: OFF
+```
+
+**MANUAL Mode:**
+```markdown
+## ⚙️ EXECUTION MODE
+
+**Mode: MANUAL (M)** - User prefers step-by-step control. After each fileChange or command, include nextSteps with "continue" so user can review and approve before proceeding to the next step.
+- Auto-apply files: OFF
+- Auto-apply CLI: OFF
+```
+
+### When AI Should Always Stop
+
+Regardless of mode, the AI should stop and use `nextSteps` when:
+- It needs a file that's NOT in context (ask user to attach)
+- It needs user clarification on requirements
+- It needs user to run a command and report results
+- Response would be very large (5+ files, 500+ lines) - batch to prevent truncation
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.autoApply` | `true` | Master switch for auto mode |
+| `grok.autoApplyFiles` | `true` | Auto-apply file changes |
+| `grok.autoApplyCli` | `false` | Auto-execute CLI commands |
+
+### Example Responses
+
+**AUTO Mode Response (all todos complete):**
+```json
+{
+  "summary": "Completed all 3 steps.",
+  "todos": [
+    {"text": "Create config", "completed": true},
+    {"text": "Update script", "completed": true},
+    {"text": "Add dropdown", "completed": true}
+  ],
+  "fileChanges": [
+    {"path": "config.json", "todoIndex": 0, ...},
+    {"path": "script.py", "todoIndex": 1, ...},
+    {"path": "index.html", "todoIndex": 2, ...}
+  ]
+}
+```
+Notice: NO `nextSteps` - task is complete!
+
+**MANUAL Mode Response (one step at a time):**
+```json
+{
+  "summary": "Created config file (step 1 of 3).",
+  "todos": [
+    {"text": "Create config", "completed": false},
+    {"text": "Update script", "completed": false},
+    {"text": "Add dropdown", "completed": false}
+  ],
+  "fileChanges": [
+    {"path": "config.json", "todoIndex": 0, ...}
+  ],
+  "nextSteps": [
+    {"html": "Continue to next step", "inputText": "continue"}
+  ]
+}
+```
+
+---
+
+## Large File Batching (Auto-Continue)
+
+When modifying large files (1000+ lines or 50KB+), the AI batches changes across multiple responses to prevent truncation. In AUTO mode, the system automatically continues until all TODOs are complete.
+
+### How It Works
+
+```mermaid
+flowchart TD
+    subgraph Detection["🔍 Large File Detection"]
+        A[Agent loads files] --> B{Any file > 50KB<br/>or > 1000 lines?}
+        B -->|Yes| C[Show notification to user]
+        C --> D[📄 Processing Large file\n   script.py 78KB, 1549 lines]
+    end
+    
+    subgraph Batching["📦 AI Batching"]
+        D --> E[AI sees large file warning in prompt]
+        E --> F[AI completes 1-2 TODOs per response]
+        F --> G[Response includes partial TODOs]
+    end
+    
+    subgraph AutoContinue["🔄 Auto-Continue"]
+        G --> H{Pending TODOs<br/>remaining?}
+        H -->|Yes| I[Auto-apply changes]
+        I --> J[Auto-send 'continue']
+        J --> K[Fresh file content attached]
+        K --> F
+        H -->|No| L[Task complete!]
+    end
+    
+    style Detection fill:#1a2a3a,stroke:#4ec9b0,color:#fff
+    style Batching fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style AutoContinue fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### Thresholds
+
+| Metric | Threshold | Behavior |
+|--------|-----------|----------|
+| File size | 50KB+ | Show warning, AI batches changes |
+| Line count | 1000+ | Show warning, AI batches changes |
+| lineOperations | ~20-30 per response | AI limits to prevent truncation |
+
+### User Notification
+
+When large files are detected:
+```
+⚠️ Processing Large file(s) - changes will be batched:
+   📄 error_dashboard.py (78.9KB, 1549 lines)
+   📄 config.json (156B, 10 lines)
+✅ Loaded 2 file(s)
+```
+
+### Auto-Continue Flow
+
+In AUTO mode (`grok.autoApply: true`):
+
+1. **AI Response with partial completion:**
+```json
+{
+  "todos": [
+    {"text": "Remove hardcoded config", "completed": true},
+    {"text": "Add config loading", "completed": true},
+    {"text": "Update query function", "completed": false},
+    {"text": "Add API endpoint", "completed": false}
+  ],
+  "fileChanges": [/* only changes for TODO 0-1 */]
+}
+```
+
+2. **System detects incomplete TODOs:**
+```
+🔄 Auto-continuing with remaining 2 TODO(s)...
+```
+
+3. **System automatically:**
+   - Applies pending edits (1.5s delay for UI)
+   - Sends "continue" message
+   - Fresh file content auto-attached
+   - AI continues with remaining TODOs
+
+### Code Reference
+
+| Component | Location |
+|-----------|----------|
+| Large file detection | `ChatViewProvider.ts` (after agent workflow) |
+| User notification | `updateResponseChunk` with file list |
+| Auto-continue logic | `_checkAutoContinue()` method |
+| System prompt guidance | `config/system-prompt.json` (MULTI-STEP section) |
+
+### Configuration
+
+Auto-continue requires:
+- `grok.autoApply: true` (AUTO mode enabled)
+- `grok.autoApplyFiles: true` (auto-apply file changes)
+
+In MANUAL mode, the user sees the partial completion and must click "continue" manually.
 
 ---
 

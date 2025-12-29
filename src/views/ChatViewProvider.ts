@@ -39,6 +39,7 @@ import {
     createSessionExtension,
     // File history tracking
     appendPairFileOperation,
+    appendPairFileOperationsBatch,
     getAllPairFileHistory,
     buildFileHistorySummary,
     PairFileOperation,
@@ -65,7 +66,17 @@ import {
     buildSubTasksSummary,
     SubTaskRegistryData,
     SubTaskData,
-    SubTaskStatus
+    SubTaskStatus,
+    // Large file awareness
+    storePendingLargeFiles,
+    getPendingLargeFiles,
+    buildLargeFilesSummary,
+    LargeFileMetadataEntry,
+    // Analysis results cache
+    storeAnalysisResult,
+    getAnalysisResults,
+    buildAnalysisResultsSummary,
+    AnalysisResult
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -114,6 +125,7 @@ import { fetchUrl } from '../agent/httpFetcher';
 import { generateImages, detectImageGenerationRequest, generateImagePrompts, createImageId, GeneratedImage } from '../api/imageGenClient';
 import { bundleRelatedFiles, BundledFile } from '../utils/importAnalyzer';
 import { isContinueMessage, buildMemoryBlock } from '../utils/memoryBuilder';
+import { PendingChunks, getNextChunk, ChunkProcessingContext } from '../agent/agentOrchestrator';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -124,6 +136,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _isRequestInProgress = false;
     private _modelInfoCache: Map<string, GrokModelInfo> = new Map();
     private _extensionVersion: string;
+    /** Pending chunks for large file processing */
+    private _pendingChunks?: PendingChunks;
+    /** Context accumulated from processing previous chunks */
+    private _chunkContext?: ChunkProcessingContext;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -1880,6 +1896,170 @@ ${cliSummary}
             // Auto-attach modified files on "continue" messages
             // This ensures AI has current file state for accurate diffs
             let finalMessageText = messageText;
+            
+            // Handle request_content: special messages from file awareness system
+            // Format: request_content:<method>:<path>[:optional_args]
+            // These messages actually load file content - not just convert to natural language
+            const requestContentMatch = messageText.match(/^request_content:(chunk|analyze|extract):(.+)$/);
+            let requestContentHandled = false;
+            if (requestContentMatch) {
+                const [, method, rest] = requestContentMatch;
+                const parts = rest.split(':');
+                const filePath = parts[0];
+                
+                this._postMessage({ 
+                    type: 'updateResponseChunk', 
+                    pairIndex, 
+                    deltaText: `📥 Processing content request: ${method} for ${filePath}\n` 
+                });
+                
+                if (method === 'chunk') {
+                    // Actually load the file content
+                    try {
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        const fullPath = filePath.startsWith('/') ? filePath : `${workspaceRoot}/${filePath}`;
+                        const uri = vscode.Uri.file(fullPath);
+                        const fileContent = await vscode.workspace.fs.readFile(uri);
+                        const content = Buffer.from(fileContent).toString('utf-8');
+                        const lineCount = content.split('\n').length;
+                        const sizeKB = (content.length / 1024).toFixed(1);
+                        
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `✅ Loaded ${filePath} (${sizeKB}KB, ${lineCount} lines)\n\n`
+                        });
+                        
+                        // Add line numbers and include in message
+                        const numberedContent = addLineNumbers(content);
+                        finalMessageText = `Here is the full content of ${filePath} with line numbers. Please analyze and process it:\n\n\`\`\`python\n${numberedContent}\n\`\`\`\n\nOriginal request: ${messageText}`;
+                        
+                        // Update contextFiles
+                        if (this._currentSessionId) {
+                            await updateLastPairContextFiles(this._currentSessionId, [filePath]);
+                        }
+                        
+                        info(`Content request: chunk - loaded ${filePath} (${sizeKB}KB)`);
+                        requestContentHandled = true;
+                    } catch (loadErr: any) {
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `❌ Failed to load ${filePath}: ${loadErr.message}\n\n`
+                        });
+                        finalMessageText = `Failed to load ${filePath}: ${loadErr.message}. Please check the file path.`;
+                    }
+                } else if (method === 'analyze') {
+                    // Run the specified command and store results in analysis cache
+                    const command = parts.slice(1).join(':'); // Rest is the command
+                    try {
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        const { exec } = require('child_process');
+                        const util = require('util');
+                        const execAsync = util.promisify(exec);
+                        const crypto = require('crypto');
+                        
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `🔬 Running: ${command}\n`
+                        });
+                        
+                        const startTime = Date.now();
+                        const { stdout, stderr } = await execAsync(command, { 
+                            cwd: workspaceRoot,
+                            timeout: 30000,
+                            maxBuffer: 1024 * 1024 // 1MB
+                        });
+                        const durationMs = Date.now() - startTime;
+                        
+                        const output = stdout || stderr || '(no output)';
+                        const outputLines = output.split('\n').length;
+                        const truncated = output.length > 10000;
+                        const truncatedOutput = truncated ? output.slice(0, 10000) : output;
+                        
+                        // Compute MD5 hash of the file for change detection
+                        let md5Hash = 'unknown';
+                        try {
+                            const fullPath = filePath.startsWith('/') ? filePath : `${workspaceRoot}/${filePath}`;
+                            const uri = vscode.Uri.file(fullPath);
+                            const fileContent = await vscode.workspace.fs.readFile(uri);
+                            md5Hash = crypto.createHash('md5').update(fileContent).digest('hex');
+                        } catch { /* file might not exist or be accessible */ }
+                        
+                        // Store analysis result in session cache
+                        if (this._currentSessionId) {
+                            try {
+                                await storeAnalysisResult(this._currentSessionId, {
+                                    command,
+                                    filePath,
+                                    output: truncatedOutput,
+                                    outputLines,
+                                    truncated,
+                                    md5Hash,
+                                    pairIndex,
+                                    exitCode: 0,
+                                    durationMs
+                                });
+                                debug('Stored analysis result in cache');
+                            } catch (storeErr) {
+                                debug('Failed to store analysis result:', storeErr);
+                            }
+                        }
+                        
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `✅ Analysis complete (${outputLines} lines, MD5: ${md5Hash.slice(0, 8)}...)\n\n`
+                        });
+                        
+                        finalMessageText = `Analysis results for "${command}" (file MD5: ${md5Hash}):\n\n\`\`\`\n${truncatedOutput}\n\`\`\`\n\nBased on this analysis, please continue with the refactoring.`;
+                        info(`Content request: analyze - ran command, got ${output.length} chars, MD5: ${md5Hash}`);
+                        requestContentHandled = true;
+                    } catch (cmdErr: any) {
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `❌ Command failed: ${cmdErr.message}\n\n`
+                        });
+                        finalMessageText = `Analysis command failed: ${cmdErr.message}`;
+                    }
+                } else if (method === 'extract') {
+                    // Extract specific lines from file
+                    const startLine = parseInt(parts[1], 10) || 1;
+                    const endLine = parseInt(parts[2], 10) || 100;
+                    try {
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        const fullPath = filePath.startsWith('/') ? filePath : `${workspaceRoot}/${filePath}`;
+                        const uri = vscode.Uri.file(fullPath);
+                        const fileContent = await vscode.workspace.fs.readFile(uri);
+                        const content = Buffer.from(fileContent).toString('utf-8');
+                        const lines = content.split('\n');
+                        
+                        // Extract the requested range (1-indexed)
+                        const extracted = lines.slice(startLine - 1, endLine);
+                        const numberedExtract = extracted.map((line, i) => `${startLine + i}: ${line}`).join('\n');
+                        
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `✅ Extracted lines ${startLine}-${endLine} from ${filePath}\n\n`
+                        });
+                        
+                        finalMessageText = `Extracted lines ${startLine}-${endLine} from ${filePath}:\n\n\`\`\`python\n${numberedExtract}\n\`\`\`\n\nPlease continue with the analysis.`;
+                        info(`Content request: extract lines ${startLine}-${endLine} from ${filePath}`);
+                        requestContentHandled = true;
+                    } catch (extractErr: any) {
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `❌ Failed to extract: ${extractErr.message}\n\n`
+                        });
+                        finalMessageText = `Failed to extract lines: ${extractErr.message}`;
+                    }
+                }
+            }
+            
             const isContinueMessage = /^continue/i.test(messageText.trim());
             if (isContinueMessage && this._currentSessionId) {
                 try {
@@ -1946,14 +2126,33 @@ ${cliSummary}
                         }
                     }
                     
-                    if (modifiedFiles.length > 0) {
-                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔄 Auto-attaching modified files for context...\n' });
+                    // Also include working files from fileRegistry (files loaded but not modified)
+                    // This ensures AI has context for files it was working with in previous turns
+                    let workingFiles: string[] = [];
+                    if (session && session.fileRegistry) {
+                        const currentTurn = session.pairs.length;
+                        // Use 0 as threshold for early turns (turns 0-3), otherwise go back 3 turns
+                        // lastSeenTurn is 0-indexed (0 = first pair), so we need >= 0 to include first-turn files
+                        const recentThreshold = currentTurn <= 3 ? 0 : currentTurn - 3;
+                        for (const [path, entry] of Object.entries(session.fileRegistry)) {
+                            if (entry.lastSeenTurn >= recentThreshold && !modifiedFiles.includes(path)) {
+                                workingFiles.push(path);
+                            }
+                        }
+                        debug(`Continue message: found ${workingFiles.length} working files from fileRegistry (threshold: ${recentThreshold}):`, workingFiles);
+                    }
+                    
+                    // Combine modified + working files, prioritizing modified
+                    const allFilesToAttach = [...modifiedFiles, ...workingFiles];
+                    
+                    if (allFilesToAttach.length > 0) {
+                        this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔄 Auto-attaching context files for continuation...\n' });
                         
                         const fileContents: string[] = [];
                         const attachedNames: string[] = [];
                         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
                         
-                        for (const filePath of modifiedFiles.slice(0, 5)) { // Limit to 5 most recent
+                        for (const filePath of allFilesToAttach.slice(0, 5)) { // Limit to 5 files
                             try {
                                 const content = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
                                 const textContent = Buffer.from(content).toString('utf8');
@@ -1986,22 +2185,58 @@ ${cliSummary}
                         }
                         
                         if (fileContents.length > 0) {
-                            finalMessageText = `${messageText}\n\n**Current state of modified files (FRESH READ - use these MD5 hashes in your fileHashes response):**\n${fileContents.join('\n\n')}`;
+                            finalMessageText = `${messageText}\n\n**Current state of context files (FRESH READ - use these MD5 hashes in your fileHashes response):**\n${fileContents.join('\n\n')}`;
                             const fileList = attachedNames.map(f => `   └─ ${f}`).join('\n');
-                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} modified file(s)\n${fileList}\n\n` });
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `✅ Attached ${fileContents.length} context file(s)\n${fileList}\n\n` });
                         }
                     }
                 } catch (attachErr) {
                     debug('Auto-attach error (continuing):', attachErr);
                 }
+                
+                // Check if this is a chunk continuation request
+                const isChunkContinue = /continue.*chunk|next chunk/i.test(messageText.trim());
+                if (isChunkContinue && this._pendingChunks && Object.keys(this._pendingChunks).length > 0) {
+                    // Pass context from previous chunks so AI knows what was already done
+                    const chunkResult = getNextChunk(this._pendingChunks, this._chunkContext);
+                    if (chunkResult.currentChunk) {
+                        finalMessageText = messageText + chunkResult.chunkMessage;
+                        this._pendingChunks = chunkResult.updatedPendingChunks;
+                        
+                        // Update context for next iteration
+                        if (chunkResult.updatedContext) {
+                            this._chunkContext = chunkResult.updatedContext;
+                        }
+                        
+                        const remaining = Object.values(this._pendingChunks).reduce((sum, chunks) => sum + chunks.length, 0);
+                        this._postMessage({ 
+                            type: 'updateResponseChunk', 
+                            pairIndex, 
+                            deltaText: `📦 Loading chunk ${chunkResult.currentChunk.chunkIndex + 1}/${chunkResult.currentChunk.totalChunks} ` +
+                                      `(lines ${chunkResult.currentChunk.startLine}-${chunkResult.currentChunk.endLine})\n` +
+                                      (this._chunkContext?.previousSummaries.length ? 
+                                          `   Context: ${this._chunkContext.previousSummaries.length} previous chunk(s) tracked\n` : '') +
+                                      (remaining > 0 ? `   ${remaining} chunk(s) remaining\n\n` : `   ✅ Final chunk!\n\n`)
+                        });
+                        info(`Loaded chunk ${chunkResult.currentChunk.chunkIndex + 1}, ${remaining} chunks remaining, context: ${this._chunkContext?.previousSummaries.length || 0} summaries`);
+                        
+                        // Clear pending chunks if none left
+                        if (Object.keys(this._pendingChunks).length === 0) {
+                            this._pendingChunks = undefined;
+                            this._chunkContext = undefined;
+                            info('All chunks processed, context cleared');
+                        }
+                    }
+                }
             }
 
             // Agent workflow: analyze if files are needed and load them
             // Use Files API if enabled (uploads files to xAI for document_search)
+            // Skip if request_content was already handled (file content already loaded)
             const useFilesApi = config.get<boolean>('useFilesApi', false);
             let filesApiFileIds: string[] = [];
             
-            if (!hasImages && !isContinueMessage) {
+            if (!hasImages && !isContinueMessage && !requestContentHandled) {
                 try {
                     this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '🔍 Analyzing request...\n' });
                     
@@ -2087,11 +2322,36 @@ ${cliSummary}
                         
                         const hasFiles = agentResult.filesLoaded.length > 0;
                         const hasUrls = agentResult.urlsLoaded > 0;
+                        const hasLargeFiles = agentResult.largeFileMetadata && agentResult.largeFileMetadata.length > 0;
                         
-                        if (hasFiles || hasUrls) {
+                        if (hasFiles || hasUrls || hasLargeFiles) {
                             const parts: string[] = [];
                             if (hasFiles) parts.push(`${agentResult.filesLoaded.length} file(s)`);
+                            if (hasLargeFiles) parts.push(`${agentResult.largeFileMetadata!.length} large file(s) [metadata]`);
                             if (hasUrls) parts.push(`${agentResult.urlsLoaded} URL(s)`);
+                            
+                            // Check for large files and notify user
+                            const LARGE_FILE_THRESHOLD = 100 * 1024; // 100KB (increased from 50KB)
+                            const LARGE_LINE_THRESHOLD = 1000; // 1000 lines
+                            const largeFiles = agentResult.filesLoaded.filter(f => 
+                                f.content.length > LARGE_FILE_THRESHOLD || f.lineCount > LARGE_LINE_THRESHOLD
+                            );
+                            
+                            if (largeFiles.length > 0) {
+                                const formatSize = (bytes: number) => {
+                                    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+                                    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+                                    return `${bytes}B`;
+                                };
+                                const largeFileList = largeFiles.map(f => 
+                                    `   📄 ${f.name} (${formatSize(f.content.length)}, ${f.lineCount} lines)`
+                                ).join('\n');
+                                this._postMessage({ 
+                                    type: 'updateResponseChunk', 
+                                    pairIndex, 
+                                    deltaText: `⚠️ Processing Large file(s) - changes will be batched:\n${largeFileList}\n\n` 
+                                });
+                            }
                             
                             this._postMessage({ 
                                 type: 'updateResponseChunk', 
@@ -2108,19 +2368,20 @@ ${cliSummary}
                                     await updateLastPairContextFiles(this._currentSessionId, filePaths);
                                     debug('Saved contextFiles:', filePaths.length);
                                     
-                                    // Also track file reads in pairFileHistory
-                                    for (const file of agentResult.filesLoaded) {
-                                        try {
-                                            await appendPairFileOperation(this._currentSessionId, pairIndex, {
-                                                file: file.path,
-                                                md5: file.md5Hash,
-                                                op: 'read',
-                                                size: file.content.length,
-                                                by: 'auto'
-                                            });
-                                        } catch (trackErr) {
-                                            debug('Failed to track agent file read:', trackErr);
-                                        }
+                                    // Track file reads in pairFileHistory using batch operation
+                                    // This prevents race conditions when multiple files are loaded
+                                    try {
+                                        const fileOps = agentResult.filesLoaded.map(file => ({
+                                            file: file.path,
+                                            md5: file.md5Hash,
+                                            op: 'read' as const,
+                                            size: file.content.length,
+                                            by: 'auto' as const
+                                        }));
+                                        await appendPairFileOperationsBatch(this._currentSessionId, pairIndex, fileOps);
+                                        debug('Tracked', fileOps.length, 'file reads in pairFileHistory');
+                                    } catch (trackErr) {
+                                        debug('Failed to track agent file reads:', trackErr);
                                     }
                                     
                                     // Update file registry with loaded files
@@ -2141,6 +2402,69 @@ ${cliSummary}
                                     }
                                 } catch (err) {
                                     debug('Failed to save contextFiles:', err);
+                                }
+                            }
+                            
+                            // Store pending chunks for large file processing
+                            if (agentResult.pendingChunks && Object.keys(agentResult.pendingChunks).length > 0) {
+                                this._pendingChunks = agentResult.pendingChunks;
+                                const chunkInfo = agentResult.chunkingInfo!;
+                                
+                                // Initialize chunk context for tracking what AI learns from each chunk
+                                this._chunkContext = {
+                                    extractedChanges: [],
+                                    previousSummaries: [],
+                                    currentChunkNumber: 1,
+                                    totalChunks: chunkInfo.totalChunks
+                                };
+                                
+                                this._postMessage({ 
+                                    type: 'updateResponseChunk', 
+                                    pairIndex, 
+                                    deltaText: `📦 Large file chunking active: ${chunkInfo.filesChunked} file(s) split into ${chunkInfo.totalChunks} chunks\n` +
+                                              `   Processing chunk 1 of ${chunkInfo.totalChunks}. Context will be preserved between chunks.\n\n`
+                                });
+                                info(`Stored ${Object.keys(this._pendingChunks).length} files with pending chunks, context initialized`);
+                            }
+                            
+                            // Store large file metadata for file awareness system
+                            if (agentResult.largeFileMetadata && agentResult.largeFileMetadata.length > 0) {
+                                try {
+                                    // Convert FileMetadata to LargeFileMetadataEntry format
+                                    const entries: LargeFileMetadataEntry[] = agentResult.largeFileMetadata.map(meta => ({
+                                        path: meta.path,
+                                        sizeBytes: meta.sizeBytes,
+                                        lineCount: meta.lineCount,
+                                        language: meta.language,
+                                        md5Hash: meta.md5Hash,
+                                        preview: meta.preview,
+                                        structureHints: meta.structureHints,
+                                        reason: meta.reason || 'File exceeds 50KB threshold',
+                                        detectedAt: new Date().toISOString(),
+                                        contentRequested: false
+                                    }));
+                                    
+                                    await storePendingLargeFiles(this._currentSessionId!, entries);
+                                    
+                                    // Show user what large files were detected
+                                    const formatSize = (bytes: number) => {
+                                        if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+                                        if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+                                        return `${bytes}B`;
+                                    };
+                                    const largeFileList = entries.map(f => 
+                                        `   📊 ${f.path} (${formatSize(f.sizeBytes)}, ${f.lineCount} lines)`
+                                    ).join('\n');
+                                    
+                                    this._postMessage({ 
+                                        type: 'updateResponseChunk', 
+                                        pairIndex, 
+                                        deltaText: `📦 Large file(s) detected - metadata only:\n${largeFileList}\n   AI can request content via nextSteps\n\n`
+                                    });
+                                    
+                                    info(`Stored ${entries.length} large file metadata entries for file awareness`);
+                                } catch (metaErr) {
+                                    debug('Failed to store large file metadata:', metaErr);
                                 }
                             }
                         } else if (!agentResult.skipped) {
@@ -2928,6 +3252,25 @@ ${cliSummary}
 
             // Handle sub-task proposals from AI
             await this._handleSubTasks(structured.subTasks, pairIndex);
+
+            // Capture summary for chunk context (if processing chunks)
+            if (this._chunkContext && structured.summary) {
+                this._chunkContext.previousSummaries.push(structured.summary);
+                
+                // Also capture any file changes that were made
+                if (structured.fileChanges && structured.fileChanges.length > 0) {
+                    for (const fc of structured.fileChanges) {
+                        this._chunkContext.extractedChanges.push({
+                            path: fc.path,
+                            description: fc.isDiff ? 'Modified' : 'Created/Updated'
+                        });
+                    }
+                }
+                info(`Chunk context updated: ${this._chunkContext.previousSummaries.length} summaries, ${this._chunkContext.extractedChanges.length} changes`);
+            }
+
+            // Auto-continue for incomplete TODOs in AUTO mode (large file batching)
+            await this._checkAutoContinue(structured, pairIndex);
 
             vscode.window.showInformationMessage('Grok completed the request.');
 
@@ -3991,6 +4334,107 @@ ${cliSummary}
     }
 
     /**
+     * Check if we should auto-continue for incomplete TODOs or pending chunks in AUTO mode.
+     * This enables automatic batching for large file modifications.
+     */
+    private async _checkAutoContinue(
+        structured: any,
+        pairIndex: number
+    ): Promise<void> {
+        // Only auto-continue in AUTO mode
+        const grokConfig = vscode.workspace.getConfiguration('grok');
+        const autoApply = grokConfig.get<boolean>('autoApply', true);
+        
+        if (!autoApply || !this._currentSessionId) {
+            return;
+        }
+
+        // Check for pending chunks (large file processing) - PRIORITY
+        if (this._pendingChunks && Object.keys(this._pendingChunks).length > 0) {
+            const pendingCount = Object.values(this._pendingChunks).reduce((sum, chunks) => sum + chunks.length, 0);
+            info(`Auto-continue: ${pendingCount} chunk(s) pending for large file processing`);
+            
+            // Notify user
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: `\n🔄 Auto-continuing with remaining ${pendingCount} chunk(s)...\n\n`
+            });
+            
+            // Wait a bit for changes to be applied, then auto-continue with chunk
+            setTimeout(async () => {
+                try {
+                    // Auto-apply pending edits first
+                    const autoApplyFiles = grokConfig.get<boolean>('autoApplyFiles', true);
+                    if (autoApplyFiles) {
+                        await this.applyEdits('all');
+                    }
+                    
+                    // Send continue message for next chunk
+                    await this.sendMessage('continue with next chunk');
+                } catch (err: any) {
+                    debug('Auto-continue chunk failed:', err);
+                    this._postMessage({
+                        type: 'updateResponseChunk',
+                        pairIndex,
+                        deltaText: `\n⚠️ Auto-continue failed: ${err.message}. Please type "continue with next chunk" manually.\n`
+                    });
+                }
+            }, 1500); // Wait 1.5s for UI to update and changes to apply
+            return; // Don't also check TODOs
+        }
+
+        // Check if there are incomplete TODOs
+        const todos = structured.todos || [];
+        if (todos.length === 0) {
+            return;
+        }
+
+        const completedCount = todos.filter((t: any) => t.completed).length;
+        const pendingCount = todos.length - completedCount;
+        
+        // If all TODOs are complete, nothing to do
+        if (pendingCount === 0) {
+            return;
+        }
+
+        // If there are file changes but also pending TODOs, this is a batched response
+        const hasFileChanges = structured.fileChanges && structured.fileChanges.length > 0;
+        
+        if (hasFileChanges && pendingCount > 0) {
+            info(`Auto-continue: ${completedCount}/${todos.length} TODOs complete, ${pendingCount} pending`);
+            
+            // Notify user
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: `\n🔄 Auto-continuing with remaining ${pendingCount} TODO(s)...\n\n`
+            });
+            
+            // Wait a bit for changes to be applied, then auto-continue
+            setTimeout(async () => {
+                try {
+                    // Auto-apply pending edits first
+                    const autoApplyFiles = grokConfig.get<boolean>('autoApplyFiles', true);
+                    if (autoApplyFiles) {
+                        await this.applyEdits('all');
+                    }
+                    
+                    // Send continue message
+                    await this.sendMessage('continue');
+                } catch (err: any) {
+                    debug('Auto-continue failed:', err);
+                    this._postMessage({
+                        type: 'updateResponseChunk',
+                        pairIndex,
+                        deltaText: `\n⚠️ Auto-continue failed: ${err.message}. Please type "continue" manually.\n`
+                    });
+                }
+            }, 1500); // Wait 1.5s for UI to update and changes to apply
+        }
+    }
+
+    /**
      * Execute a specific sub-task by ID.
      * Creates a child session and runs the task goal.
      */
@@ -4241,6 +4685,28 @@ ${parentSession.handoffText}`;
                             });
                         }
                     }
+                    
+                    // Inject analysis results cache - previous grep/command results for reference
+                    if (session.analysisResults && session.analysisResults.length > 0) {
+                        const analysisSummary = buildAnalysisResultsSummary(session.analysisResults);
+                        if (analysisSummary) {
+                            systemPrompt += analysisSummary;
+                            debug('Injected analysis results cache', { 
+                                resultCount: session.analysisResults.length 
+                            });
+                        }
+                    }
+                    
+                    // Inject execution mode (Auto vs Manual) so AI knows whether to auto-continue
+                    const grokConfig = vscode.workspace.getConfiguration('grok');
+                    const autoApply = grokConfig.get<boolean>('autoApply', true);
+                    const autoApplyFiles = grokConfig.get<boolean>('autoApplyFiles', true);
+                    const autoApplyCli = grokConfig.get<boolean>('autoApplyCli', false);
+                    const modeDescription = autoApply 
+                        ? `**Mode: AUTO (A)** - Complete ALL todos in a single response. Do NOT stop to ask user to "continue". User has auto-apply enabled, so changes will be applied automatically.`
+                        : `**Mode: MANUAL (M)** - User prefers step-by-step control. After each fileChange or command, include nextSteps with "continue" so user can review and approve before proceeding to the next step.`;
+                    systemPrompt += `\n\n## ⚙️ EXECUTION MODE\n\n${modeDescription}\n- Auto-apply files: ${autoApplyFiles ? 'ON' : 'OFF'}\n- Auto-apply CLI: ${autoApplyCli ? 'ON' : 'OFF'}\n`;
+                    debug('Injected execution mode:', autoApply ? 'AUTO' : 'MANUAL');
                     
                     // System message must come FIRST before history
                     messages.push({ role: 'system', content: systemPrompt });

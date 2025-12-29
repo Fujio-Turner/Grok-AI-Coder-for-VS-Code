@@ -1,9 +1,11 @@
 {
   "name": "planning-schema",
   "description": "JSON Schema for xAI Structured Outputs API - enforces valid planning response format",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
   "changelog": {
+    "1.3.0": "Added request_content action type for file awareness system (AI requests how to receive large file content)",
+    "1.2.0": "Added analyze and extract action types for local file analysis",
     "1.1.0": "Added patterns array for fallback glob patterns, fallbackAction field, required flag"
   },
   "schema": {
@@ -35,7 +37,17 @@
             "items": {
               "type": "object",
               "properties": {
-                "type": { "type": "string", "enum": ["file", "url"], "description": "Action type" },
+                "type": { 
+                  "type": "string", 
+                  "enum": ["file", "url", "analyze", "extract", "request_content"], 
+                  "description": "Action type: file (load), url (fetch), analyze (run command), extract (get lines), request_content (request large file content)" 
+                },
+                "filePath": { "type": "string", "description": "For request_content: path to the large file" },
+                "deliveryMethod": { 
+                  "type": "string", 
+                  "enum": ["chunk", "analyze", "extract"],
+                  "description": "For request_content: how to receive content (chunk=full file in chunks, analyze=run command, extract=get line range)" 
+                },
                 "pattern": { "type": "string", "description": "Primary glob pattern for file type (deprecated - use patterns array)" },
                 "patterns": {
                   "type": "array",
@@ -43,6 +55,17 @@
                   "description": "Glob patterns to try in order (first match wins). Most specific first."
                 },
                 "url": { "type": "string", "description": "URL to fetch for url type" },
+                "command": { "type": "string", "description": "Shell command to run for analyze type (grep, head, tail, etc.)" },
+                "targetFile": { "type": "string", "description": "File being analyzed (for context)" },
+                "outputHint": { 
+                  "type": "string", 
+                  "enum": ["line_numbers", "json", "text", "count"],
+                  "description": "Expected output format hint for analyze type" 
+                },
+                "sourceFile": { "type": "string", "description": "Source file for extract type" },
+                "startLine": { "type": "integer", "description": "Start line (1-indexed) for extract type" },
+                "endLine": { "type": "integer", "description": "End line (1-indexed) for extract type" },
+                "destinationFile": { "type": "string", "description": "Optional destination file to save extracted content" },
                 "reason": { "type": "string", "description": "Why this action is needed" },
                 "required": { "type": "boolean", "description": "If true, task cannot proceed without this file" },
                 "fallbackAction": {

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { changeTracker, FileChange, ChangeSet, DiffStats } from './changeTracker';
-import { createFileBackup, getOriginalBackup, restoreFromBackup, FileBackupReference } from '../storage/chatSessionRepository';
+import { createFileBackup, getOriginalBackup, restoreFromBackup, FileBackupReference, storeFileRevision } from '../storage/chatSessionRepository';
 import { debug } from '../utils/logger';
 
 /**
@@ -349,6 +349,35 @@ export async function applyEdits(
             await doc.save();
         } catch (saveError) {
             console.error('Failed to save file:', edit.fileUri.fsPath, saveError);
+        }
+    }
+
+    // Store file revisions for line-level rollback tracking
+    if (sessionId) {
+        for (const fileChange of fileChanges) {
+            if (fileChange.oldContent !== fileChange.newContent || fileChange.isNewFile) {
+                try {
+                    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                    const relativePath = fileChange.filePath.startsWith(workspaceRoot)
+                        ? fileChange.filePath.slice(workspaceRoot.length + 1)
+                        : fileChange.filePath;
+                    
+                    await storeFileRevision(
+                        relativePath,
+                        fileChange.filePath,
+                        fileChange.oldContent,
+                        fileChange.newContent,
+                        {
+                            sessionId,
+                            pairIndex,
+                            changeSource: 'ai'
+                        }
+                    );
+                    debug('Stored file revision:', { path: relativePath });
+                } catch (revErr) {
+                    console.error('[Grok] Failed to store file revision:', fileChange.filePath, revErr);
+                }
+            }
         }
     }
 

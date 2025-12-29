@@ -16,6 +16,10 @@ import {
     Action, 
     FileAction, 
     UrlAction, 
+    AnalyzeAction,
+    ExtractAction,
+    RequestContentAction,
+    FileMetadata,
     ActionResult, 
     ExecutionResult,
     ProgressUpdate,
@@ -23,6 +27,15 @@ import {
 } from './actionTypes';
 import { debug, info, error as logError } from '../utils/logger';
 import { getPromptFromConfig, getSchemaFromConfig } from '../utils/configLoader';
+import { 
+    chunkFile, 
+    needsChunking, 
+    formatChunkForPrompt, 
+    createChunkSummary,
+    FileChunk,
+    ChunkingResult,
+    ChunkingOptions
+} from './fileChunker';
 
 /**
  * Default planning schema for structured outputs (fallback if config not found)
@@ -197,6 +210,9 @@ export async function createPlan(
                 })
             };
             
+            // Log raw actions from planner for debugging
+            debug(`Raw actions from planner: ${JSON.stringify(parsed.actions || [])}`);
+            
             // FALLBACK: If model didn't include URLs but user message contains URLs, add them
             const urlsInMessage = extractUrls(userMessage);
             const existingUrls = plan.actions.filter(a => a.type === 'url').map((a: any) => a.url);
@@ -211,12 +227,56 @@ export async function createPlan(
                     } as UrlAction);
                 }
             }
+            
+            // FALLBACK: If model didn't include file actions but user message contains file paths, add them
+            // Matches patterns like: `path/to/file.ext`, "path/to/file.ext", or bare path/file.ext
+            const filePathPatterns = [
+                /`([^`]+\.[a-zA-Z]{1,10})`/g,  // backtick-quoted paths with extension
+                /"([^"]+\.[a-zA-Z]{1,10})"/g,  // double-quoted paths with extension
+                /'([^']+\.[a-zA-Z]{1,10})'/g,  // single-quoted paths with extension
+                /\b([\w\/\\.-]+\.(py|ts|tsx|js|jsx|json|yaml|yml|md|txt|html|css|scss|go|rs|java|c|cpp|h|hpp))\b/gi  // common code file extensions
+            ];
+            
+            const existingFilePaths = new Set<string>();
+            plan.actions.filter(a => a.type === 'file').forEach((a: any) => {
+                if (a.patterns) a.patterns.forEach((p: string) => existingFilePaths.add(p));
+                if (a.pattern) existingFilePaths.add(a.pattern);
+            });
+            
+            for (const regex of filePathPatterns) {
+                let match;
+                while ((match = regex.exec(userMessage)) !== null) {
+                    const filePath = match[1];
+                    // Skip if it looks like a URL or already exists
+                    if (filePath.startsWith('http') || filePath.startsWith('//')) continue;
+                    if (existingFilePaths.has(filePath)) continue;
+                    
+                    // Check if this path is already covered by an existing pattern
+                    const fileName = filePath.split('/').pop() || filePath;
+                    const alreadyCovered = Array.from(existingFilePaths).some(p => 
+                        p.includes(fileName) || filePath.includes(p.replace('**/', ''))
+                    );
+                    if (alreadyCovered) continue;
+                    
+                    info(`Adding missed file path from user message: ${filePath}`);
+                    existingFilePaths.add(filePath);
+                    plan.actions.push({
+                        type: 'file',
+                        pattern: filePath,
+                        patterns: [filePath, `**/${fileName}`],
+                        reason: 'File path mentioned in user request'
+                    } as FileAction);
+                }
+            }
 
             // Log URL actions for debugging
             const urlActions = plan.actions.filter(a => a.type === 'url');
             const fileActions = plan.actions.filter(a => a.type === 'file');
             
             info(`Plan created: ${plan.todos.length} todos, ${fileActions.length} file actions, ${urlActions.length} URL actions`);
+            if (fileActions.length > 0) {
+                fileActions.forEach((a: any) => debug(`File action: ${JSON.stringify(a.patterns || a.pattern)}`));
+            }
             if (urlActions.length > 0) {
                 urlActions.forEach((a: any) => debug(`URL action: ${a.url}`));
             }
@@ -262,8 +322,119 @@ export interface ExecuteResult {
     timeMs: number;
 }
 
+/** 
+ * Threshold for large file detection - files above this get metadata only.
+ * Default: 100KB (increased from 50KB to reduce user friction for moderately large files)
+ * Files under this threshold are loaded directly with full content.
+ */
+const LARGE_FILE_THRESHOLD = 100 * 1024;
+
+/** Number of preview lines to include in file metadata */
+const METADATA_PREVIEW_LINES = 30;
+
+/**
+ * Extract structure hints from file content (classes, functions, sections).
+ * Returns lightweight hints to help AI understand file structure without full content.
+ */
+function extractStructureHints(content: string, language: string): FileMetadata['structureHints'] {
+    const lines = content.split('\n');
+    const classes: string[] = [];
+    const functions: string[] = [];
+    const sections: string[] = [];
+    
+    const patterns: { [lang: string]: { classes: RegExp; functions: RegExp } } = {
+        py: {
+            classes: /^class\s+(\w+)/,
+            functions: /^(?:async\s+)?def\s+(\w+)/
+        },
+        python: {
+            classes: /^class\s+(\w+)/,
+            functions: /^(?:async\s+)?def\s+(\w+)/
+        },
+        ts: {
+            classes: /^(?:export\s+)?class\s+(\w+)/,
+            functions: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/
+        },
+        typescript: {
+            classes: /^(?:export\s+)?class\s+(\w+)/,
+            functions: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/
+        },
+        js: {
+            classes: /^(?:export\s+)?class\s+(\w+)/,
+            functions: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/
+        },
+        javascript: {
+            classes: /^(?:export\s+)?class\s+(\w+)/,
+            functions: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/
+        }
+    };
+    
+    const langPatterns = patterns[language.toLowerCase()];
+    
+    for (const line of lines) {
+        const trimmed = line.trim();
+        
+        if (langPatterns) {
+            const classMatch = trimmed.match(langPatterns.classes);
+            if (classMatch && classes.length < 20) {
+                classes.push(classMatch[1]);
+            }
+            const funcMatch = trimmed.match(langPatterns.functions);
+            if (funcMatch && functions.length < 30) {
+                functions.push(funcMatch[1]);
+            }
+        }
+        
+        // Section markers (comments with headers)
+        if (trimmed.match(/^(#|\/\/)\s*={3,}|^(#|\/\/)\s*-{3,}/)) {
+            const nextLineIdx = lines.indexOf(line) + 1;
+            if (nextLineIdx < lines.length) {
+                const sectionLine = lines[nextLineIdx].trim();
+                const sectionMatch = sectionLine.match(/^(?:#|\/\/)\s*(.+)/);
+                if (sectionMatch && sections.length < 10) {
+                    sections.push(sectionMatch[1].substring(0, 50));
+                }
+            }
+        }
+    }
+    
+    return {
+        classes: classes.length > 0 ? classes : undefined,
+        functions: functions.length > 0 ? functions : undefined,
+        sections: sections.length > 0 ? sections : undefined
+    };
+}
+
+/**
+ * Collect metadata for a large file without loading full content.
+ */
+function collectFileMetadata(file: FileContent): FileMetadata {
+    const lines = file.content.split('\n');
+    const previewLines = lines.slice(0, METADATA_PREVIEW_LINES).join('\n');
+    const structureHints = extractStructureHints(file.content, file.language);
+    
+    return {
+        path: file.relativePath,
+        sizeBytes: file.content.length,
+        lineCount: file.lineCount,
+        language: file.language,
+        md5Hash: file.md5Hash,
+        preview: previewLines,
+        structureHints,
+        reason: `File size ${(file.content.length / 1024).toFixed(1)}KB exceeds ${LARGE_FILE_THRESHOLD / 1024}KB threshold`
+    };
+}
+
+/**
+ * Check if a file should be treated as a large file (metadata only).
+ */
+function isLargeFile(file: FileContent): boolean {
+    return file.content.length > LARGE_FILE_THRESHOLD;
+}
+
 /**
  * Pass 2: Execute all actions with progress updates.
+ * Large files (>50KB) get metadata only - AI must request content via request_content action.
  */
 export async function executeActions(
     plan: AgentPlan,
@@ -274,6 +445,7 @@ export async function executeActions(
     const filesContent = new Map<string, string>();
     const fileHashes = new Map<string, string>();
     const urlsContent = new Map<string, string>();
+    const largeFileMetadata: FileMetadata[] = [];
 
     for (const action of plan.actions) {
         if (action.type === 'file') {
@@ -333,28 +505,61 @@ export async function executeActions(
             }
             
             if (foundFiles.length > 0 && successfulPattern) {
-                const totalLines = foundFiles.reduce((sum, f) => sum + f.lineCount, 0);
-                const fileNames = foundFiles.map(f => f.name);
+                // Separate large files (metadata only) from regular files (full content)
+                const regularFiles: FileContent[] = [];
+                const largeFiles: FileContent[] = [];
                 
-                foundFiles.forEach(f => {
+                for (const file of foundFiles) {
+                    if (isLargeFile(file)) {
+                        largeFiles.push(file);
+                    } else {
+                        regularFiles.push(file);
+                    }
+                }
+                
+                // Add regular files to content maps
+                regularFiles.forEach(f => {
                     filesContent.set(f.path, f.content);
                     fileHashes.set(f.path, f.md5Hash);
                 });
+                
+                // Collect metadata for large files (content not loaded)
+                for (const file of largeFiles) {
+                    const metadata = collectFileMetadata(file);
+                    largeFileMetadata.push(metadata);
+                    // Store hash so we can verify later when content is requested
+                    fileHashes.set(file.path, file.md5Hash);
+                    
+                    onProgress?.({
+                        type: 'file-done',
+                        message: `📊 Large file detected: ${file.name} (${(file.content.length / 1024).toFixed(1)}KB, ${file.lineCount} lines)\n   └─ Metadata collected, awaiting AI request for content`,
+                        details: { 
+                            path: file.path,
+                            lines: file.lineCount,
+                            bytes: file.content.length
+                        }
+                    });
+                }
 
-                // Show each file found on its own line for better visibility
-                const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
-                onProgress?.({
-                    type: 'file-done',
-                    message: `✅ Found ${foundFiles.length} file(s) (${totalLines} lines)\n${fileList}`,
-                    details: { 
-                        path: successfulPattern,
-                        lines: totalLines,
-                        files: fileNames
-                    }
-                });
+                const totalLines = regularFiles.reduce((sum, f) => sum + f.lineCount, 0);
+                const fileNames = regularFiles.map(f => f.name);
+                
+                if (regularFiles.length > 0) {
+                    // Show each file found on its own line for better visibility
+                    const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
+                    onProgress?.({
+                        type: 'file-done',
+                        message: `✅ Loaded ${regularFiles.length} file(s) (${totalLines} lines)\n${fileList}`,
+                        details: { 
+                            path: successfulPattern,
+                            lines: totalLines,
+                            files: fileNames
+                        }
+                    });
+                }
 
-                // Follow imports for each loaded file (max depth 3)
-                for (const file of foundFiles) {
+                // Follow imports for each loaded file (max depth 3) - only for regular files
+                for (const file of regularFiles) {
                     try {
                         onProgress?.({
                             type: 'file-start',
@@ -495,24 +700,412 @@ export async function executeActions(
                     error: err.message
                 });
             }
+        } else if (action.type === 'analyze') {
+            // Local analysis action - run command locally to analyze large files
+            const analyzeAction = action as AnalyzeAction;
+            
+            onProgress?.({
+                type: 'file-start',
+                message: `🔬 Analyzing: ${analyzeAction.targetFile || 'file'} (${analyzeAction.reason})`,
+                details: { path: analyzeAction.targetFile }
+            });
+
+            try {
+                const analysisResult = await executeLocalCommand(analyzeAction.command, onProgress);
+                
+                if (analysisResult.success) {
+                    onProgress?.({
+                        type: 'file-done',
+                        message: `✅ Analysis complete (${analysisResult.output?.split('\n').length || 0} lines output)`,
+                        details: { path: analyzeAction.targetFile }
+                    });
+
+                    results.push({
+                        action,
+                        success: true,
+                        content: analysisResult.output,
+                        metadata: { 
+                            bytes: analysisResult.output?.length || 0,
+                            lines: analysisResult.output?.split('\n').length || 0
+                        }
+                    });
+                } else {
+                    results.push({
+                        action,
+                        success: false,
+                        error: analysisResult.error || 'Analysis command failed'
+                    });
+                }
+            } catch (err: any) {
+                results.push({
+                    action,
+                    success: false,
+                    error: err.message
+                });
+            }
+        } else if (action.type === 'extract') {
+            // Extract action - extract specific lines from a file
+            const extractAction = action as ExtractAction;
+            
+            onProgress?.({
+                type: 'file-start',
+                message: `📑 Extracting lines ${extractAction.startLine}-${extractAction.endLine} from ${extractAction.sourceFile}`,
+                details: { path: extractAction.sourceFile }
+            });
+
+            try {
+                const extractResult = await extractFileLines(
+                    extractAction.sourceFile,
+                    extractAction.startLine,
+                    extractAction.endLine,
+                    extractAction.destinationFile
+                );
+                
+                if (extractResult.success) {
+                    onProgress?.({
+                        type: 'file-done',
+                        message: `✅ Extracted ${extractResult.lineCount} lines${extractAction.destinationFile ? ` → ${extractAction.destinationFile}` : ''}`,
+                        details: { 
+                            path: extractAction.sourceFile,
+                            lines: extractResult.lineCount
+                        }
+                    });
+
+                    // If extracted without destination, add to filesContent so AI can see it
+                    if (!extractAction.destinationFile && extractResult.content) {
+                        filesContent.set(
+                            `${extractAction.sourceFile}:${extractAction.startLine}-${extractAction.endLine}`,
+                            extractResult.content
+                        );
+                    }
+
+                    results.push({
+                        action,
+                        success: true,
+                        content: extractResult.content,
+                        metadata: { 
+                            lines: extractResult.lineCount,
+                            bytes: extractResult.content?.length || 0
+                        }
+                    });
+                } else {
+                    results.push({
+                        action,
+                        success: false,
+                        error: extractResult.error || 'Extraction failed'
+                    });
+                }
+            } catch (err: any) {
+                results.push({
+                    action,
+                    success: false,
+                    error: err.message
+                });
+            }
+        } else if (action.type === 'request_content') {
+            // AI is requesting content for a large file that was previously shown as metadata
+            const requestAction = action as RequestContentAction;
+            
+            onProgress?.({
+                type: 'file-start',
+                message: `📥 AI requested ${requestAction.deliveryMethod} for: ${requestAction.filePath}`,
+                details: { path: requestAction.filePath }
+            });
+            
+            try {
+                if (requestAction.deliveryMethod === 'chunk') {
+                    // Load the file and let the chunking system handle it
+                    const files = await findAndReadFiles(requestAction.filePath, 1);
+                    if (files.length > 0) {
+                        const file = files[0];
+                        filesContent.set(file.path, file.content);
+                        fileHashes.set(file.path, file.md5Hash);
+                        
+                        onProgress?.({
+                            type: 'file-done',
+                            message: `✅ Loaded for chunking: ${file.name} (${file.lineCount} lines)`,
+                            details: { path: file.path, lines: file.lineCount }
+                        });
+                        
+                        results.push({
+                            action,
+                            success: true,
+                            content: file.content,
+                            metadata: { lines: file.lineCount, bytes: file.content.length }
+                        });
+                    } else {
+                        results.push({
+                            action,
+                            success: false,
+                            error: `File not found: ${requestAction.filePath}`
+                        });
+                    }
+                } else if (requestAction.deliveryMethod === 'analyze') {
+                    // Run the analysis command
+                    if (!requestAction.command) {
+                        results.push({
+                            action,
+                            success: false,
+                            error: 'No command specified for analyze delivery method'
+                        });
+                    } else {
+                        const analysisResult = await executeLocalCommand(requestAction.command, onProgress);
+                        if (analysisResult.success) {
+                            onProgress?.({
+                                type: 'file-done',
+                                message: `✅ Analysis complete (${analysisResult.output?.split('\n').length || 0} lines output)`,
+                                details: { path: requestAction.filePath }
+                            });
+                            results.push({
+                                action,
+                                success: true,
+                                content: analysisResult.output,
+                                metadata: { bytes: analysisResult.output?.length || 0 }
+                            });
+                        } else {
+                            results.push({
+                                action,
+                                success: false,
+                                error: analysisResult.error || 'Analysis failed'
+                            });
+                        }
+                    }
+                } else if (requestAction.deliveryMethod === 'extract') {
+                    // Extract specific lines
+                    if (!requestAction.startLine || !requestAction.endLine) {
+                        results.push({
+                            action,
+                            success: false,
+                            error: 'startLine and endLine required for extract delivery method'
+                        });
+                    } else {
+                        const extractResult = await extractFileLines(
+                            requestAction.filePath,
+                            requestAction.startLine,
+                            requestAction.endLine
+                        );
+                        if (extractResult.success) {
+                            filesContent.set(
+                                `${requestAction.filePath}:${requestAction.startLine}-${requestAction.endLine}`,
+                                extractResult.content!
+                            );
+                            onProgress?.({
+                                type: 'file-done',
+                                message: `✅ Extracted lines ${requestAction.startLine}-${requestAction.endLine} (${extractResult.lineCount} lines)`,
+                                details: { path: requestAction.filePath, lines: extractResult.lineCount }
+                            });
+                            results.push({
+                                action,
+                                success: true,
+                                content: extractResult.content,
+                                metadata: { lines: extractResult.lineCount, bytes: extractResult.content?.length || 0 }
+                            });
+                        } else {
+                            results.push({
+                                action,
+                                success: false,
+                                error: extractResult.error || 'Extraction failed'
+                            });
+                        }
+                    }
+                }
+            } catch (err: any) {
+                results.push({
+                    action,
+                    success: false,
+                    error: err.message
+                });
+            }
         }
     }
 
     return { 
-        execution: { plan, results, filesContent, fileHashes, urlsContent },
+        execution: { 
+            plan, 
+            results, 
+            filesContent, 
+            fileHashes, 
+            urlsContent,
+            largeFileMetadata: largeFileMetadata.length > 0 ? largeFileMetadata : undefined
+        },
         timeMs: Date.now() - startTime
     };
 }
 
 /**
+ * Default whitelisted commands for local analysis.
+ * These are safe read-only commands that don't modify files.
+ */
+const ANALYSIS_COMMAND_WHITELIST = [
+    'grep', 'egrep', 'fgrep',  // Pattern searching
+    'head', 'tail',             // Line extraction
+    'wc',                       // Word/line counting
+    'cat', 'less',              // File viewing (cat is limited by timeout)
+    'sed -n',                   // Print-only sed (no in-place editing)
+    'awk',                      // Text processing
+    'cut',                      // Column extraction
+    'sort', 'uniq',             // Sorting/deduplication
+    'find',                     // File finding
+    'ls', 'tree',               // Directory listing
+    'python -c', 'python3 -c',  // Python one-liners
+];
+
+/**
+ * Check if a command is safe for auto-execution.
+ */
+function isAnalysisCommandSafe(command: string): boolean {
+    const cmdLower = command.trim().toLowerCase();
+    
+    // Block dangerous commands
+    const dangerous = ['rm ', 'mv ', 'cp ', 'chmod', 'chown', 'sudo', '>', '>>', '|'];
+    if (dangerous.some(d => cmdLower.includes(d))) {
+        return false;
+    }
+    
+    // Check if command starts with a whitelisted prefix
+    return ANALYSIS_COMMAND_WHITELIST.some(prefix => 
+        cmdLower.startsWith(prefix.toLowerCase())
+    );
+}
+
+/**
+ * Execute a local command for file analysis.
+ * This uses the shell to run commands like grep, head, tail, wc, etc.
+ * 
+ * SECURITY: Only auto-executes safe analysis commands. Others require user approval.
+ */
+async function executeLocalCommand(
+    command: string,
+    onProgress?: (update: ProgressUpdate) => void,
+    requireApproval: boolean = false
+): Promise<{ success: boolean; output?: string; error?: string; skipped?: boolean }> {
+    const vscode = await import('vscode');
+    const { exec } = require('child_process');
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    const cwd = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+    
+    // Check if command is safe for auto-execution
+    if (!isAnalysisCommandSafe(command)) {
+        onProgress?.({
+            type: 'error',
+            message: `⚠️ Command requires approval: ${command}`,
+            details: {}
+        });
+        
+        // Show approval dialog
+        const action = await vscode.window.showWarningMessage(
+            `AI wants to run analysis command:\n"${command}"`,
+            'Run Once',
+            'Add to Whitelist & Run',
+            'Skip'
+        );
+        
+        if (action === 'Skip' || !action) {
+            return { success: false, error: 'Command skipped by user', skipped: true };
+        }
+        
+        if (action === 'Add to Whitelist & Run') {
+            // Add command prefix to user's CLI whitelist
+            const config = vscode.workspace.getConfiguration('grok');
+            const whitelist = config.get<string[]>('cliWhitelist', []);
+            const cmdPrefix = command.split(' ')[0];
+            if (!whitelist.includes(cmdPrefix)) {
+                whitelist.push(cmdPrefix);
+                await config.update('cliWhitelist', whitelist, vscode.ConfigurationTarget.Global);
+                info(`Added "${cmdPrefix}" to CLI whitelist`);
+            }
+        }
+    }
+    
+    return new Promise((resolve) => {
+        exec(command, { cwd, maxBuffer: 1024 * 1024, timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
+            if (error && !stdout) {
+                resolve({ success: false, error: error.message || stderr });
+            } else {
+                resolve({ success: true, output: stdout || stderr });
+            }
+        });
+    });
+}
+
+/**
+ * Extract specific lines from a file.
+ * Uses sed/head/tail for efficiency on large files.
+ */
+async function extractFileLines(
+    sourceFile: string,
+    startLine: number,
+    endLine: number,
+    destinationFile?: string
+): Promise<{ success: boolean; content?: string; lineCount?: number; error?: string }> {
+    const fs = await import('fs');
+    const path = await import('path');
+    const vscode = await import('vscode');
+    
+    try {
+        // Resolve the file path
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || '';
+        const fullPath = path.isAbsolute(sourceFile) ? sourceFile : path.join(workspaceRoot, sourceFile);
+        
+        // Read the file
+        const content = fs.readFileSync(fullPath, 'utf8');
+        const lines = content.split('\n');
+        
+        // Extract the specified range (1-indexed)
+        const start = Math.max(0, startLine - 1);
+        const end = Math.min(lines.length, endLine);
+        const extractedLines = lines.slice(start, end);
+        const extractedContent = extractedLines.join('\n');
+        
+        // If destination specified, write the file
+        if (destinationFile) {
+            const destPath = path.isAbsolute(destinationFile) ? destinationFile : path.join(workspaceRoot, destinationFile);
+            
+            // Create directory if needed
+            const destDir = path.dirname(destPath);
+            if (!fs.existsSync(destDir)) {
+                fs.mkdirSync(destDir, { recursive: true });
+            }
+            
+            fs.writeFileSync(destPath, extractedContent, 'utf8');
+            info(`Extracted lines ${startLine}-${endLine} to ${destinationFile}`);
+        }
+        
+        return {
+            success: true,
+            content: extractedContent,
+            lineCount: extractedLines.length
+        };
+    } catch (err: any) {
+        return {
+            success: false,
+            error: err.message
+        };
+    }
+}
+
+export interface AugmentedMessageResult {
+    message: string;
+    pendingChunks?: PendingChunks;
+    chunkingInfo?: {
+        filesChunked: number;
+        totalChunks: number;
+        currentChunkIndex: number;
+    };
+}
+
+/**
  * Build the augmented message with all gathered context.
+ * Now returns pending chunks for large file processing.
  */
 export function buildAugmentedMessage(
     originalMessage: string,
     plan: AgentPlan,
     execution: ExecutionResult
-): string {
+): AugmentedMessageResult {
     let augmented = originalMessage;
+    const pendingChunksMap: PendingChunks = {};
 
     // Add plan context
     if (plan.todos.length > 0) {
@@ -535,15 +1128,110 @@ export function buildAugmentedMessage(
         augmented += '\n**You CANNOT see these files. Ask the user to attach them or provide the correct path.**\n';
     }
 
-    // Add file contents with line numbers
+    // Add large file metadata (file awareness system)
+    if (execution.largeFileMetadata && execution.largeFileMetadata.length > 0) {
+        augmented += '\n\n---\n**📦 LARGE FILES DETECTED (Metadata Only - Request Content to Access):**\n';
+        augmented += '⚠️ These files exceed 50KB. You have metadata + preview, NOT full content.\n';
+        augmented += 'To access content, use nextSteps with a request_content action.\n\n';
+        
+        for (const meta of execution.largeFileMetadata) {
+            const sizeKB = (meta.sizeBytes / 1024).toFixed(1);
+            augmented += `### 📄 ${meta.path}\n`;
+            augmented += `| Property | Value |\n`;
+            augmented += `|----------|-------|\n`;
+            augmented += `| Size | ${sizeKB}KB (${meta.lineCount} lines) |\n`;
+            augmented += `| Language | ${meta.language} |\n`;
+            augmented += `| MD5 Hash | ${meta.md5Hash} |\n`;
+            
+            // Add structure hints if available
+            if (meta.structureHints) {
+                if (meta.structureHints.classes?.length) {
+                    augmented += `| Classes | ${meta.structureHints.classes.join(', ')} |\n`;
+                }
+                if (meta.structureHints.functions?.length) {
+                    const funcs = meta.structureHints.functions.slice(0, 15).join(', ');
+                    const more = meta.structureHints.functions.length > 15 ? ` (+${meta.structureHints.functions.length - 15} more)` : '';
+                    augmented += `| Functions | ${funcs}${more} |\n`;
+                }
+                if (meta.structureHints.sections?.length) {
+                    augmented += `| Sections | ${meta.structureHints.sections.join(', ')} |\n`;
+                }
+            }
+            
+            augmented += `\n**Preview (first ${METADATA_PREVIEW_LINES} lines):**\n\`\`\`${meta.language}\n${meta.preview}\n\`\`\`\n\n`;
+            
+            // Show how to request content
+            augmented += `**To access this file's content, respond with nextSteps:**\n`;
+            augmented += '```json\n';
+            augmented += '// Option 1: Chunk the entire file to me\n';
+            augmented += `{"nextSteps": [{"html": "Load ${meta.path.split('/').pop()} in chunks", "inputText": "request_content:chunk:${meta.path}"}]}\n\n`;
+            augmented += '// Option 2: Run a local command to analyze (e.g., grep for patterns)\n';
+            augmented += `{"nextSteps": [{"html": "Analyze ${meta.path.split('/').pop()}", "inputText": "request_content:analyze:${meta.path}:grep -n 'pattern' ${meta.path}"}]}\n\n`;
+            augmented += '// Option 3: Extract specific line range\n';
+            augmented += `{"nextSteps": [{"html": "Extract lines 100-200", "inputText": "request_content:extract:${meta.path}:100:200"}]}\n`;
+            augmented += '```\n\n';
+        }
+    }
+
+    // Add file contents with line numbers - WITH CHUNKING FOR LARGE FILES
     if (execution.filesContent.size > 0) {
         augmented += '\n\n---\n**Files from workspace (with line numbers and MD5 hashes - use these in fileHashes when modifying):**\n';
+        
+        const chunkedFiles: ChunkingResult[] = [];
+        const regularFiles: { path: string; content: string; hash: string }[] = [];
+        
+        // Separate files into chunked and regular
         for (const [filePath, content] of execution.filesContent) {
             const hash = execution.fileHashes.get(filePath) || 'UNKNOWN';
-            // Add line numbers to help AI reference correct lines
-            const numberedContent = addLineNumbers(content);
-            augmented += `\n### ${filePath} [MD5: ${hash}]\n\`\`\`\n${numberedContent}\n\`\`\`\n`;
+            const lineCount = content.split('\n').length;
+            const fileContent: FileContent = {
+                path: filePath,
+                relativePath: filePath,
+                name: filePath.split('/').pop() || filePath,
+                content,
+                language: filePath.split('.').pop() || 'text',
+                lineCount,
+                md5Hash: hash
+            };
+            
+            if (needsChunking(fileContent)) {
+                const chunkResult = chunkFile(fileContent);
+                chunkedFiles.push(chunkResult);
+                info(`Large file chunked: ${filePath} -> ${chunkResult.chunks.length} chunks`);
+            } else {
+                regularFiles.push({ path: filePath, content, hash });
+            }
         }
+        
+        // Add regular (small) files normally
+        for (const file of regularFiles) {
+            const numberedContent = addLineNumbers(file.content);
+            augmented += `\n### ${file.path} [MD5: ${file.hash}]\n\`\`\`\n${numberedContent}\n\`\`\`\n`;
+        }
+        
+        // Add chunked files - ONLY FIRST CHUNK with summary
+        if (chunkedFiles.length > 0) {
+            augmented += '\n\n---\n**📦 LARGE FILES (CHUNKED FOR PROCESSING):**\n';
+            augmented += '⚠️ Files below exceed 50KB and have been split into chunks.\n';
+            augmented += 'Process ONE chunk at a time. Use nextSteps to request the next chunk.\n\n';
+            
+            for (const chunkResult of chunkedFiles) {
+                const firstChunk = chunkResult.chunks[0];
+                augmented += createChunkSummary(chunkResult.chunks);
+                augmented += '\n**CURRENT CHUNK (process this first):**\n';
+                augmented += formatChunkForPrompt(firstChunk);
+                augmented += '\n';
+                
+                // Store remaining chunks for later retrieval
+                if (chunkResult.chunks.length > 1) {
+                    const remaining = chunkResult.chunks.length - 1;
+                    pendingChunksMap[chunkResult.originalFile.path] = chunkResult.chunks.slice(1);
+                    augmented += `\n**${remaining} more chunk(s) pending.** After processing this chunk, respond with:\n`;
+                    augmented += '```json\n{"nextSteps": [{"html": "Continue to chunk 2", "inputText": "continue with next chunk"}]}\n```\n';
+                }
+            }
+        }
+        
         augmented += '\n**IMPORTANT: Line numbers shown are 1-indexed. When using lineOperations, use exact line numbers as shown.**\n';
     }
 
@@ -590,7 +1278,45 @@ export function buildAugmentedMessage(
 
     augmented += '\n\n---\n**IMPORTANT:** When creating fileChanges from URL content, use the EXACT content fetched above (do not modify or regenerate). Include the full file extension (e.g., .py, .js) in the path.';
 
-    return augmented;
+    // Calculate chunking info
+    const hasPendingChunks = Object.keys(pendingChunksMap).length > 0;
+    const totalChunks = Object.values(pendingChunksMap).reduce((sum, chunks) => sum + chunks.length + 1, 0);
+    
+    return {
+        message: augmented,
+        pendingChunks: hasPendingChunks ? pendingChunksMap : undefined,
+        chunkingInfo: hasPendingChunks ? {
+            filesChunked: Object.keys(pendingChunksMap).length,
+            totalChunks,
+            currentChunkIndex: 0
+        } : undefined
+    };
+}
+
+/** Context accumulated from processing previous chunks */
+export interface ChunkProcessingContext {
+    /** File changes extracted from previous chunks */
+    extractedChanges: { path: string; description: string }[];
+    /** Summary of what was done in previous chunks */
+    previousSummaries: string[];
+    /** Current chunk being processed (1-indexed) */
+    currentChunkNumber: number;
+    /** Total chunks for the file */
+    totalChunks: number;
+}
+
+/** Pending chunks that need to be processed in subsequent turns */
+export interface PendingChunks {
+    /** File path -> remaining chunks (after first chunk was sent) */
+    [filePath: string]: FileChunk[];
+}
+
+/** Full chunking state including context */
+export interface ChunkingState {
+    /** Pending chunks to process */
+    pendingChunks: PendingChunks;
+    /** Accumulated context from previous chunks */
+    context: ChunkProcessingContext;
 }
 
 export interface AgentWorkflowResult {
@@ -599,9 +1325,119 @@ export interface AgentWorkflowResult {
     urlsLoaded: number;
     skipped: boolean;
     plan?: AgentPlan;
+    /** Chunks waiting to be processed (for large files) */
+    pendingChunks?: PendingChunks;
+    /** Info about which files were chunked */
+    chunkingInfo?: {
+        filesChunked: number;
+        totalChunks: number;
+        currentChunkIndex: number;
+    };
+    /** Metadata for large files (>50KB) - content not loaded, AI must request */
+    largeFileMetadata?: FileMetadata[];
     stepMetrics: {
         planning: { timeMs: number; tokensIn: number; tokensOut: number };
         execute: { timeMs: number };
+    };
+}
+
+/**
+ * Get the next chunk for a file that's being processed in chunks.
+ * Returns the formatted chunk ready to include in the next message.
+ * 
+ * @param pendingChunks - Remaining chunks to process
+ * @param previousContext - Context from previous chunk processing (summaries, changes found)
+ */
+export function getNextChunk(
+    pendingChunks: PendingChunks, 
+    previousContext?: ChunkProcessingContext
+): {
+    hasMore: boolean;
+    chunkMessage: string;
+    updatedPendingChunks: PendingChunks;
+    currentChunk?: FileChunk;
+    updatedContext?: ChunkProcessingContext;
+} {
+    const filePaths = Object.keys(pendingChunks);
+    if (filePaths.length === 0) {
+        return {
+            hasMore: false,
+            chunkMessage: '',
+            updatedPendingChunks: {}
+        };
+    }
+
+    // Get the first file with pending chunks
+    const filePath = filePaths[0];
+    const chunks = pendingChunks[filePath];
+    
+    if (!chunks || chunks.length === 0) {
+        // No more chunks for this file, remove it and try next
+        const { [filePath]: _, ...rest } = pendingChunks;
+        return getNextChunk(rest, previousContext);
+    }
+
+    const [nextChunk, ...remainingChunks] = chunks;
+    
+    // Build the chunk message with context from previous chunks
+    let message = `\n\n---\n**📦 CONTINUING LARGE FILE - CHUNK ${nextChunk.chunkIndex + 1}/${nextChunk.totalChunks}:**\n`;
+    
+    // CRITICAL: Include context from previous chunks so AI doesn't lose track
+    if (previousContext && previousContext.previousSummaries.length > 0) {
+        message += `\n**📋 CONTEXT FROM PREVIOUS CHUNKS (DO NOT RE-REQUEST THIS DATA):**\n`;
+        previousContext.previousSummaries.forEach((summary, i) => {
+            message += `- Chunk ${i + 1}: ${summary}\n`;
+        });
+        
+        if (previousContext.extractedChanges.length > 0) {
+            message += `\n**Already planned/extracted:**\n`;
+            previousContext.extractedChanges.forEach(change => {
+                message += `- ${change.path}: ${change.description}\n`;
+            });
+        }
+        message += `\n**Continue from where you left off. Build on the work done in previous chunks.**\n\n`;
+    }
+    
+    message += formatChunkForPrompt(nextChunk);
+    
+    const moreChunksForFile = remainingChunks.length;
+    const moreFiles = filePaths.length - 1;
+    
+    if (moreChunksForFile > 0) {
+        message += `\n\n**${moreChunksForFile} more chunk(s) for this file.** After processing this chunk:\n`;
+        message += `1. Make any file changes for THIS chunk's content\n`;
+        message += `2. Summarize what you found/did in this chunk\n`;
+        message += `3. Respond with nextSteps to continue\n`;
+        message += '```json\n{"nextSteps": [{"html": "Continue to next chunk", "inputText": "continue with next chunk"}]}\n```\n';
+    } else if (moreFiles > 0) {
+        message += `\n\n**This file complete. ${moreFiles} more file(s) with pending chunks.**\n`;
+    } else {
+        message += `\n\n**✅ This is the FINAL chunk. Now provide ALL remaining file changes and complete the task.**\n`;
+        message += `You have seen the entire file across all chunks. Provide the final implementation.\n`;
+    }
+
+    // Update pending chunks
+    const updatedPendingChunks: PendingChunks = { ...pendingChunks };
+    if (remainingChunks.length > 0) {
+        updatedPendingChunks[filePath] = remainingChunks;
+    } else {
+        delete updatedPendingChunks[filePath];
+    }
+
+    // Update context for next iteration
+    const updatedContext: ChunkProcessingContext = {
+        extractedChanges: previousContext?.extractedChanges || [],
+        previousSummaries: previousContext?.previousSummaries || [],
+        currentChunkNumber: nextChunk.chunkIndex + 1,
+        totalChunks: nextChunk.totalChunks
+    };
+
+    return {
+        hasMore: Object.keys(updatedPendingChunks).length > 0 || remainingChunks.length > 0,
+        chunkMessage: message,
+        updatedPendingChunks,
+        currentChunk: nextChunk,
+        updatedContext
     };
 }
 
@@ -668,22 +1504,35 @@ export async function runAgentWorkflow(
         }
     }
 
-    // Build augmented message
-    const augmented = buildAugmentedMessage(userMessage, plan, execution);
+    // Build augmented message (now handles chunking internally)
+    const augmentedResult = buildAugmentedMessage(userMessage, plan, execution);
     
     const totalFiles = execution.filesContent.size;
     const totalUrls = execution.urlsContent.size;
     
+    // Report chunking if applicable
+    if (augmentedResult.chunkingInfo) {
+        onProgress?.(`📦 Large file(s) chunked: ${augmentedResult.chunkingInfo.filesChunked} file(s) -> ${augmentedResult.chunkingInfo.totalChunks} chunks`);
+    }
+    
     if (totalFiles > 0 || totalUrls > 0) {
         onProgress?.(`✅ Ready: ${totalFiles} file(s), ${totalUrls} URL(s) loaded`);
     }
+    
+    // Report large files with metadata only
+    if (execution.largeFileMetadata && execution.largeFileMetadata.length > 0) {
+        onProgress?.(`📊 Large file(s) detected: ${execution.largeFileMetadata.length} file(s) - metadata only, AI must request content`);
+    }
 
     return {
-        augmentedMessage: augmented,
+        augmentedMessage: augmentedResult.message,
         filesLoaded,
         urlsLoaded: totalUrls,
         skipped: false,
         plan,
+        pendingChunks: augmentedResult.pendingChunks,
+        chunkingInfo: augmentedResult.chunkingInfo,
+        largeFileMetadata: execution.largeFileMetadata,
         stepMetrics: {
             planning: { timeMs: planResult.timeMs, tokensIn: planResult.tokensIn, tokensOut: planResult.tokensOut },
             execute: { timeMs: executeResult.timeMs }

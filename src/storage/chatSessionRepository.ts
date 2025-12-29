@@ -116,6 +116,129 @@ export interface ChangeHistoryData {
     position: number;
 }
 
+// ============================================================================
+// File Revision Tracking - Line-level change history for precise rollback
+// ============================================================================
+
+/**
+ * Type of change operation at line level
+ */
+export type LineChangeType = 'insert' | 'delete' | 'replace' | 'unchanged';
+
+/**
+ * A single line-level change within a revision
+ */
+export interface LineChange {
+    type: LineChangeType;
+    lineNumber: number;           // 1-indexed line number in the file
+    oldContent?: string;          // Content before change (for delete/replace)
+    newContent?: string;          // Content after change (for insert/replace)
+}
+
+/**
+ * A range of lines affected by a change (for batch operations)
+ */
+export interface LineRangeChange {
+    type: 'range-insert' | 'range-delete' | 'range-replace';
+    startLine: number;            // 1-indexed start line
+    endLine: number;              // 1-indexed end line (inclusive)
+    oldLines?: string[];          // Lines before change
+    newLines?: string[];          // Lines after change
+}
+
+/**
+ * A file revision capturing state at a specific point in time.
+ * Stored as a separate document in Couchbase for efficient querying.
+ */
+export interface FileRevisionDocument {
+    id: string;                   // Document key: file-rev::{pathHash}::{revNum}
+    docType: 'file-revision';
+    
+    // File identification
+    filePath: string;             // Relative path from workspace
+    absolutePath: string;         // Full filesystem path
+    pathHash: string;             // SHA256 hash of path (first 16 chars)
+    fileName: string;             // Just the filename
+    
+    // Revision info
+    revisionNumber: number;       // Sequential revision number (1, 2, 3...)
+    previousRevisionId?: string;  // Link to previous revision (for chain)
+    
+    // Content state
+    md5Before: string;            // MD5 hash before this revision
+    md5After: string;             // MD5 hash after this revision
+    lineCountBefore: number;      // Line count before
+    lineCountAfter: number;       // Line count after
+    sizeBytesBefore: number;      // Size before
+    sizeBytesAfter: number;       // Size after
+    
+    // Change details (line-level tracking)
+    changes: LineChange[];        // Individual line changes
+    rangeChanges?: LineRangeChange[]; // Batch changes (lineOperations)
+    changeStats: {
+        linesAdded: number;
+        linesDeleted: number;
+        linesModified: number;
+    };
+    
+    // What caused this revision
+    changeSource: 'ai' | 'user' | 'auto-apply';
+    sessionId: string;            // Session that made the change
+    pairIndex: number;            // Which conversation turn
+    changeSetId?: string;         // Link to ChangeSet if applicable
+    
+    // Timestamps
+    createdAt: string;
+    
+    // For quick restore - compressed content snapshots
+    // Only stored if content is under 100KB to avoid bloat
+    contentSnapshotBefore?: string;  // Base64 gzip of content before
+    contentSnapshotAfter?: string;   // Base64 gzip of content after
+}
+
+/**
+ * Summary of all revisions for a file.
+ * Stored as a separate document for quick lookup.
+ */
+export interface FileRevisionIndex {
+    id: string;                   // Document key: file-rev-index::{pathHash}
+    docType: 'file-revision-index';
+    filePath: string;
+    absolutePath: string;
+    pathHash: string;
+    
+    // Revision chain
+    revisions: Array<{
+        revisionNumber: number;
+        revisionId: string;       // Document key for full revision
+        md5After: string;         // Quick hash lookup
+        createdAt: string;
+        changeStats: { linesAdded: number; linesDeleted: number; linesModified: number };
+        sessionId: string;
+        pairIndex: number;
+    }>;
+    
+    // Current state
+    currentRevision: number;      // Latest revision number
+    originalBackupId?: string;    // Link to FileBackupDocument for original
+    
+    // Timestamps
+    firstSeenAt: string;          // When file was first tracked
+    lastModifiedAt: string;       // Last revision timestamp
+}
+
+/**
+ * Request to store a file before modification.
+ * Must be called before any write operation.
+ */
+export interface StoreFileRequest {
+    filePath: string;             // Relative path
+    absolutePath: string;         // Full path
+    reason: 'read' | 'write' | 'pre-modify';  // Why we're storing
+    sessionId: string;
+    pairIndex: number;
+}
+
 export interface ModelUsageEntry {
     model: string;      // e.g., "grok-4", "grok-3-mini"
     text: number;       // Number of text-only calls
@@ -339,6 +462,66 @@ export interface ChatSessionDocument {
     pendingBundledFiles?: PendingBundledFiles;
     /** Sub-task registry for parallel/sequential work decomposition */
     subTaskRegistry?: SubTaskRegistryData;
+    /** Large file metadata (file awareness system) - files too big to load, awaiting AI request */
+    pendingLargeFiles?: LargeFileMetadataEntry[];
+    /** Analysis results cache - stores results of grep/head/python commands for AI reference */
+    analysisResults?: AnalysisResult[];
+}
+
+/**
+ * Large file metadata entry stored in session for persistence.
+ * Part of the file awareness system where AI sees metadata before requesting full content.
+ */
+export interface LargeFileMetadataEntry {
+    path: string;
+    sizeBytes: number;
+    lineCount: number;
+    language: string;
+    md5Hash: string;
+    preview: string;
+    structureHints?: {
+        classes?: string[];
+        functions?: string[];
+        sections?: string[];
+    };
+    reason: string;
+    detectedAt: string;
+    /** Track if AI has requested this file's content */
+    contentRequested?: boolean;
+    contentRequestMethod?: 'chunk' | 'analyze' | 'extract';
+}
+
+// ============================================================================
+// Analysis Results Cache - Persistent storage of file analysis results
+// ============================================================================
+
+/**
+ * Result of an analysis command run on a file.
+ * Stored in session so AI can reference previous analysis without re-requesting.
+ */
+export interface AnalysisResult {
+    /** Unique ID for this analysis */
+    id: string;
+    /** The command that was run (grep, head, python -c, etc.) */
+    command: string;
+    /** File path that was analyzed */
+    filePath: string;
+    /** Command output (truncated if too long) */
+    output: string;
+    /** Number of lines in output */
+    outputLines: number;
+    /** Whether output was truncated */
+    truncated: boolean;
+    /** MD5 hash of the file at time of analysis */
+    md5Hash: string;
+    /** ISO timestamp when analysis was run */
+    timestamp: string;
+    /** Which conversation pair requested this */
+    pairIndex: number;
+    /** Exit code of the command */
+    exitCode: number;
+    /** Duration in ms */
+    durationMs: number;
 }
 
 // ============================================================================
@@ -489,16 +672,27 @@ export type PairFileHistoryEntry = PairFileOperation[];
 /**
  * Entry in the file registry tracking file metadata across the conversation.
  * Allows AI to know which files it has "seen" even if not in current context.
+ * Tracks MD5 hashes at read time and after modifications for change detection.
  */
 export interface FileRegistryEntry {
     path: string;              // Relative path from workspace root
     absolutePath: string;      // Full filesystem path
-    md5: string;               // Last known hash
+    md5: string;               // Current/last known hash
+    originalMd5?: string;      // MD5 hash when file was FIRST read (before any AI changes)
+    originalReadAt?: string;   // ISO timestamp when file was first read
     lastSeenTurn: number;      // Which pairIndex last had this file attached
     lastModifiedTurn?: number; // Which pairIndex last modified this file
+    lastModifiedAt?: string;   // ISO timestamp of last modification
     sizeBytes: number;         // File size for context budget decisions
     language: string;          // Detected language (for syntax highlighting)
     loadedBy: PairFileOperationBy;  // How file was loaded (user/auto/ai-adhoc)
+    /** Track MD5 changes over time: [{turn, md5, timestamp}] */
+    md5History?: Array<{
+        turn: number;
+        md5: string;
+        timestamp: string;
+        changedBy: 'ai' | 'user' | 'external';
+    }>;
 }
 
 // ============================================================================
@@ -1404,6 +1598,55 @@ export async function appendPairFileOperation(
 }
 
 /**
+ * Append multiple file operations to a pair's history in a single atomic operation.
+ * This prevents race conditions when tracking multiple files loaded together.
+ */
+export async function appendPairFileOperationsBatch(
+    sessionId: string,
+    pairIndex: number,
+    operations: Array<Omit<PairFileOperation, 'dt'>>
+): Promise<PairFileOperation[]> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    const timestamp = Date.now();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Initialize pairFileHistory if not present
+    if (!doc.pairFileHistory) {
+        doc.pairFileHistory = [];
+    }
+    
+    // Ensure array is long enough for this pairIndex
+    while (doc.pairFileHistory.length <= pairIndex) {
+        doc.pairFileHistory.push([]);
+    }
+    
+    // Add all operations with the same timestamp
+    const fullOperations: PairFileOperation[] = operations.map(op => ({
+        ...op,
+        dt: timestamp
+    }));
+    
+    // Append all operations to the specific pair's history
+    doc.pairFileHistory[pairIndex].push(...fullOperations);
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to append pair file operations batch');
+    }
+    
+    console.log(`[FileHistory] Batch added ${operations.length} file(s) to pair ${pairIndex}`);
+    return fullOperations;
+}
+
+/**
  * Get the file history for a specific pair.
  */
 export async function getPairFileHistory(
@@ -1529,15 +1772,24 @@ export async function updateFileRegistry(
     for (const entry of entries) {
         const existing = doc.fileRegistry[entry.path];
         
+        // If this is the FIRST time we're seeing this file, record original MD5
+        const isFirstRead = !existing;
+        const originalMd5 = isFirstRead ? entry.md5 : (existing?.originalMd5 || existing?.md5);
+        const originalReadAt = isFirstRead ? now : existing?.originalReadAt;
+        
         doc.fileRegistry[entry.path] = {
             path: entry.path,
             absolutePath: entry.absolutePath,
             md5: entry.md5,
+            originalMd5,              // Preserve original hash from first read
+            originalReadAt,           // When file was first read
             lastSeenTurn: currentTurn,
             lastModifiedTurn: existing?.lastModifiedTurn,
+            lastModifiedAt: existing?.lastModifiedAt,
             sizeBytes: entry.sizeBytes,
             language: entry.language,
-            loadedBy: entry.loadedBy
+            loadedBy: entry.loadedBy,
+            md5History: existing?.md5History  // Preserve hash history
         };
     }
     
@@ -1582,9 +1834,31 @@ export async function markFileModified(
     
     const existing = doc.fileRegistry[path];
     if (existing) {
+        const oldMd5 = existing.md5;
+        
+        // Update current MD5 and modification tracking
         existing.md5 = newMd5;
         existing.lastModifiedTurn = modifiedTurn;
+        existing.lastModifiedAt = now;
         existing.lastSeenTurn = modifiedTurn;
+        
+        // Add to MD5 history if hash actually changed
+        if (oldMd5 !== newMd5) {
+            if (!existing.md5History) {
+                existing.md5History = [];
+            }
+            existing.md5History.push({
+                turn: modifiedTurn,
+                md5: newMd5,
+                timestamp: now,
+                changedBy: 'ai'  // Assume AI made the change (can be overridden)
+            });
+            // Keep history limited to last 10 changes
+            if (existing.md5History.length > 10) {
+                existing.md5History.shift();
+            }
+            debug(`[FileRegistry] MD5 changed: ${oldMd5.slice(0, 8)}... -> ${newMd5.slice(0, 8)}...`);
+        }
     } else {
         warn(`[FileRegistry] markFileModified called for unknown file: ${path}`);
     }
@@ -1647,32 +1921,50 @@ export function buildFileRegistrySummary(
     
     const lines: string[] = [];
     lines.push('\n## 📂 KNOWN FILES (Session Registry)');
-    lines.push('Files you have seen in this conversation. Check "Modified Since" before using cached knowledge.\n');
-    lines.push('| File | Last Seen | Modified Since | Hash (first 12) |');
-    lines.push('|------|-----------|----------------|-----------------|');
+    lines.push('Files you have seen in this conversation. Tracks original MD5 from first read + changes.\n');
+    lines.push('| File | First Read | Original MD5 | Current MD5 | Changes |');
+    lines.push('|------|------------|--------------|-------------|---------|');
     
     for (const entry of displayEntries) {
         const turnsAgo = currentTurn - entry.lastSeenTurn;
         const lastSeenLabel = turnsAgo === 0 ? 'This turn' : `${turnsAgo} turn(s) ago`;
         
-        let modifiedLabel = 'No';
-        if (entry.lastModifiedTurn !== undefined) {
-            if (entry.lastModifiedTurn > entry.lastSeenTurn) {
-                modifiedLabel = `⚠️ Yes (turn ${entry.lastModifiedTurn})`;
-            } else if (entry.lastModifiedTurn === entry.lastSeenTurn) {
-                modifiedLabel = 'Just now';
+        // Show original MD5 from first read
+        const originalHash = entry.originalMd5 ? entry.originalMd5.slice(0, 8) : entry.md5.slice(0, 8);
+        const currentHash = entry.md5.slice(0, 8);
+        
+        // Determine change status
+        let changeStatus = '—';
+        const hasChanged = entry.originalMd5 && entry.originalMd5 !== entry.md5;
+        if (hasChanged) {
+            const changeCount = entry.md5History?.length || 1;
+            changeStatus = `✏️ ${changeCount} change(s)`;
+            if (entry.lastModifiedTurn !== undefined) {
+                changeStatus += ` (turn ${entry.lastModifiedTurn})`;
             }
         }
         
-        const hashPreview = entry.md5.slice(0, 12);
-        lines.push(`| ${entry.path} | ${lastSeenLabel} | ${modifiedLabel} | ${hashPreview}... |`);
+        lines.push(`| ${entry.path} | ${lastSeenLabel} | ${originalHash}... | ${currentHash}... | ${changeStatus} |`);
+    }
+    
+    // Show detailed change history for recently modified files
+    const modifiedFiles = displayEntries.filter(e => e.md5History && e.md5History.length > 0);
+    if (modifiedFiles.length > 0) {
+        lines.push('\n### 📝 CHANGE HISTORY (your modifications)');
+        for (const entry of modifiedFiles.slice(0, 5)) {
+            lines.push(`\n**${entry.path}**`);
+            lines.push(`- Original: ${entry.originalMd5?.slice(0, 12) || 'N/A'}... (read at ${entry.originalReadAt || 'unknown'})`);
+            for (const change of entry.md5History || []) {
+                lines.push(`- Turn ${change.turn}: → ${change.md5.slice(0, 12)}... (${change.changedBy}, ${change.timestamp})`);
+            }
+        }
     }
     
     if (entries.length > maxFiles) {
         lines.push(`\n*...and ${entries.length - maxFiles} more files in registry*`);
     }
     
-    lines.push('\n**If "Modified Since" shows ⚠️, request re-attachment before making changes.**');
+    lines.push('\n**Use Original MD5 to verify file unchanged. If Current != Original, you modified it.**');
     
     return lines.join('\n');
 }
@@ -3159,4 +3451,624 @@ export async function getBackupsForSession(sessionId: string): Promise<FileBacku
         console.error('Failed to get backups for session:', sessionId, err);
         return [];
     }
+}
+
+// ============================================================================
+// Large File Metadata (File Awareness System)
+// ============================================================================
+
+/**
+ * Store large file metadata in session for persistence.
+ * Called when a file exceeds the size threshold during agent workflow.
+ */
+export async function storePendingLargeFiles(
+    sessionId: string,
+    metadata: LargeFileMetadataEntry[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    const doc = result.content;
+    
+    // Merge with existing, avoiding duplicates by path
+    const existing = doc.pendingLargeFiles || [];
+    const existingPaths = new Set(existing.map(f => f.path));
+    
+    for (const entry of metadata) {
+        if (!existingPaths.has(entry.path)) {
+            existing.push({
+                ...entry,
+                detectedAt: entry.detectedAt || now
+            });
+            existingPaths.add(entry.path);
+        }
+    }
+    
+    doc.pendingLargeFiles = existing;
+    doc.updatedAt = now;
+
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to store pending large files');
+    }
+
+    debug('Stored pending large files', { sessionId, count: metadata.length, total: existing.length });
+}
+
+/**
+ * Mark a large file's content as requested by AI.
+ */
+export async function markLargeFileRequested(
+    sessionId: string,
+    filePath: string,
+    method: 'chunk' | 'analyze' | 'extract'
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    const doc = result.content;
+    
+    if (doc.pendingLargeFiles) {
+        const entry = doc.pendingLargeFiles.find(f => f.path === filePath);
+        if (entry) {
+            entry.contentRequested = true;
+            entry.contentRequestMethod = method;
+        }
+    }
+    
+    doc.updatedAt = now;
+
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to mark large file requested');
+    }
+
+    debug('Marked large file requested', { sessionId, filePath, method });
+}
+
+/**
+ * Get pending large files that haven't had content requested yet.
+ */
+export async function getPendingLargeFiles(sessionId: string): Promise<LargeFileMetadataEntry[]> {
+    const client = getCouchbaseClient();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return [];
+    }
+
+    return (result.content.pendingLargeFiles || []).filter(f => !f.contentRequested);
+}
+
+/**
+ * Clear pending large files after they've been processed.
+ */
+export async function clearPendingLargeFiles(sessionId: string): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return;
+    }
+
+    const doc = result.content;
+    doc.pendingLargeFiles = [];
+    doc.updatedAt = now;
+
+    await client.replace(sessionId, doc);
+    debug('Cleared pending large files', { sessionId });
+}
+
+/**
+ * Build a summary of large files for inclusion in context.
+ */
+export function buildLargeFilesSummary(entries: LargeFileMetadataEntry[]): string {
+    if (entries.length === 0) {
+        return '';
+    }
+    
+    let summary = '\n\n---\n**📦 LARGE FILES PENDING (from previous turn):**\n';
+    summary += 'These files were detected but not loaded. Use request_content to access.\n\n';
+    
+    for (const entry of entries) {
+        const sizeKB = (entry.sizeBytes / 1024).toFixed(1);
+        summary += `- **${entry.path}** (${sizeKB}KB, ${entry.lineCount} lines)\n`;
+        if (entry.structureHints?.functions?.length) {
+            summary += `  Functions: ${entry.structureHints.functions.slice(0, 5).join(', ')}...\n`;
+        }
+    }
+    
+    return summary;
+}
+
+// ============================================================================
+// Analysis Results Cache - Store and retrieve file analysis results
+// ============================================================================
+
+/**
+ * Store an analysis result in the session.
+ * Results are keyed by command+filePath so duplicate runs update existing.
+ */
+export async function storeAnalysisResult(
+    sessionId: string,
+    result: Omit<AnalysisResult, 'id' | 'timestamp'>
+): Promise<AnalysisResult> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const fullResult: AnalysisResult = {
+        ...result,
+        id: uuidv4(),
+        timestamp: now
+    };
+    
+    const getResult = await client.get<ChatSessionDocument>(sessionId);
+    if (!getResult || !getResult.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = getResult.content;
+    const existing = doc.analysisResults || [];
+    
+    // Check if we already have a result for this command+filePath
+    const existingIndex = existing.findIndex(r => 
+        r.command === result.command && r.filePath === result.filePath
+    );
+    
+    if (existingIndex >= 0) {
+        // Update existing result
+        existing[existingIndex] = fullResult;
+        debug('Updated existing analysis result', { command: result.command, filePath: result.filePath });
+    } else {
+        // Add new result (keep last 20 to avoid bloat)
+        existing.push(fullResult);
+        if (existing.length > 20) {
+            existing.shift(); // Remove oldest
+        }
+        debug('Added new analysis result', { command: result.command, filePath: result.filePath });
+    }
+    
+    doc.analysisResults = existing;
+    doc.updatedAt = now;
+    
+    await client.replace(sessionId, doc);
+    return fullResult;
+}
+
+/**
+ * Get all analysis results for a session.
+ */
+export async function getAnalysisResults(sessionId: string): Promise<AnalysisResult[]> {
+    const client = getCouchbaseClient();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return [];
+    }
+    
+    return result.content.analysisResults || [];
+}
+
+/**
+ * Get analysis results for a specific file.
+ */
+export async function getFileAnalysisResults(sessionId: string, filePath: string): Promise<AnalysisResult[]> {
+    const results = await getAnalysisResults(sessionId);
+    return results.filter(r => r.filePath === filePath);
+}
+
+/**
+ * Build a summary of previous analysis results for AI context.
+ * Includes command, truncated output, and MD5 hash.
+ */
+export function buildAnalysisResultsSummary(results: AnalysisResult[]): string {
+    if (results.length === 0) {
+        return '';
+    }
+    
+    let summary = '\n\n---\n**📊 PREVIOUS ANALYSIS RESULTS (use this data - don\'t re-request):**\n\n';
+    
+    for (const result of results) {
+        const truncatedOutput = result.output.length > 2000 
+            ? result.output.slice(0, 2000) + '\n... (truncated)'
+            : result.output;
+        
+        summary += `### Analysis: \`${result.command}\`\n`;
+        summary += `- File: ${result.filePath}\n`;
+        summary += `- MD5: ${result.md5Hash}\n`;
+        summary += `- Lines: ${result.outputLines}${result.truncated ? ' (truncated)' : ''}\n`;
+        summary += `- Ran at: ${result.timestamp}\n`;
+        summary += '```\n' + truncatedOutput + '\n```\n\n';
+    }
+    
+    return summary;
+}
+
+// ============================================================================
+// File Revision Functions - Line-level change tracking
+// ============================================================================
+
+/**
+ * Generate a path hash for file revision keys
+ */
+function getRevisionPathHash(filePath: string): string {
+    return crypto.createHash('sha256').update(filePath).digest('hex').slice(0, 16);
+}
+
+/**
+ * Get the revision index for a file (or null if not tracked)
+ */
+export async function getFileRevisionIndex(filePath: string): Promise<FileRevisionIndex | null> {
+    const client = getCouchbaseClient();
+    const pathHash = getRevisionPathHash(filePath);
+    const indexId = `file-rev-index::${pathHash}`;
+    
+    try {
+        const result = await client.get<FileRevisionIndex>(indexId);
+        if (result && result.content) {
+            return result.content;
+        }
+    } catch (err) {
+        debug('Failed to get revision index:', { filePath, error: String(err) });
+    }
+    return null;
+}
+
+/**
+ * Compute line-level diff between two content strings.
+ * Returns individual line changes for precise rollback.
+ */
+export function computeLineDiff(
+    oldContent: string,
+    newContent: string
+): { changes: LineChange[]; stats: { linesAdded: number; linesDeleted: number; linesModified: number } } {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+    const changes: LineChange[] = [];
+    let linesAdded = 0;
+    let linesDeleted = 0;
+    let linesModified = 0;
+    
+    // Simple diff algorithm - LCS would be better for complex diffs
+    // For now, compare line by line with insertions/deletions
+    const maxLen = Math.max(oldLines.length, newLines.length);
+    let oldIdx = 0;
+    let newIdx = 0;
+    
+    while (oldIdx < oldLines.length || newIdx < newLines.length) {
+        if (oldIdx >= oldLines.length) {
+            // Remaining lines are inserts
+            changes.push({
+                type: 'insert',
+                lineNumber: newIdx + 1,
+                newContent: newLines[newIdx]
+            });
+            linesAdded++;
+            newIdx++;
+        } else if (newIdx >= newLines.length) {
+            // Remaining lines are deletes
+            changes.push({
+                type: 'delete',
+                lineNumber: oldIdx + 1,
+                oldContent: oldLines[oldIdx]
+            });
+            linesDeleted++;
+            oldIdx++;
+        } else if (oldLines[oldIdx] === newLines[newIdx]) {
+            // Lines match - skip
+            oldIdx++;
+            newIdx++;
+        } else {
+            // Lines differ - check if it's a replace or insert/delete
+            // Look ahead to see if old line appears later in new content
+            const oldLineInNew = newLines.slice(newIdx + 1).indexOf(oldLines[oldIdx]);
+            const newLineInOld = oldLines.slice(oldIdx + 1).indexOf(newLines[newIdx]);
+            
+            if (oldLineInNew === -1 && newLineInOld === -1) {
+                // Neither line appears later - it's a replace
+                changes.push({
+                    type: 'replace',
+                    lineNumber: oldIdx + 1,
+                    oldContent: oldLines[oldIdx],
+                    newContent: newLines[newIdx]
+                });
+                linesModified++;
+                oldIdx++;
+                newIdx++;
+            } else if (oldLineInNew !== -1 && (newLineInOld === -1 || oldLineInNew <= newLineInOld)) {
+                // New line inserted
+                changes.push({
+                    type: 'insert',
+                    lineNumber: newIdx + 1,
+                    newContent: newLines[newIdx]
+                });
+                linesAdded++;
+                newIdx++;
+            } else {
+                // Old line deleted
+                changes.push({
+                    type: 'delete',
+                    lineNumber: oldIdx + 1,
+                    oldContent: oldLines[oldIdx]
+                });
+                linesDeleted++;
+                oldIdx++;
+            }
+        }
+    }
+    
+    return { changes, stats: { linesAdded, linesDeleted, linesModified } };
+}
+
+/**
+ * Store a file revision before/after a change.
+ * This is the core function that captures line-level changes.
+ */
+export async function storeFileRevision(
+    filePath: string,
+    absolutePath: string,
+    oldContent: string,
+    newContent: string,
+    options: {
+        sessionId: string;
+        pairIndex: number;
+        changeSource: 'ai' | 'user' | 'auto-apply';
+        changeSetId?: string;
+    }
+): Promise<FileRevisionDocument> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    const pathHash = getRevisionPathHash(absolutePath);
+    const fileName = absolutePath.split('/').pop() || absolutePath;
+    
+    // Get or create revision index
+    let revIndex = await getFileRevisionIndex(absolutePath);
+    let revisionNumber = 1;
+    let previousRevisionId: string | undefined;
+    
+    if (revIndex) {
+        revisionNumber = revIndex.currentRevision + 1;
+        if (revIndex.revisions.length > 0) {
+            previousRevisionId = revIndex.revisions[revIndex.revisions.length - 1].revisionId;
+        }
+    }
+    
+    // Compute line-level diff
+    const { changes, stats } = computeLineDiff(oldContent, newContent);
+    
+    // Create revision document
+    const revisionId = `file-rev::${pathHash}::${revisionNumber}`;
+    const oldMd5 = computeFileHash(oldContent);
+    const newMd5 = computeFileHash(newContent);
+    
+    const revisionDoc: FileRevisionDocument = {
+        id: revisionId,
+        docType: 'file-revision',
+        filePath,
+        absolutePath,
+        pathHash,
+        fileName,
+        revisionNumber,
+        previousRevisionId,
+        md5Before: oldMd5,
+        md5After: newMd5,
+        lineCountBefore: oldContent.split('\n').length,
+        lineCountAfter: newContent.split('\n').length,
+        sizeBytesBefore: Buffer.byteLength(oldContent, 'utf8'),
+        sizeBytesAfter: Buffer.byteLength(newContent, 'utf8'),
+        changes,
+        changeStats: stats,
+        changeSource: options.changeSource,
+        sessionId: options.sessionId,
+        pairIndex: options.pairIndex,
+        changeSetId: options.changeSetId,
+        createdAt: now
+    };
+    
+    // Store content snapshots if under 100KB
+    const SNAPSHOT_THRESHOLD = 100 * 1024;
+    if (oldContent.length < SNAPSHOT_THRESHOLD) {
+        const compressed = await gzipAsync(Buffer.from(oldContent, 'utf8'));
+        revisionDoc.contentSnapshotBefore = compressed.toString('base64');
+    }
+    if (newContent.length < SNAPSHOT_THRESHOLD) {
+        const compressed = await gzipAsync(Buffer.from(newContent, 'utf8'));
+        revisionDoc.contentSnapshotAfter = compressed.toString('base64');
+    }
+    
+    // Store revision document
+    const insertResult = await client.insert(revisionId, revisionDoc);
+    if (!insertResult.success) {
+        throw new Error(`Failed to store file revision: ${insertResult.error}`);
+    }
+    
+    // Update or create revision index
+    const indexId = `file-rev-index::${pathHash}`;
+    if (revIndex) {
+        revIndex.revisions.push({
+            revisionNumber,
+            revisionId,
+            md5After: newMd5,
+            createdAt: now,
+            changeStats: stats,
+            sessionId: options.sessionId,
+            pairIndex: options.pairIndex
+        });
+        revIndex.currentRevision = revisionNumber;
+        revIndex.lastModifiedAt = now;
+        
+        await client.replace(indexId, revIndex);
+    } else {
+        const newIndex: FileRevisionIndex = {
+            id: indexId,
+            docType: 'file-revision-index',
+            filePath,
+            absolutePath,
+            pathHash,
+            revisions: [{
+                revisionNumber,
+                revisionId,
+                md5After: newMd5,
+                createdAt: now,
+                changeStats: stats,
+                sessionId: options.sessionId,
+                pairIndex: options.pairIndex
+            }],
+            currentRevision: revisionNumber,
+            firstSeenAt: now,
+            lastModifiedAt: now
+        };
+        
+        await client.insert(indexId, newIndex);
+    }
+    
+    info(`Stored file revision ${revisionNumber} for ${fileName}`, { 
+        changes: changes.length,
+        stats 
+    });
+    
+    return revisionDoc;
+}
+
+/**
+ * Get a specific file revision by number
+ */
+export async function getFileRevision(
+    filePath: string,
+    revisionNumber: number
+): Promise<FileRevisionDocument | null> {
+    const client = getCouchbaseClient();
+    const pathHash = getRevisionPathHash(filePath);
+    const revisionId = `file-rev::${pathHash}::${revisionNumber}`;
+    
+    try {
+        const result = await client.get<FileRevisionDocument>(revisionId);
+        if (result && result.content) {
+            return result.content;
+        }
+    } catch (err) {
+        debug('Failed to get file revision:', { revisionId, error: String(err) });
+    }
+    return null;
+}
+
+/**
+ * Get all revisions for a file
+ */
+export async function getFileRevisions(filePath: string): Promise<FileRevisionDocument[]> {
+    const index = await getFileRevisionIndex(filePath);
+    if (!index) {
+        return [];
+    }
+    
+    const client = getCouchbaseClient();
+    const revisions: FileRevisionDocument[] = [];
+    
+    for (const rev of index.revisions) {
+        try {
+            const result = await client.get<FileRevisionDocument>(rev.revisionId);
+            if (result && result.content) {
+                revisions.push(result.content);
+            }
+        } catch (err) {
+            debug('Failed to get revision:', { revisionId: rev.revisionId, error: String(err) });
+        }
+    }
+    
+    return revisions;
+}
+
+/**
+ * Restore file content from a specific revision.
+ * Returns the content at that revision (before or after state).
+ */
+export async function restoreFromRevision(
+    filePath: string,
+    revisionNumber: number,
+    state: 'before' | 'after' = 'before'
+): Promise<string | null> {
+    const revision = await getFileRevision(filePath, revisionNumber);
+    if (!revision) {
+        warn('Revision not found:', { filePath, revisionNumber });
+        return null;
+    }
+    
+    // Try to use snapshot if available
+    const snapshot = state === 'before' 
+        ? revision.contentSnapshotBefore 
+        : revision.contentSnapshotAfter;
+    
+    if (snapshot) {
+        try {
+            const compressed = Buffer.from(snapshot, 'base64');
+            const decompressed = await gunzipAsync(compressed);
+            return decompressed.toString('utf8');
+        } catch (err) {
+            warn('Failed to decompress snapshot, will reconstruct:', err);
+        }
+    }
+    
+    // No snapshot - need to reconstruct from original + changes
+    // This requires having the original backup or iterating through revisions
+    // For now, return null if no snapshot
+    warn('No snapshot available for revision:', { filePath, revisionNumber, state });
+    return null;
+}
+
+/**
+ * Rollback a file to a specific revision.
+ * Writes the file content to disk.
+ */
+export async function rollbackFileToRevision(
+    filePath: string,
+    revisionNumber: number,
+    state: 'before' | 'after' = 'before'
+): Promise<{ success: boolean; error?: string; content?: string }> {
+    const content = await restoreFromRevision(filePath, revisionNumber, state);
+    if (!content) {
+        return { success: false, error: 'Could not restore content from revision' };
+    }
+    
+    const vscode = await import('vscode');
+    const uri = vscode.Uri.file(filePath);
+    
+    try {
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+        info(`Rolled back ${filePath} to revision ${revisionNumber} (${state})`);
+        return { success: true, content };
+    } catch (err: any) {
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * Build a summary of file revision history for display
+ */
+export function buildRevisionHistorySummary(index: FileRevisionIndex): string {
+    if (!index || index.revisions.length === 0) {
+        return '';
+    }
+    
+    let summary = `\n📜 **Revision History for ${index.filePath}**\n`;
+    summary += `| Rev | Date | Changes | Session |\n`;
+    summary += `|-----|------|---------|--------|\n`;
+    
+    for (const rev of index.revisions.slice(-10)) { // Last 10 revisions
+        const date = new Date(rev.createdAt).toLocaleString();
+        const changes = `+${rev.changeStats.linesAdded}/-${rev.changeStats.linesDeleted}`;
+        summary += `| ${rev.revisionNumber} | ${date} | ${changes} | ${rev.sessionId.slice(0, 8)} |\n`;
+    }
+    
+    return summary;
 }
