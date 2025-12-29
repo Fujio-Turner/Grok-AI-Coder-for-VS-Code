@@ -324,7 +324,7 @@ export interface ExecuteResult {
 
 /** 
  * Threshold for large file detection - files above this get metadata only.
- * Default: 100KB (increased from 50KB to reduce user friction for moderately large files)
+ * Default: 100KB - files above this get metadata only, AI must request content
  * Files under this threshold are loaded directly with full content.
  */
 const LARGE_FILE_THRESHOLD = 100 * 1024;

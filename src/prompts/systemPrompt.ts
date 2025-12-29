@@ -461,8 +461,8 @@ export function buildSystemPrompt(workspaceInfo?: WorkspaceInfo): string {
     if (workspaceInfo) {
         // OS-specific command hints
         const osHints = workspaceInfo.platform === 'windows'
-            ? 'Use PowerShell commands (e.g., mkdir, Copy-Item). Paths use backslash (\\).'
-            : 'Use Unix commands (e.g., mkdir -p, cp). Paths use forward slash (/).';
+            ? 'Use PowerShell commands (e.g., mkdir, Copy-Item). Paths use backslash (\\). Use `python` for Python scripts.'
+            : 'Use Unix commands (e.g., mkdir -p, cp). Paths use forward slash (/). Use `python3` for Python scripts (not `python`).';
         
         prompt += `\n\n## WORKSPACE CONTEXT
 
