@@ -6,10 +6,19 @@
  * Pass 3: Main model processes everything and can update the plan
  */
 
+export type FallbackAction = 'ask_user' | 'skip' | 'create_new';
+
 export interface FileAction {
     type: 'file';
-    pattern: string;
+    /** @deprecated Use patterns array instead */
+    pattern?: string;
+    /** Glob patterns to try in order (first match wins) */
+    patterns?: string[];
     reason: string;
+    /** If true, task cannot proceed without this file */
+    required?: boolean;
+    /** What to do if all patterns fail */
+    fallbackAction?: FallbackAction;
 }
 
 export interface UrlAction {
@@ -54,7 +63,7 @@ export interface ExecutionResult {
 }
 
 export interface ProgressUpdate {
-    type: 'plan' | 'file-start' | 'file-done' | 'url-start' | 'url-done' | 'error';
+    type: 'plan' | 'file-start' | 'file-done' | 'url-start' | 'url-done' | 'dir-start' | 'dir-done' | 'error';
     message: string;
     details?: {
         path?: string;
@@ -64,5 +73,22 @@ export interface ProgressUpdate {
         todoCount?: number;
         actionCount?: number;
         files?: string[];
+        directories?: string[];
+        fileCount?: number;
+        dirCount?: number;
     };
+}
+
+export interface DirectoryListingEntry {
+    name: string;
+    isDirectory: boolean;
+    sizeBytes?: number;
+}
+
+export interface DirectoryListingResult {
+    path: string;
+    entries: DirectoryListingEntry[];
+    error?: string;
+    filter?: string;
+    recursive: boolean;
 }

@@ -332,6 +332,41 @@ export interface ChatSessionDocument {
     auditGenerating?: boolean;
     /** File registry - persistent file metadata across conversation turns */
     fileRegistry?: Record<string, FileRegistryEntry>;
+    /** Pending directory listing results to inject in next turn */
+    pendingDirectoryResults?: PendingDirectoryResults;
+    /** Pending bundled files (imports/tests) to attach in next turn */
+    pendingBundledFiles?: PendingBundledFiles;
+    /** Sub-task registry for parallel/sequential work decomposition */
+    subTaskRegistry?: SubTaskRegistryData;
+}
+
+// ============================================================================
+// Sub-Task Registry - Parallel work decomposition
+// ============================================================================
+
+export type SubTaskStatus = 'pending' | 'ready' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface SubTaskData {
+    id: string;
+    goal: string;
+    files: string[];
+    dependencies: string[];
+    autoExecute: boolean;
+    status: SubTaskStatus;
+    sessionId?: string;
+    result?: string;
+    error?: string;
+    createdAt: string;
+    startedAt?: string;
+    completedAt?: string;
+    filesChanged?: string[];
+}
+
+export interface SubTaskRegistryData {
+    tasks: SubTaskData[];
+    parentSessionId: string;
+    createdAt: string;
+    updatedAt: string;
 }
 
 // ============================================================================
@@ -463,6 +498,64 @@ export interface FileRegistryEntry {
     sizeBytes: number;         // File size for context budget decisions
     language: string;          // Detected language (for syntax highlighting)
     loadedBy: PairFileOperationBy;  // How file was loaded (user/auto/ai-adhoc)
+}
+
+// ============================================================================
+// Directory Listing - AI can explore workspace directories
+// ============================================================================
+
+/**
+ * Entry in a directory listing result.
+ */
+export interface DirectoryListingEntry {
+    name: string;           // File or directory name
+    isDirectory: boolean;   // True if this is a directory
+    sizeBytes?: number;     // File size (only for files)
+}
+
+/**
+ * Result of a directory listing request.
+ */
+export interface DirectoryListingResult {
+    path: string;           // Requested directory path
+    entries: DirectoryListingEntry[];  // Listing entries
+    error?: string;         // Error message if listing failed
+    filter?: string;        // Glob filter that was applied
+    recursive: boolean;     // Whether subdirectories were included
+    requestedAt: string;    // ISO timestamp of request
+}
+
+/**
+ * Pending directory requests waiting to be processed.
+ * Stored on session and injected into next turn's context.
+ */
+export interface PendingDirectoryResults {
+    turn: number;           // Which turn requested these listings
+    results: DirectoryListingResult[];  // Results to inject
+}
+
+// ============================================================================
+// Proactive File Bundling - Auto-attach imports/tests
+// ============================================================================
+
+/**
+ * A file that was bundled due to its relationship to a modified file.
+ */
+export interface BundledFileEntry {
+    path: string;           // Absolute path to the file
+    relativePath: string;   // Relative to workspace root
+    type: 'import' | 'test' | 'related';  // Why this file was bundled
+    sourceFile: string;     // Which modified file triggered this bundle
+    sizeBytes?: number;     // File size for context budget
+}
+
+/**
+ * Pending bundled files waiting to be attached in next turn.
+ */
+export interface PendingBundledFiles {
+    turn: number;           // Which turn's modifications triggered the bundling
+    files: BundledFileEntry[];  // Files to auto-attach
+    triggeredBy: string[];  // Paths of modified files that triggered bundling
 }
 
 /**
@@ -1567,6 +1660,390 @@ export function buildFileRegistrySummary(
     
     lines.push('\n**If "Modified Since" shows ⚠️, request re-attachment before making changes.**');
     
+    return lines.join('\n');
+}
+
+// ============================================================================
+// Directory Listing - AI can explore workspace directories
+// ============================================================================
+
+/**
+ * Store pending directory listing results for injection into next turn.
+ * These are processed after AI response and injected into the next API call.
+ */
+export async function storePendingDirectoryResults(
+    sessionId: string,
+    turn: number,
+    results: DirectoryListingResult[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    doc.pendingDirectoryResults = { turn, results };
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to store pending directory results');
+    }
+    
+    debug('Stored pending directory results', { sessionId, turn, count: results.length });
+}
+
+/**
+ * Clear pending directory results after they've been injected.
+ */
+export async function clearPendingDirectoryResults(sessionId: string): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return; // Session not found, nothing to clear
+    }
+    
+    const doc = result.content;
+    if (doc.pendingDirectoryResults) {
+        delete doc.pendingDirectoryResults;
+        doc.updatedAt = now;
+        await client.replace(sessionId, doc);
+        debug('Cleared pending directory results', { sessionId });
+    }
+}
+
+/**
+ * Build a summary of directory listing results for injection into AI context.
+ * Called when building messages for the next turn.
+ */
+export function buildDirectoryListingSummary(
+    results: DirectoryListingResult[]
+): string {
+    if (!results || results.length === 0) {
+        return '';
+    }
+    
+    const lines: string[] = [];
+    lines.push('\n## 📁 DIRECTORY LISTING RESULTS');
+    lines.push('You requested these directory listings. Use exact paths to request specific files.\n');
+    
+    for (const result of results) {
+        if (result.error) {
+            lines.push(`### ⚠️ ${result.path}`);
+            lines.push(`Error: ${result.error}\n`);
+            continue;
+        }
+        
+        const filterNote = result.filter ? ` (filter: ${result.filter})` : '';
+        const recursiveNote = result.recursive ? ' [recursive]' : '';
+        lines.push(`### 📂 ${result.path}${filterNote}${recursiveNote}`);
+        
+        if (result.entries.length === 0) {
+            lines.push('*(empty directory)*\n');
+            continue;
+        }
+        
+        // Separate dirs and files
+        const dirs = result.entries.filter(e => e.isDirectory);
+        const files = result.entries.filter(e => !e.isDirectory);
+        
+        lines.push('| Name | Type | Size |');
+        lines.push('|------|------|------|');
+        
+        // Show directories first
+        for (const entry of dirs) {
+            lines.push(`| ${entry.name}/ | 📁 dir | - |`);
+        }
+        
+        // Then files
+        for (const entry of files) {
+            const size = entry.sizeBytes !== undefined 
+                ? formatFileSize(entry.sizeBytes) 
+                : '-';
+            lines.push(`| ${entry.name} | 📄 file | ${size} |`);
+        }
+        
+        lines.push(`\n*${dirs.length} directories, ${files.length} files*\n`);
+    }
+    
+    lines.push('**To load a file, use:** `{\"nextSteps\": [{\"html\": \"Attach file.ts\", \"inputText\": \"path/to/file.ts\"}]}`');
+    
+    return lines.join('\n');
+}
+
+/**
+ * Format file size in human-readable format.
+ */
+function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// ============================================================================
+// Proactive File Bundling - Auto-attach imports/tests
+// ============================================================================
+
+/**
+ * Store pending bundled files for injection into next turn.
+ * Called after user applies file changes.
+ */
+export async function storePendingBundledFiles(
+    sessionId: string,
+    turn: number,
+    files: BundledFileEntry[],
+    triggeredBy: string[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    doc.pendingBundledFiles = { turn, files, triggeredBy };
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to store pending bundled files');
+    }
+    
+    debug('Stored pending bundled files', { sessionId, turn, count: files.length });
+}
+
+/**
+ * Clear pending bundled files after they've been injected.
+ */
+export async function clearPendingBundledFiles(sessionId: string): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return; // Session not found, nothing to clear
+    }
+    
+    const doc = result.content;
+    if (doc.pendingBundledFiles) {
+        delete doc.pendingBundledFiles;
+        doc.updatedAt = now;
+        await client.replace(sessionId, doc);
+        debug('Cleared pending bundled files', { sessionId });
+    }
+}
+
+/**
+ * Build a summary of bundled files for injection into AI context.
+ */
+export function buildBundledFilesSummary(bundledFiles: PendingBundledFiles): string {
+    if (!bundledFiles || bundledFiles.files.length === 0) {
+        return '';
+    }
+
+    const lines: string[] = [];
+    lines.push('\n## 📦 AUTO-BUNDLED FILES');
+    lines.push('These files were automatically attached because they are related to files you modified.\n');
+
+    const imports = bundledFiles.files.filter(f => f.type === 'import');
+    const tests = bundledFiles.files.filter(f => f.type === 'test');
+    const related = bundledFiles.files.filter(f => f.type === 'related');
+
+    if (imports.length > 0) {
+        lines.push('### Imported Files');
+        for (const f of imports) {
+            const size = f.sizeBytes ? ` (${formatFileSize(f.sizeBytes)})` : '';
+            lines.push(`- 📄 ${f.relativePath}${size}`);
+        }
+        lines.push('');
+    }
+
+    if (tests.length > 0) {
+        lines.push('### Test Files');
+        for (const f of tests) {
+            const size = f.sizeBytes ? ` (${formatFileSize(f.sizeBytes)})` : '';
+            lines.push(`- 🧪 ${f.relativePath}${size}`);
+        }
+        lines.push('');
+    }
+
+    if (related.length > 0) {
+        lines.push('### Related Files');
+        for (const f of related) {
+            const size = f.sizeBytes ? ` (${formatFileSize(f.sizeBytes)})` : '';
+            lines.push(`- 📎 ${f.relativePath}${size}`);
+        }
+        lines.push('');
+    }
+
+    lines.push(`*Triggered by modifications to: ${bundledFiles.triggeredBy.join(', ')}*`);
+    lines.push('\n**These file contents are attached below. Review before making changes.**');
+
+    return lines.join('\n');
+}
+
+// ============================================================================
+// Sub-Task Registry Functions
+// ============================================================================
+
+/**
+ * Store or update sub-task registry for a session
+ */
+export async function storeSubTaskRegistry(
+    sessionId: string,
+    registry: SubTaskRegistryData
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        warn('Cannot store sub-task registry: session not found', { sessionId });
+        return;
+    }
+
+    const doc = result.content;
+    doc.subTaskRegistry = {
+        ...registry,
+        updatedAt: now
+    };
+    doc.updatedAt = now;
+
+    await client.replace(sessionId, doc);
+    debug('Stored sub-task registry', { sessionId, taskCount: registry.tasks.length });
+}
+
+/**
+ * Get sub-task registry for a session
+ */
+export async function getSubTaskRegistry(sessionId: string): Promise<SubTaskRegistryData | undefined> {
+    const client = getCouchbaseClient();
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return undefined;
+    }
+    return result.content.subTaskRegistry;
+}
+
+/**
+ * Update a single sub-task's status
+ */
+export async function updateSubTaskStatus(
+    sessionId: string,
+    taskId: string,
+    status: SubTaskStatus,
+    result?: string,
+    error?: string,
+    filesChanged?: string[]
+): Promise<boolean> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const getResult = await client.get<ChatSessionDocument>(sessionId);
+    if (!getResult || !getResult.content) {
+        return false;
+    }
+
+    const doc = getResult.content;
+    if (!doc.subTaskRegistry) {
+        return false;
+    }
+
+    const task = doc.subTaskRegistry.tasks.find(t => t.id === taskId);
+    if (!task) {
+        return false;
+    }
+
+    task.status = status;
+    if (status === 'running') {
+        task.startedAt = now;
+    }
+    if (status === 'completed' || status === 'failed' || status === 'skipped') {
+        task.completedAt = now;
+    }
+    if (result) {
+        task.result = result;
+    }
+    if (error) {
+        task.error = error;
+    }
+    if (filesChanged) {
+        task.filesChanged = filesChanged;
+    }
+
+    doc.subTaskRegistry.updatedAt = now;
+    doc.updatedAt = now;
+
+    const success = await client.replace(sessionId, doc);
+    if (success) {
+        debug('Updated sub-task status', { sessionId, taskId, status });
+    }
+    return success;
+}
+
+/**
+ * Build a summary of sub-tasks for display in AI context
+ */
+export function buildSubTasksSummary(registry: SubTaskRegistryData): string {
+    if (!registry || registry.tasks.length === 0) {
+        return '';
+    }
+
+    const statusEmoji: Record<SubTaskStatus, string> = {
+        pending: '⏸️',
+        ready: '🟡',
+        running: '🔄',
+        completed: '✅',
+        failed: '❌',
+        skipped: '⏭️'
+    };
+
+    const completed = registry.tasks.filter(t => t.status === 'completed').length;
+    const lines: string[] = [];
+    
+    lines.push(`\n## 📋 SUB-TASKS (${completed}/${registry.tasks.length} complete)\n`);
+    lines.push('| Status | ID | Goal | Dependencies |');
+    lines.push('|--------|-----|------|--------------|');
+
+    for (const task of registry.tasks) {
+        const emoji = statusEmoji[task.status];
+        const deps = task.dependencies.length > 0 ? task.dependencies.join(', ') : '-';
+        const goal = task.goal.length > 50 ? task.goal.slice(0, 50) + '...' : task.goal;
+        lines.push(`| ${emoji} ${task.status} | ${task.id} | ${goal} | ${deps} |`);
+    }
+
+    lines.push('');
+    
+    // Show results for completed tasks
+    const completedWithResults = registry.tasks.filter(t => t.status === 'completed' && t.result);
+    if (completedWithResults.length > 0) {
+        lines.push('### Completed Task Results\n');
+        for (const task of completedWithResults) {
+            lines.push(`**${task.id}**: ${task.result}`);
+            if (task.filesChanged && task.filesChanged.length > 0) {
+                lines.push(`  - Files changed: ${task.filesChanged.join(', ')}`);
+            }
+        }
+        lines.push('');
+    }
+
+    // Show ready tasks
+    const ready = registry.tasks.filter(t => t.status === 'ready');
+    if (ready.length > 0) {
+        lines.push('### Ready to Execute\n');
+        for (const task of ready) {
+            lines.push(`- **${task.id}**: ${task.goal}`);
+        }
+        lines.push('');
+    }
+
     return lines.join('\n');
 }
 

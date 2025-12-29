@@ -45,6 +45,20 @@ export interface NextStep {
 // Union type for backward compatibility - can be string or structured
 export type NextStepItem = string | NextStep;
 
+export interface DirectoryRequest {
+    path: string;        // Directory path relative to workspace root
+    recursive?: boolean; // Include subdirectories (default: false)
+    filter?: string;     // Optional glob filter (e.g., '*.ts')
+}
+
+export interface SubTaskRequest {
+    id: string;              // Unique ID for tracking
+    goal: string;            // Clear description of what to accomplish
+    files?: string[];        // Files to attach to sub-task context
+    dependencies?: string[]; // IDs of sub-tasks that must complete first
+    autoExecute?: boolean;   // If true, execute without user confirmation
+}
+
 export interface CodeBlock {
     language: string;
     code: string;
@@ -67,6 +81,10 @@ export interface GrokStructuredResponse {
     nextSteps?: NextStepItem[];  // Can be string[] or NextStep[] (or mixed)
     // MD5 hashes of files the AI claims to have read (for verification)
     fileHashes?: Record<string, string>;
+    // Directory exploration - AI can request directory listings
+    directoryRequests?: DirectoryRequest[];
+    // Sub-tasks for parallel/sequential work decomposition
+    subTasks?: SubTaskRequest[];
     // Legacy field - kept for backward compatibility
     message?: string;
 }
@@ -102,6 +120,9 @@ export const RESPONSE_JSON_SCHEMA = `{
   "nextSteps": [
     { "html": "Continue to next step", "inputText": "continue" },
     { "html": "Attach the config file", "inputText": "config.json" }
+  ],
+  "directoryRequests": [
+    { "path": "src/prompts", "recursive": false, "filter": "*.ts" }
   ]
 }`;
 
@@ -264,6 +285,46 @@ export function validateResponse(parsed: unknown): GrokStructuredResponse | null
         }
     }
 
+    // Validate optional directoryRequests
+    if (obj.directoryRequests !== undefined) {
+        if (!Array.isArray(obj.directoryRequests)) {
+            return null;
+        }
+        response.directoryRequests = obj.directoryRequests.filter((d): d is DirectoryRequest =>
+            typeof d === 'object' && d !== null &&
+            typeof (d as DirectoryRequest).path === 'string' &&
+            (d as DirectoryRequest).path.trim().length > 0
+        ).map(d => ({
+            path: d.path.trim(),
+            recursive: typeof d.recursive === 'boolean' ? d.recursive : false,
+            filter: typeof d.filter === 'string' ? d.filter.trim() : undefined
+        }));
+    }
+
+    // Validate optional subTasks
+    if (obj.subTasks !== undefined) {
+        if (!Array.isArray(obj.subTasks)) {
+            return null;
+        }
+        response.subTasks = obj.subTasks.filter((s): s is SubTaskRequest =>
+            typeof s === 'object' && s !== null &&
+            typeof (s as SubTaskRequest).id === 'string' &&
+            (s as SubTaskRequest).id.trim().length > 0 &&
+            typeof (s as SubTaskRequest).goal === 'string' &&
+            (s as SubTaskRequest).goal.trim().length > 0
+        ).map(s => ({
+            id: s.id.trim(),
+            goal: s.goal.trim(),
+            files: Array.isArray(s.files) 
+                ? s.files.filter((f): f is string => typeof f === 'string').map(f => f.trim())
+                : undefined,
+            dependencies: Array.isArray(s.dependencies)
+                ? s.dependencies.filter((d): d is string => typeof d === 'string').map(d => d.trim())
+                : undefined,
+            autoExecute: typeof s.autoExecute === 'boolean' ? s.autoExecute : false
+        }));
+    }
+
     return response;
 }
 
@@ -403,6 +464,47 @@ export const STRUCTURED_OUTPUT_SCHEMA = {
                             inputText: { type: "string", description: "Text to insert when clicked" }
                         },
                         required: ["html", "inputText"],
+                        additionalProperties: false
+                    }
+                },
+                directoryRequests: {
+                    type: "array",
+                    description: "Request directory listings to explore file structure",
+                    items: {
+                        type: "object",
+                        properties: {
+                            path: { type: "string", description: "Directory path relative to workspace root" },
+                            recursive: { type: "boolean", description: "Include subdirectories (default: false)" },
+                            filter: { type: "string", description: "Optional glob filter (e.g., '*.ts')" }
+                        },
+                        required: ["path"],
+                        additionalProperties: false
+                    }
+                },
+                subTasks: {
+                    type: "array",
+                    description: "Sub-tasks for parallel or sequential work decomposition",
+                    items: {
+                        type: "object",
+                        properties: {
+                            id: { type: "string", description: "Unique ID for tracking (e.g., 'api', 'frontend', 'tests')" },
+                            goal: { type: "string", description: "Clear description of what to accomplish" },
+                            files: { 
+                                type: "array", 
+                                items: { type: "string" },
+                                description: "Files to attach to sub-task context"
+                            },
+                            dependencies: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "IDs of sub-tasks that must complete first"
+                            },
+                            autoExecute: { 
+                                type: "boolean", 
+                                description: "If true, execute without user confirmation (default: false)"
+                            }
+                        },
+                        required: ["id", "goal"],
                         additionalProperties: false
                     }
                 }

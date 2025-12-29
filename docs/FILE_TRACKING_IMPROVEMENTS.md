@@ -7,6 +7,60 @@
 
 ---
 
+## 🔧 Batch Processing Fix (2024-12-28)
+
+**Issue:** AI was breaking multi-file tasks into separate steps (e.g., 3 files → 3 TODOs requiring 3 "continue" clicks).
+
+**Root Cause:** 
+1. Missing prompt guidance on batch file processing
+2. **CRITICAL:** `config/system-prompt.json` was NOT being loaded - `systemPrompt.ts` used hardcoded string!
+
+**Fix Applied:**
+
+| File | Changes |
+|------|---------|
+| `config/planning-prompt.json` | Added "BATCH PROCESSING" section with glob examples and wrong/correct patterns |
+| `config/system-prompt.json` | Added "📦 BATCH FILE CHANGES" section with multi-file response examples |
+| `src/prompts/systemPrompt.ts` | **NEW:** Now loads from `config/system-prompt.json` with hardcoded fallback |
+
+**Key Guidance Added:**
+
+**Planning Prompt (Pass 1):**
+- Use ONE action with glob `docs/rollback_multi_file/*` to load ALL files
+- Don't create separate actions for each file
+- Trigger words: "all files in", "every file", directory globs
+
+**System Prompt (Main Response):**
+- Include ALL fileChanges in single response array
+- Use single TODO for batch operations (all files share `todoIndex: 0`)
+- User clicks Apply once, all files updated
+
+**Example - Before (WRONG):**
+```json
+{
+  "todos": [
+    {"text": "Update script1.py"},
+    {"text": "Update script2.py"},
+    {"text": "Update script3.py"}
+  ],
+  "fileChanges": [{"path": "script1.py", "todoIndex": 0}]
+}
+```
+
+**Example - After (CORRECT):**
+```json
+{
+  "todos": [{"text": "Update all scripts with third print value"}],
+  "fileChanges": [
+    {"path": "script1.py", "todoIndex": 0},
+    {"path": "script2.py", "todoIndex": 0},
+    {"path": "script3.py", "todoIndex": 0}
+  ]
+}
+```
+
+---
+
 ## ✅ Completed Improvements
 
 ### Improvement #1: Smart File Registry System - IMPLEMENTED ✅
@@ -75,6 +129,300 @@ Files you have seen in this conversation. Check "Modified Since" before using ca
 - [ ] Check AI context includes KNOWN FILES table
 - [ ] Verify ⚠️ indicator shows when file modified after last seen
 - [ ] Confirm registry persists across session reload
+
+---
+
+### Improvement #2: Fallback Pattern Chains - IMPLEMENTED ✅
+
+**Date Implemented:** 2024-12-28
+
+Fallback pattern chains enable the agent to try multiple glob patterns in order, stopping on the first match. This dramatically reduces failed file searches.
+
+#### What Was Built
+
+| Component | Description |
+|-----------|-------------|
+| `patterns` array in FileAction | Array of glob patterns to try in order |
+| `required` flag | Marks if file is essential to the task |
+| `fallbackAction` field | What to do if all patterns fail: `ask_user`, `skip`, `create_new` |
+| Pattern iteration logic | Tries patterns sequentially, stops on first match |
+
+#### Schema Changes (`config/planning-schema.json`)
+
+```json
+{
+  "type": "file",
+  "patterns": ["src/prompts/responseSchema.ts", "**/responseSchema.ts", "**/*Schema.ts"],
+  "reason": "Schema definition",
+  "required": true,
+  "fallbackAction": "ask_user"
+}
+```
+
+#### Pattern Strategy (from planning prompt)
+
+Order patterns from most specific to broadest:
+
+1. **EXACT PATH**: `"src/components/Button.tsx"`
+2. **FILENAME GLOB**: `"**/Button.tsx"`
+3. **DIRECTORY SCOPED**: `"src/components/**/*.tsx"`
+4. **PARTIAL NAME**: `"**/*Button*.tsx"`
+5. **EXTENSION ONLY** (last resort): `"**/*.tsx"`
+
+#### Integration Points
+
+1. **createPlan()** (`agentOrchestrator.ts` ~line 180):
+   - Parses both `patterns` array and legacy `pattern` field
+   - Converts single pattern to array for backward compatibility
+
+2. **executeActions()** (`agentOrchestrator.ts` ~line 278):
+   - Loops through patterns array
+   - Shows progress with pattern count: `🔍 Searching: \`pattern\` (1/3)`
+   - Logs when fallback succeeds
+   - Shows all tried patterns on failure
+
+3. **runFilesApiWorkflow()** (`agentOrchestrator.ts` ~line 791):
+   - Same pattern iteration logic for Files API workflow
+
+#### Example Progress Output
+
+```
+🔍 Searching: `src/prompts/responseSchema.ts` (1/3)
+🔍 Searching: `**/responseSchema.ts` (2/3)
+✅ Found 1 file(s) (150 lines)
+   └─ responseSchema.ts
+```
+
+When all patterns fail:
+```
+⚠️ No files found matching [src/foo.ts, **/foo.ts, **/*foo*.ts] - tried 3 pattern(s)
+```
+
+#### Files Changed
+
+| File | Changes |
+|------|---------|
+| `config/planning-schema.json` | +20 lines: patterns array, required, fallbackAction fields |
+| `config/planning-prompt.json` | +60 lines: Pattern strategy guide, updated examples |
+| `src/agent/actionTypes.ts` | +10 lines: Updated FileAction interface with optional fields |
+| `src/agent/agentOrchestrator.ts` | +80 lines: Pattern iteration in executeActions and runFilesApiWorkflow |
+
+#### Testing Checklist
+
+- [ ] Single pattern (legacy) still works
+- [ ] Multiple patterns tried in order
+- [ ] First matching pattern stops iteration
+- [ ] Fallback success logged with attempt number
+- [ ] All patterns shown in failure message
+- [ ] Files API workflow also uses pattern fallbacks
+
+---
+
+### Improvement #3: Directory Listing Tool - IMPLEMENTED ✅
+
+**Date Implemented:** 2024-12-28
+
+The directory listing tool enables AI to explore workspace directories when it doesn't know exact file locations, reducing pattern guessing and failed auto-loads.
+
+#### What Was Built
+
+| Component | Description |
+|-----------|-------------|
+| `DirectoryRequest` interface | Response schema field with path, recursive, filter properties |
+| `DirectoryListingResult` type | Stores listing results with entries, error handling |
+| `PendingDirectoryResults` type | Session storage for results pending injection |
+| `_handleDirectoryRequests()` | Handler in ChatViewProvider that executes listings |
+| `_listDirectory()` | Recursive directory walker with filter support |
+| `storePendingDirectoryResults()` | Stores results in session for next turn |
+| `buildDirectoryListingSummary()` | Generates markdown table for AI context |
+
+#### Integration Points
+
+1. **Response Schema** (`src/prompts/responseSchema.ts` and `config/response-schema.json`):
+   - New `directoryRequests` field in `GrokStructuredResponse`
+   - Added to `STRUCTURED_OUTPUT_SCHEMA` for API validation
+   - Validation in `validateResponse()` function
+
+2. **Session Storage** (`src/storage/chatSessionRepository.ts`):
+   - `pendingDirectoryResults` field on `ChatSessionDocument`
+   - `storePendingDirectoryResults()` to save results after AI response
+   - `clearPendingDirectoryResults()` to clean up after injection
+   - `buildDirectoryListingSummary()` to format results as markdown table
+
+3. **Handler** (`src/views/ChatViewProvider.ts` ~line 3627):
+   - `_handleDirectoryRequests()` called after AI response processing
+   - Security: Blocks `..` traversal, limits recursive depth to 3
+   - Glob filter support with simple `*` and `?` patterns
+   - Max 100 entries per directory request
+
+4. **Context Injection** (`src/views/ChatViewProvider.ts` ~line 3875):
+   - Results injected into system prompt in `_buildMessages()`
+   - Cleared after injection to avoid duplicate display
+
+5. **System Prompt** (`config/system-prompt.json`):
+   - New "DIRECTORY EXPLORATION" section with usage instructions
+   - Example JSON showing directoryRequests usage
+
+#### Example AI Response
+
+```json
+{
+  "summary": "I need to see what files are in the prompts directory to find the schema.",
+  "directoryRequests": [
+    {"path": "src/prompts", "recursive": false, "filter": "*.ts"}
+  ],
+  "nextSteps": [{"html": "After listing, I'll identify the correct file", "inputText": "continue"}]
+}
+```
+
+#### Example Context Injection (Next Turn)
+
+```markdown
+## 📁 DIRECTORY LISTING RESULTS
+You requested these directory listings. Use exact paths to request specific files.
+
+### 📂 src/prompts (filter: *.ts)
+| Name | Type | Size |
+|------|------|------|
+| responseSchema.ts | 📄 file | 12.5 KB |
+| responseParser.ts | 📄 file | 8.2 KB |
+| jsonCleaner.ts | 📄 file | 5.1 KB |
+
+*0 directories, 3 files*
+```
+
+#### Files Changed
+
+| File | Changes |
+|------|---------|
+| `config/response-schema.json` | +3 lines: directoryRequests field example |
+| `src/prompts/responseSchema.ts` | +40 lines: DirectoryRequest interface, validation, schema |
+| `src/storage/chatSessionRepository.ts` | +120 lines: Types, storage/retrieval functions, summary builder |
+| `src/views/ChatViewProvider.ts` | +180 lines: Handler, directory walker, context injection |
+| `config/system-prompt.json` | +35 lines: DIRECTORY EXPLORATION section |
+
+#### Security Considerations
+
+- Path traversal (`..`) is blocked
+- Paths must be relative to workspace root
+- Recursive depth limited to 3 levels
+- Max 100 entries per request
+- Only workspace files are accessible
+
+#### Testing Checklist
+
+- [ ] Request directory listing → verify results stored
+- [ ] Next message → verify results appear in AI context
+- [ ] Results cleared after injection (don't appear twice)
+- [ ] Recursive listing works with depth limit
+- [ ] Filter (*.ts) correctly filters files
+- [ ] Invalid path (..) returns error
+- [ ] Non-existent directory returns error message
+
+---
+
+### Improvement #4: Proactive File Bundling - IMPLEMENTED ✅
+
+**Date Implemented:** 2024-12-28
+
+Proactive File Bundling automatically analyzes modified files for imports and related tests, then attaches those files to the next AI turn. This helps the AI maintain context about related code.
+
+#### What Was Built
+
+| Component | Description |
+|-----------|-------------|
+| `src/utils/importAnalyzer.ts` | New utility file with import parsing for TS/JS/Python |
+| `ImportInfo` interface | Tracks import source, resolved path, and locality |
+| `BundledFile` interface | Tracks bundled file path, type (import/test), and size |
+| `analyzeImports()` | Parses file content for import statements |
+| `findRelatedTests()` | Finds test files matching common naming patterns |
+| `bundleRelatedFiles()` | Main function combining import analysis + test discovery |
+| `BundledFileEntry` type | Session storage type for bundled files |
+| `PendingBundledFiles` type | Session field for pending bundle injection |
+| `storePendingBundledFiles()` | Stores bundled files after apply |
+| `clearPendingBundledFiles()` | Clears after injection |
+| `buildBundledFilesSummary()` | Generates markdown summary for AI context |
+| `_bundleRelatedFilesForNextTurn()` | Handler in ChatViewProvider |
+
+#### Integration Points
+
+1. **Import Analyzer** (`src/utils/importAnalyzer.ts`):
+   - TypeScript/JavaScript: `import ... from`, `require()`, `export ... from`
+   - Python: `from ... import`, `import ...`
+   - Resolves relative paths to absolute
+   - Filters to local project files only
+
+2. **Apply Edits Hook** (`src/views/ChatViewProvider.ts` ~line 3242):
+   - `_bundleRelatedFilesForNextTurn()` called after edits applied
+   - Analyzes each modified file for imports/tests
+   - Stores results in session via `storePendingBundledFiles()`
+
+3. **Context Injection** (`src/views/ChatViewProvider.ts` ~line 3973):
+   - Checks for `pendingBundledFiles` in session
+   - Injects summary table AND file contents with line numbers
+   - Clears after injection
+
+4. **Configuration** (`package.json`):
+   - `grok.proactiveBundling`: Master toggle (default: true)
+   - `grok.bundleImports`: Include imported files (default: true)
+   - `grok.bundleTests`: Include test files (default: true)
+   - `grok.maxBundledFiles`: Max files to bundle (default: 5)
+
+#### Example Context Injection
+
+```markdown
+## 📦 AUTO-BUNDLED FILES
+These files were automatically attached because they are related to files you modified.
+
+### Imported Files
+- 📄 src/utils/logger.ts (2.5 KB)
+- 📄 src/api/grokClient.ts (8.1 KB)
+
+### Test Files
+- 🧪 src/utils/logger.test.ts (1.2 KB)
+
+*Triggered by modifications to: src/views/ChatViewProvider.ts*
+
+## 📦 BUNDLED FILE CONTENTS
+
+### 📄 src/utils/logger.ts (MD5: abc123...)
+```
+1: export function debug(...args: any[]) {
+2:     console.log('[DEBUG]', ...args);
+3: }
+...
+```
+```
+
+#### Files Changed
+
+| File | Changes |
+|------|---------|
+| `src/utils/importAnalyzer.ts` | +320 lines: New file with import parsing and bundling logic |
+| `src/storage/chatSessionRepository.ts` | +80 lines: Types and storage functions for bundled files |
+| `src/views/ChatViewProvider.ts` | +110 lines: Handler and context injection |
+| `package.json` | +24 lines: Configuration settings |
+
+#### Configuration
+
+```json
+{
+    "grok.proactiveBundling": true,
+    "grok.bundleImports": true,
+    "grok.bundleTests": true,
+    "grok.maxBundledFiles": 5
+}
+```
+
+#### Testing Checklist
+
+- [ ] Modify TypeScript file → verify imports bundled
+- [ ] Modify Python file → verify imports bundled
+- [ ] Modify file with tests → verify test files bundled
+- [ ] Next message includes bundled file contents
+- [ ] Max files limit respected
+- [ ] Bundled files cleared after injection
+- [ ] Bundling disabled when `proactiveBundling: false`
 
 ---
 
@@ -474,96 +822,173 @@ Add to VS Code settings:
 
 ---
 
-## Improvement #5: Continuation Memory Block
+## Improvement #5: Continuation Memory Block - IMPLEMENTED ✅
 
-### Overview
-Inject a structured "AI Memory" section on "continue" that summarizes state, eliminating need for AI to re-derive context.
+**Date Implemented:** 2024-12-28
+
+The Continuation Memory Block provides instant context recovery when the user says "continue". Instead of the AI re-deriving state from conversation history, a structured summary is injected with completed/pending todos, modified files, and files needing refresh.
+
+### What Was Built
+
+| Component | Description |
+|-----------|-------------|
+| `src/utils/memoryBuilder.ts` | New utility file for AI memory generation |
+| `AIMemory` interface | Structured state: completedTodos, pendingTodos, modifiedFiles, filesNeedingRefresh, lastSummary, workingFiles |
+| `isContinueMessage()` | Detects "continue", "proceed", "go on", "next", etc. |
+| `buildAIMemory()` | Extracts state from session data |
+| `buildMemoryBlock()` | Generates markdown block for context injection |
+
+### Integration Points
+
+1. **Memory Builder** (`src/utils/memoryBuilder.ts`):
+   - Extracts completed/pending todos from session.todos
+   - Builds modified files list from changeHistory
+   - Identifies files needing refresh using fileRegistry
+   - Gets last response summary from most recent pair
+   - Lists active working files from recent turns
+
+2. **Context Injection** (`src/views/ChatViewProvider.ts` ~line 4006):
+   - `isContinueMessage()` detects continuation messages
+   - `buildMemoryBlock()` generates context if useful data exists
+   - Injected after bundled files, before system message push
+
+3. **System Prompt** (`config/system-prompt.json`):
+   - New "🧠 CONTINUATION CONTEXT (AI Memory)" section
+   - Instructions on how to use the memory block
+   - Example continuation response
 
 ### Memory Block Structure
 
 ```markdown
-## 🧠 AI Memory (Injected on Continue)
+## 🧠 AI Memory (Continuation Context)
 
-### Completed Todos
+This is a continuation. Use this memory to resume efficiently without re-reading full history.
+
+**Current Turn:** 5
+
+### Last Response Summary
+> Fixed the syntax error and added timeout wrappers.
+
+### ✅ Completed Todos (2)
 - [x] Fix syntax error in utils.py (line 45)
 - [x] Add timeout wrapper to API calls
 
-### Pending Todos
-- [ ] Update tests for new timeout behavior
-- [ ] Add error handling for timeout exceptions
+### ⏳ Pending Todos (2)
+**Resume from the first uncompleted item:**
 
-### Modified Files This Session
-| File | Hash Before | Hash After | Turn Modified |
-|------|-------------|------------|---------------|
-| src/utils.py | 9a906fd5... | b2c4e8a1... | 3 |
-| src/api.py | abc123... | def456... | 4 |
+1. [ ] **Update tests for new timeout behavior**
+   - *Details:* In src/tests/test_api.py, add test cases for timeout scenarios...
+2. [ ] **Add error handling for timeout exceptions**
+   - *Details:* In src/api.py lines 50-60, wrap async calls with try/catch...
 
-### Files Needing Refresh
-- src/utils.py (modified in turn 4, you last saw turn 3)
+### ⚠️ Files Needing Refresh
+These files were modified since you last saw them. Request re-attachment before modifying:
 
-### Last AI Response Summary
-"Fixed the syntax error and added timeout wrappers. Two todos remaining."
+- 📄 src/utils.py
 
-### Current Working Files (Auto-Attached)
-📄 src/utils.py (fresh - attached this turn)
-📄 src/tests/test_api.py (from registry, unchanged)
+### 📝 Modified Files This Session
+| File | Turn Modified |
+|------|---------------|
+| utils.py | Turn 3 |
+| api.py | Turn 4 |
+
+### 📂 Active Working Files
+Files you've recently worked with (last 3 turns):
+- utils.py
+- api.py
+
+### 📋 Resumption Instructions
+1. Check "Files Needing Refresh" before modifying any files
+2. Resume from the first pending todo
+3. Don't repeat completed work
+4. If needed files aren't attached, ask for them
 ```
 
-### Implementation Steps
+### Continue Message Detection
 
-1. **Create `memoryBuilder.ts`**:
-   ```typescript
-   interface AIMemory {
-       completedTodos: string[];
-       pendingTodos: Array<{text: string, aiText: string}>;
-       modifiedFiles: Array<{path: string, hashBefore: string, hashAfter: string, turn: number}>;
-       filesNeedingRefresh: string[];
-       lastSummary: string;
-       workingFiles: string[];
-   }
-   
-   function buildMemoryBlock(session: ChatSession, currentTurn: number): string {
-       const memory: AIMemory = {
-           completedTodos: session.pairs
-               .flatMap(p => p.response?.todos ?? [])
-               .filter(t => t.completed)
-               .map(t => t.text),
-           // ... build other fields from session state
-       };
-       
-       return formatAsMarkdown(memory);
-   }
-   ```
+The following messages trigger memory injection:
+- `continue`
+- `go on`
+- `proceed`
+- `next`
+- `keep going`
+- `continue with...`
+- `go ahead...`
 
-2. **Inject in `buildContextForAI()`**:
-   ```typescript
-   if (userMessage.toLowerCase().includes('continue')) {
-       const memory = buildMemoryBlock(session, currentPairIndex);
-       contextParts.push(memory);
-   }
-   ```
+### Files Changed
 
-3. **Update system prompt**:
-   ```
-   ## CONTINUATION CONTEXT
-   
-   When you see "## 🧠 AI Memory", this contains your state from previous turns:
-   - Check "Files Needing Refresh" before making changes
-   - Resume from "Pending Todos"
-   - Don't repeat completed work
-   ```
+| File | Changes |
+|------|---------|
+| `src/utils/memoryBuilder.ts` | +210 lines: New file with AIMemory interface, isContinueMessage(), buildAIMemory(), buildMemoryBlock() |
+| `src/views/ChatViewProvider.ts` | +12 lines: Import memoryBuilder, inject memory block on continue |
+| `config/system-prompt.json` | +30 lines: CONTINUATION CONTEXT section with usage instructions |
 
 ### Benefits
-- Zero-cost state recovery for AI
-- Clear signal on what needs refresh
-- Reduces hallucination of completed work
+
+- **Zero-cost state recovery**: AI doesn't need to re-parse conversation
+- **Clear resumption point**: Pending todos with details show exactly what to do
+- **Stale file detection**: Files needing refresh are highlighted
+- **Reduced hallucination**: Completed work is explicitly listed
+- **Efficient tokens**: Only injected on "continue", not every turn
+
+### Testing Checklist
+
+- [ ] Send "continue" after multi-step task → verify memory block appears
+- [ ] Check completed todos are listed correctly
+- [ ] Check pending todos include aiText details
+- [ ] Verify files needing refresh detection works
+- [ ] Test different continue phrases ("proceed", "go on", etc.)
+- [ ] Verify memory not injected on first message (pairs.length <= 1)
 
 ---
 
-## Improvement #6: Sub-Task Spawning (Phase 2)
+## Improvement #6: Sub-Task Spawning (Phase 2) - IMPLEMENTED ✅
 
-### Overview
-Allow AI to spawn child tasks that run semi-autonomously, enabling parallel work and complex multi-step operations.
+**Date Implemented:** 2024-12-28
+
+Sub-Task Spawning allows the AI to propose independent sub-tasks for complex work, enabling parallel execution with dependency management. This is Phase 2 of the autonomy roadmap.
+
+### What Was Built
+
+| Component | Description |
+|-----------|-------------|
+| `src/agent/subTaskManager.ts` | New file with SubTask interface, SubTaskManager class |
+| `SubTask` interface | Full task data: id, goal, files, dependencies, status, result |
+| `SubTaskRequest` interface | AI response format (responseSchema.ts) |
+| `SubTaskRegistryData` | Session storage type for sub-task persistence |
+| `validateSubTasks()` | Validates subTasks from AI response |
+| `SubTaskManager` class | Manages lifecycle: pending → ready → running → completed |
+| `storeSubTaskRegistry()` | Persists sub-tasks to Couchbase |
+| `updateSubTaskStatus()` | Updates individual task status |
+| `buildSubTasksSummary()` | Generates markdown for AI context injection |
+| `_handleSubTasks()` | Handler in ChatViewProvider |
+| `_executeSubTask()` | Runs a sub-task in current session |
+| `_skipSubTask()` | Skips a sub-task (user choice) |
+
+### Integration Points
+
+1. **Response Schema** (`src/prompts/responseSchema.ts`):
+   - New `SubTaskRequest` interface
+   - Added to `GrokStructuredResponse.subTasks`
+   - Added to `STRUCTURED_OUTPUT_SCHEMA` for API validation
+   - Validation in `validateResponse()`
+
+2. **Session Storage** (`src/storage/chatSessionRepository.ts`):
+   - `SubTaskData` and `SubTaskRegistryData` types
+   - `subTaskRegistry` field on `ChatSessionDocument`
+   - CRUD functions for sub-task persistence
+
+3. **ChatViewProvider** (`src/views/ChatViewProvider.ts`):
+   - `_handleSubTasks()` processes AI proposals
+   - `_executeSubTask()` runs tasks
+   - `_skipSubTask()` handles user skips
+   - Message handlers: `executeSubTask`, `skipSubTask`
+   - Context injection in `_buildMessages()`
+
+4. **System Prompt** (`config/system-prompt.json`):
+   - New "📋 SUB-TASKS (Parallel Work Decomposition)" section
+   - Instructions on when/how to use sub-tasks
+   - Example sub-task response
 
 ### New Response Field
 
@@ -694,8 +1119,31 @@ Add to `config/response-schema.json`:
 | Phase | Description | User Interaction |
 |-------|-------------|------------------|
 | Phase 1 (Current) | Manual multi-step | User clicks "continue" repeatedly |
-| **Phase 2** | Semi-automated | AI proposes sub-tasks, user approves batch |
+| **Phase 2 (Implemented)** | Semi-automated | AI proposes sub-tasks, user approves batch |
 | Phase 3 | Fully automated | AI spawns and manages sub-tasks autonomously |
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `src/agent/subTaskManager.ts` | +330 lines: New file with SubTask interface, SubTaskManager class, validation |
+| `src/prompts/responseSchema.ts` | +50 lines: SubTaskRequest interface, validation, STRUCTURED_OUTPUT_SCHEMA |
+| `src/storage/chatSessionRepository.ts` | +160 lines: SubTaskData types, registry CRUD functions, buildSubTasksSummary() |
+| `src/views/ChatViewProvider.ts` | +210 lines: Imports, handlers, message cases, context injection |
+| `config/response-schema.json` | +10 lines: subTasks field example |
+| `config/system-prompt.json` | +50 lines: SUB-TASKS section with usage instructions |
+
+### Testing Checklist
+
+- [ ] AI proposes sub-tasks in response → verify stored in session
+- [ ] Tasks with no dependencies start as "ready"
+- [ ] Tasks with dependencies start as "pending"
+- [ ] UI receives subTasksUpdate message
+- [ ] Execute sub-task → task runs and status updates
+- [ ] Skip sub-task → status changes to "skipped"
+- [ ] Dependent tasks become ready when deps complete
+- [ ] Sub-task summary injected into AI context
+- [ ] Session reload preserves sub-task registry
 
 ---
 
@@ -704,11 +1152,11 @@ Add to `config/response-schema.json`:
 | # | Improvement | Effort | Impact | Priority | Status |
 |---|-------------|--------|--------|----------|--------|
 | 1 | File Registry System | Medium | High | **P0** | ✅ Done |
-| 2 | Fallback Pattern Chains | Low | Medium | **P1** | Pending |
-| 3 | Directory Listing Tool | Low | Medium | **P1** | Pending |
-| 4 | Proactive File Bundling | Medium | Medium | **P2** | Pending |
-| 5 | Continuation Memory Block | Low | High | **P0** | Pending |
-| 6 | Sub-Task Spawning | High | High | **P2** | Pending |
+| 2 | Fallback Pattern Chains | Low | Medium | **P1** | ✅ Done |
+| 3 | Directory Listing Tool | Low | Medium | **P1** | ✅ Done |
+| 4 | Proactive File Bundling | Medium | Medium | **P2** | ✅ Done |
+| 5 | Continuation Memory Block | Low | High | **P0** | ✅ Done |
+| 6 | Sub-Task Spawning | High | High | **P2** | ✅ Done |
 
 ### Recommended Order
 

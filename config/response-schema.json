@@ -29,6 +29,18 @@
     "nextSteps": [
       { "html": "Continue to next step", "inputText": "continue" },
       { "html": "Attach the config file", "inputText": "config.json" }
+    ],
+    "directoryRequests": [
+      { "path": "src/prompts", "recursive": false, "filter": "*.ts" }
+    ],
+    "subTasks": [
+      {
+        "id": "api",
+        "goal": "Create POST /api/users endpoint with validation",
+        "files": ["src/api/routes.ts"],
+        "dependencies": [],
+        "autoExecute": false
+      }
     ]
   }
 }

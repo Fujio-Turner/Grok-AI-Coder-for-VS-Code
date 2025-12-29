@@ -1,11 +1,14 @@
 /**
- * Hardcoded system prompt for Grok AI.
+ * System prompt for Grok AI.
+ * Loads from config/system-prompt.json if available, otherwise uses hardcoded fallback.
  * This is project-agnostic and instructs the AI to return structured JSON (or TOON when optimized).
  */
 
 import * as vscode from 'vscode';
 import { RESPONSE_JSON_SCHEMA } from './responseSchema';
 import { getToonOutputPrompt, getToonSystemPromptAddition } from '../utils/toonConverter';
+import { getPromptFromConfig } from '../utils/configLoader';
+import { debug } from '../utils/logger';
 
 /**
  * Get the current response format setting
@@ -369,7 +372,8 @@ This prevents massive responses that get truncated mid-output.
 `;
 
 /**
- * Get the appropriate system prompt based on optimization settings
+ * Get the appropriate system prompt based on optimization settings.
+ * Loads from config/system-prompt.json if available, otherwise uses hardcoded fallback.
  */
 export function getSystemPrompt(): string {
     const responseFormat = getResponseFormat();
@@ -409,6 +413,14 @@ Complex tasks with 3+ steps: Execute ONE STEP AT A TIME.
 `;
     }
     
+    // Try to load from config file, fall back to hardcoded SYSTEM_PROMPT_BASE
+    const configPrompt = getPromptFromConfig('system-prompt', '');
+    if (configPrompt) {
+        debug('Loaded system prompt from config/system-prompt.json');
+        return configPrompt;
+    }
+    
+    debug('Using hardcoded SYSTEM_PROMPT_BASE (config not found)');
     return SYSTEM_PROMPT_BASE;
 }
 

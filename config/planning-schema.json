@@ -1,8 +1,11 @@
 {
   "name": "planning-schema",
   "description": "JSON Schema for xAI Structured Outputs API - enforces valid planning response format",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiReference": "https://docs.x.ai/docs/guides/structured-outputs",
+  "changelog": {
+    "1.1.0": "Added patterns array for fallback glob patterns, fallbackAction field, required flag"
+  },
   "schema": {
     "type": "json_schema",
     "json_schema": {
@@ -33,9 +36,20 @@
               "type": "object",
               "properties": {
                 "type": { "type": "string", "enum": ["file", "url"], "description": "Action type" },
-                "pattern": { "type": "string", "description": "Glob pattern for file type" },
+                "pattern": { "type": "string", "description": "Primary glob pattern for file type (deprecated - use patterns array)" },
+                "patterns": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Glob patterns to try in order (first match wins). Most specific first."
+                },
                 "url": { "type": "string", "description": "URL to fetch for url type" },
-                "reason": { "type": "string", "description": "Why this action is needed" }
+                "reason": { "type": "string", "description": "Why this action is needed" },
+                "required": { "type": "boolean", "description": "If true, task cannot proceed without this file" },
+                "fallbackAction": {
+                  "type": "string",
+                  "enum": ["ask_user", "skip", "create_new"],
+                  "description": "What to do if all patterns fail"
+                }
               },
               "required": ["type", "reason"],
               "additionalProperties": false

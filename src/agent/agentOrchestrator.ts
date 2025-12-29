@@ -176,12 +176,25 @@ export async function createPlan(
                 })),
                 actions: (parsed.actions || []).filter((a: any) => 
                     a.type === 'file' || a.type === 'url'
-                ).map((a: any) => ({
-                    type: a.type,
-                    pattern: a.pattern,
-                    url: a.url,
-                    reason: a.reason || ''
-                }))
+                ).map((a: any) => {
+                    if (a.type === 'file') {
+                        // Support both patterns array and legacy pattern field
+                        const patterns = a.patterns || (a.pattern ? [a.pattern] : []);
+                        return {
+                            type: a.type,
+                            pattern: patterns[0] || a.pattern, // Keep for backward compat
+                            patterns,
+                            reason: a.reason || '',
+                            required: a.required,
+                            fallbackAction: a.fallbackAction
+                        } as FileAction;
+                    }
+                    return {
+                        type: a.type,
+                        url: a.url,
+                        reason: a.reason || ''
+                    } as UrlAction;
+                })
             };
             
             // FALLBACK: If model didn't include URLs but user message contains URLs, add them
@@ -266,112 +279,154 @@ export async function executeActions(
         if (action.type === 'file') {
             const fileAction = action as FileAction;
             
-            onProgress?.({
-                type: 'file-start',
-                message: `🔍 Searching: \`${fileAction.pattern}\``,
-                details: { path: fileAction.pattern }
-            });
-
-            try {
-                const files = await findAndReadFiles(fileAction.pattern, 5);
+            // Get patterns to try (use patterns array or fall back to single pattern)
+            const patternsToTry = fileAction.patterns?.length 
+                ? fileAction.patterns 
+                : (fileAction.pattern ? [fileAction.pattern] : []);
+            
+            if (patternsToTry.length === 0) {
+                results.push({
+                    action,
+                    success: false,
+                    error: 'No patterns specified'
+                });
+                continue;
+            }
+            
+            let foundFiles: FileContent[] = [];
+            let successfulPattern: string | null = null;
+            let lastError: string | null = null;
+            
+            // Try each pattern in order until one succeeds
+            for (let i = 0; i < patternsToTry.length; i++) {
+                const pattern = patternsToTry[i];
+                const isLastPattern = i === patternsToTry.length - 1;
                 
-                if (files.length > 0) {
-                    const totalLines = files.reduce((sum, f) => sum + f.lineCount, 0);
-                    const fileNames = files.map(f => f.name);
+                onProgress?.({
+                    type: 'file-start',
+                    message: `🔍 Searching: \`${pattern}\`${patternsToTry.length > 1 ? ` (${i + 1}/${patternsToTry.length})` : ''}`,
+                    details: { path: pattern }
+                });
+
+                try {
+                    const files = await findAndReadFiles(pattern, 5);
                     
-                    files.forEach(f => {
-                        filesContent.set(f.path, f.content);
-                        fileHashes.set(f.path, f.md5Hash);
-                    });
-
-                    // Show each file found on its own line for better visibility
-                    const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
-                    onProgress?.({
-                        type: 'file-done',
-                        message: `✅ Found ${files.length} file(s) (${totalLines} lines)\n${fileList}`,
-                        details: { 
-                            path: fileAction.pattern,
-                            lines: totalLines,
-                            files: fileNames
+                    if (files.length > 0) {
+                        foundFiles = files;
+                        successfulPattern = pattern;
+                        
+                        // Log which pattern worked if we tried multiple
+                        if (i > 0) {
+                            info(`Pattern fallback succeeded: "${pattern}" (attempt ${i + 1}/${patternsToTry.length})`);
                         }
-                    });
-
-                    // Follow imports for each loaded file (max depth 3)
-                    for (const file of files) {
-                        try {
-                            onProgress?.({
-                                type: 'file-start',
-                                message: `🔗 Analyzing imports: ${file.name}`,
-                                details: { path: file.path }
-                            });
-                            
-                            const importResult = await followImports(
-                                file.path, 
-                                file.content,
-                                (msg) => onProgress?.({ type: 'file-start', message: msg, details: {} })
-                            );
-                            
-                            // Add imported files to context (with hashes)
-                            for (const [importPath, importFile] of importResult.files) {
-                                if (!filesContent.has(importPath)) {
-                                    filesContent.set(importPath, importFile.content);
-                                    fileHashes.set(importPath, importFile.md5Hash);
-                                }
-                            }
-                            
-                            // Add external docs to URLs
-                            for (const [url, content] of importResult.external) {
-                                if (!urlsContent.has(url)) {
-                                    urlsContent.set(url, content);
-                                }
-                            }
-                            
-                            if (importResult.files.size > 0 || importResult.external.size > 0) {
-                                const importedNames = Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p);
-                                const importList = importedNames.length > 0 
-                                    ? '\n' + importedNames.slice(0, 5).map(f => `   └─ ${f}`).join('\n') + (importedNames.length > 5 ? `\n   └─ ...and ${importedNames.length - 5} more` : '')
-                                    : '';
-                                onProgress?.({
-                                    type: 'file-done',
-                                    message: `✅ Found ${importResult.files.size} import(s), ${importResult.external.size} external doc(s)${importList}`,
-                                    details: { files: importedNames }
-                                });
-                            }
-                        } catch (importErr: any) {
-                            debug('Import following error:', importErr);
-                        }
+                        break; // Stop trying patterns
+                    } else if (!isLastPattern) {
+                        // Pattern didn't find anything, try next
+                        debug(`Pattern "${pattern}" found nothing, trying next fallback...`);
                     }
-
-                    results.push({
-                        action,
-                        success: true,
-                        content: formatFilesForPrompt(files),
-                        metadata: { lines: totalLines, files: files.map(f => f.path) }
-                    });
-                } else {
-                    onProgress?.({
-                        type: 'error',
-                        message: `⚠️ No files found matching ${fileAction.pattern}`,
-                        details: { path: fileAction.pattern }
-                    });
-
-                    results.push({
-                        action,
-                        success: false,
-                        error: 'No matching files found'
-                    });
+                } catch (err: any) {
+                    lastError = err.message;
+                    if (!isLastPattern) {
+                        debug(`Pattern "${pattern}" error: ${err.message}, trying next fallback...`);
+                    }
                 }
-            } catch (err: any) {
+            }
+            
+            if (foundFiles.length > 0 && successfulPattern) {
+                const totalLines = foundFiles.reduce((sum, f) => sum + f.lineCount, 0);
+                const fileNames = foundFiles.map(f => f.name);
+                
+                foundFiles.forEach(f => {
+                    filesContent.set(f.path, f.content);
+                    fileHashes.set(f.path, f.md5Hash);
+                });
+
+                // Show each file found on its own line for better visibility
+                const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
+                onProgress?.({
+                    type: 'file-done',
+                    message: `✅ Found ${foundFiles.length} file(s) (${totalLines} lines)\n${fileList}`,
+                    details: { 
+                        path: successfulPattern,
+                        lines: totalLines,
+                        files: fileNames
+                    }
+                });
+
+                // Follow imports for each loaded file (max depth 3)
+                for (const file of foundFiles) {
+                    try {
+                        onProgress?.({
+                            type: 'file-start',
+                            message: `🔗 Analyzing imports: ${file.name}`,
+                            details: { path: file.path }
+                        });
+                        
+                        const importResult = await followImports(
+                            file.path, 
+                            file.content,
+                            (msg) => onProgress?.({ type: 'file-start', message: msg, details: {} })
+                        );
+                        
+                        // Add imported files to context (with hashes)
+                        for (const [importPath, importFile] of importResult.files) {
+                            if (!filesContent.has(importPath)) {
+                                filesContent.set(importPath, importFile.content);
+                                fileHashes.set(importPath, importFile.md5Hash);
+                            }
+                        }
+                        
+                        // Add external docs to URLs
+                        for (const [url, content] of importResult.external) {
+                            if (!urlsContent.has(url)) {
+                                urlsContent.set(url, content);
+                            }
+                        }
+                        
+                        if (importResult.files.size > 0 || importResult.external.size > 0) {
+                            const importedNames = Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p);
+                            const importList = importedNames.length > 0 
+                                ? '\n' + importedNames.slice(0, 5).map(f => `   └─ ${f}`).join('\n') + (importedNames.length > 5 ? `\n   └─ ...and ${importedNames.length - 5} more` : '')
+                                : '';
+                            onProgress?.({
+                                type: 'file-done',
+                                message: `✅ Found ${importResult.files.size} import(s), ${importResult.external.size} external doc(s)${importList}`,
+                                details: { files: importedNames }
+                            });
+                        }
+                    } catch (importErr: any) {
+                        debug('Import following error:', importErr);
+                    }
+                }
+
+                results.push({
+                    action,
+                    success: true,
+                    content: formatFilesForPrompt(foundFiles),
+                    metadata: { lines: totalLines, files: foundFiles.map(f => f.path) }
+                });
+            } else {
+                // All patterns failed
+                const allPatterns = patternsToTry.join(', ');
+                const fallbackAction = fileAction.fallbackAction || 'ask_user';
+                
+                let message: string;
+                if (fallbackAction === 'skip' && !fileAction.required) {
+                    message = `⚠️ Skipped: No files found matching [${allPatterns}]`;
+                } else {
+                    message = `⚠️ No files found matching [${allPatterns}] - tried ${patternsToTry.length} pattern(s)`;
+                }
+                
                 onProgress?.({
                     type: 'error',
-                    message: `❌ Error reading ${fileAction.pattern}: ${err.message}`,
-                    details: { path: fileAction.pattern }
+                    message,
+                    details: { path: patternsToTry[0] }
                 });
 
                 results.push({
                     action,
                     success: false,
-                    error: err.message
+                    error: lastError || 'No matching files found'
                 });
             }
         } else if (action.type === 'url') {
@@ -734,12 +789,31 @@ export async function runFilesApiWorkflow(
     const fileActions = plan.actions.filter((a): a is FileAction => a.type === 'file');
     
     for (const fileAction of fileActions) {
-        onProgress?.(`🔍 Finding: ${fileAction.pattern}`);
+        // Get patterns to try (use patterns array or fall back to single pattern)
+        const patternsToTry = fileAction.patterns?.length 
+            ? fileAction.patterns 
+            : (fileAction.pattern ? [fileAction.pattern] : []);
         
-        const files = await findAndReadFiles(fileAction.pattern, 10);
+        if (patternsToTry.length === 0) {
+            continue;
+        }
+        
+        let files: FileContent[] = [];
+        
+        // Try each pattern in order until one succeeds
+        for (const pattern of patternsToTry) {
+            onProgress?.(`🔍 Finding: ${pattern}`);
+            
+            const foundFiles = await findAndReadFiles(pattern, 10);
+            
+            if (foundFiles.length > 0) {
+                files = foundFiles;
+                break; // Stop trying patterns
+            }
+        }
         
         if (files.length === 0) {
-            onProgress?.(`⚠️ No files found: ${fileAction.pattern}`);
+            onProgress?.(`⚠️ No files found: ${patternsToTry.join(', ')}`);
             continue;
         }
         

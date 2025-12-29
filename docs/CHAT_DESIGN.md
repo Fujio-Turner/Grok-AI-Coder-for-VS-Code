@@ -68,14 +68,19 @@ The agent uses a three-pass workflow to intelligently load files before the main
 **Pass 1: Planning** (`createPlan`)
 - Fast model (`grok-3-mini`) analyzes the request
 - Creates a plan with TODOs and actions (file patterns, URLs)
-- Example: User says "review email.py" → Plan includes `{"type": "file", "pattern": "**/email*.py"}`
+- Uses `patterns` array for fallback pattern chains (tries each until match)
+- **Batch processing**: Single glob like `docs/scripts/*` loads ALL files at once
+- Example: User says "update scripts in docs/" → Plan includes `{"type": "file", "patterns": ["docs/*", "docs/**/*"]}`
 
 **Pass 2: Execution** (`executeActions`)
+- For each action, tries patterns in order until first match
 - Runs `vscode.workspace.findFiles()` for each file pattern
 - Reads file contents via `vscode.workspace.openTextDocument()`
 - **Computes MD5 hash** for each file (for verification later)
+- **Returns ALL matching files** from a single glob (not just one)
 - Fetches any URLs mentioned in the plan
 - Reports failed searches explicitly (so AI doesn't hallucinate)
+- Progress shows pattern attempt count: `🔍 Searching: \`pattern\` (1/3)`
 
 **Pass 3: Augmented Message** (`buildAugmentedMessage`)
 - Combines original message + loaded files + plan
@@ -1450,11 +1455,13 @@ Increasing `maxOutputTokens` reduces truncation frequency for complex responses.
 
 ---
 
-## Future: Sub-Task Architecture & Concurrent Operations
+## Sub-Task Architecture & Concurrent Operations ✅
+
+**Status:** Phase 2 Implemented (2024-12-28)
 
 ### Vision
 
-Break complex tasks into independent sub-operations that can be executed in parallel by separate AI requests, then merged back together. This would dramatically improve:
+Break complex tasks into independent sub-operations that can be executed in parallel by separate AI requests, then merged back together. This dramatically improves:
 - **Speed**: Parallel execution instead of sequential
 - **Reliability**: Smaller responses = less truncation risk
 - **Cost efficiency**: Use cheaper/faster models for simple sub-tasks
@@ -1554,15 +1561,26 @@ Reduce: Collect all fileChanges, present unified diff
 
 ### Implementation Phases
 
-#### Phase 1: Manual Sub-Tasks (Current)
+#### Phase 1: Manual Sub-Tasks ✅
 - AI suggests breaking into steps
 - User manually says "continue"
 - State tracked in TODO list
 
-#### Phase 2: Semi-Automated (Near Future)
-- "Auto-continue" toggle in UI
-- System automatically sends "continue" after each step
-- User can pause/resume
+#### Phase 2: Sub-Task Spawning ✅ IMPLEMENTED
+- AI proposes sub-tasks with `subTasks` array in response
+- User sees task cards with Run/Skip buttons
+- Tasks have dependencies (wait for others to complete)
+- Status tracked in `session.subTaskRegistry`
+- Context injection shows sub-task status in subsequent turns
+
+**Key Components:**
+| Component | File |
+|-----------|------|
+| `SubTaskManager` class | `src/agent/subTaskManager.ts` |
+| `SubTaskRequest` interface | `src/prompts/responseSchema.ts` |
+| `storeSubTaskRegistry()` | `src/storage/chatSessionRepository.ts` |
+| `_handleSubTasks()` | `src/views/ChatViewProvider.ts` |
+| System prompt section | `config/system-prompt.json` (📋 SUB-TASKS) |
 
 #### Phase 3: Parallel Execution (Future)
 - Orchestrator analyzes request complexity
@@ -2095,6 +2113,317 @@ The context may include a **KNOWN FILES** section showing files you've seen:
 | Staleness Detection | Check `by: user` updates | Check `lastModifiedTurn > lastSeenTurn` |
 
 Both are injected into AI context and serve complementary purposes.
+
+---
+
+## Directory Listing Tool
+
+The Directory Listing Tool allows AI to explore workspace directories when it doesn't know exact file locations.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant AI as 🤖 AI
+    participant Handler as 📁 DirectoryHandler
+    participant Session as 💾 Session
+    participant Context as 📝 Next Context
+    
+    AI->>Handler: directoryRequests: [{path: "src/prompts", filter: "*.ts"}]
+    Handler->>Handler: List directory with filter
+    Handler->>Handler: Apply security checks (no .., depth limit)
+    Handler->>Session: storePendingDirectoryResults()
+    Note over AI: Response complete
+    
+    AI->>Context: Next message
+    Context->>Session: Check pendingDirectoryResults
+    Session->>Context: Inject DIRECTORY LISTING RESULTS
+    Context->>Session: clearPendingDirectoryResults()
+    Context->>AI: "📂 src/prompts: responseSchema.ts, responseParser.ts, ..."
+```
+
+### Response Format
+
+```json
+{
+  "summary": "I need to explore the prompts directory to find the schema.",
+  "directoryRequests": [
+    {"path": "src/prompts", "recursive": false, "filter": "*.ts"}
+  ],
+  "nextSteps": [{"html": "Continue after listing", "inputText": "continue"}]
+}
+```
+
+### Context Injection
+
+Results appear in the next turn as:
+
+```markdown
+## 📁 DIRECTORY LISTING RESULTS
+
+### 📂 src/prompts (filter: *.ts)
+| Name | Type | Size |
+|------|------|------|
+| responseSchema.ts | 📄 file | 12.5 KB |
+| responseParser.ts | 📄 file | 8.2 KB |
+```
+
+### Security
+
+- Paths cannot contain `..` (directory traversal blocked)
+- Recursive depth limited to 3 levels
+- Max 100 entries per request
+- Only workspace files accessible
+
+---
+
+## Proactive File Bundling
+
+When the user applies file changes, the system automatically analyzes modified files for imports and related tests, then attaches those files to the next AI turn.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant Apply as ✅ Apply Changes
+    participant Analyzer as 🔍 Import Analyzer
+    participant Session as 💾 Session
+    participant AI as 🤖 AI (next turn)
+    
+    User->>Apply: Click "Apply" on file changes
+    Apply->>Apply: Write changes to disk
+    Apply->>Analyzer: Analyze modified files
+    Analyzer->>Analyzer: Parse imports (TS/JS/Python)
+    Analyzer->>Analyzer: Find related test files
+    Analyzer->>Session: storePendingBundledFiles()
+    
+    User->>AI: Send next message
+    AI->>Session: Check pendingBundledFiles
+    Session->>AI: Inject file summary + contents
+    Session->>Session: clearPendingBundledFiles()
+    Note over AI: AI sees imports, tests with full content
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `grok.proactiveBundling` | true | Master toggle for bundling |
+| `grok.bundleImports` | true | Include imported files |
+| `grok.bundleTests` | true | Include test files |
+| `grok.maxBundledFiles` | 5 | Max files per bundle |
+
+### Context Injection
+
+Bundled files appear in the next turn as:
+
+```markdown
+## 📦 AUTO-BUNDLED FILES
+These files were automatically attached because they are related to files you modified.
+
+### Imported Files
+- 📄 src/utils/logger.ts (2.5 KB)
+
+### Test Files
+- 🧪 src/views/ChatViewProvider.test.ts (1.2 KB)
+
+*Triggered by modifications to: src/views/ChatViewProvider.ts*
+
+## 📦 BUNDLED FILE CONTENTS
+
+### 📄 src/utils/logger.ts (MD5: abc123...)
+```
+1: export function debug(...args: any[]) {
+2:     console.log('[DEBUG]', ...args);
+3: }
+```
+```
+
+### Supported Languages
+
+| Language | Import Patterns |
+|----------|-----------------|
+| TypeScript/JavaScript | `import ... from`, `require()`, `export ... from` |
+| Python | `from ... import`, `import ...` |
+
+---
+
+## Continuation Memory Block
+
+When the user sends a "continue" message, the system injects a structured AI Memory block that provides instant context recovery without the AI needing to re-parse the conversation history.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant Provider as ⚙️ ChatViewProvider
+    participant Memory as 🧠 Memory Builder
+    participant Session as 💾 Session
+    participant AI as 🤖 AI
+    
+    User->>Provider: Send "continue"
+    Provider->>Provider: isContinueMessage() = true
+    Provider->>Session: Get session state
+    Provider->>Memory: buildMemoryBlock(session, turn)
+    Memory->>Memory: Extract todos (completed/pending)
+    Memory->>Memory: Build modified files list
+    Memory->>Memory: Identify files needing refresh
+    Memory->>Memory: Get last response summary
+    Memory->>Provider: Return markdown block
+    Provider->>AI: Inject memory in system prompt
+    Note over AI: AI sees structured state summary
+```
+
+### Continue Message Detection
+
+These messages trigger memory injection:
+- `continue`
+- `go on`
+- `proceed`
+- `next`
+- `keep going`
+- `continue with...`
+- `go ahead...`
+
+### Memory Block Contents
+
+| Section | Purpose |
+|---------|---------|
+| **Current Turn** | Shows which turn the AI is on |
+| **Last Response Summary** | What the AI said previously |
+| **Completed Todos** | Work that's done - don't repeat |
+| **Pending Todos** | Work remaining with aiText details |
+| **Files Needing Refresh** | Modified since last seen - request before modifying |
+| **Modified Files This Session** | What files changed and when |
+| **Active Working Files** | Recently touched files |
+| **Resumption Instructions** | How to proceed |
+
+### Context Injection
+
+The memory block appears in the system prompt as:
+
+```markdown
+## 🧠 AI Memory (Continuation Context)
+
+This is a continuation. Use this memory to resume efficiently without re-reading full history.
+
+**Current Turn:** 5
+
+### Last Response Summary
+> Fixed the syntax error and added timeout wrappers.
+
+### ✅ Completed Todos (2)
+- [x] Fix syntax error in utils.py (line 45)
+- [x] Add timeout wrapper to API calls
+
+### ⏳ Pending Todos (2)
+**Resume from the first uncompleted item:**
+
+1. [ ] **Update tests for new timeout behavior**
+   - *Details:* In src/tests/test_api.py, add test cases for timeout scenarios...
+
+### ⚠️ Files Needing Refresh
+These files were modified since you last saw them. Request re-attachment before modifying:
+
+- 📄 src/utils.py
+
+### 📋 Resumption Instructions
+1. Check "Files Needing Refresh" before modifying any files
+2. Resume from the first pending todo
+3. Don't repeat completed work
+4. If needed files aren't attached, ask for them
+```
+
+### Benefits
+
+- **Zero-cost state recovery**: AI doesn't re-parse conversation
+- **Clear resumption point**: Pending todos show exactly what to do next
+- **Stale file detection**: Files needing refresh are highlighted
+- **Reduced hallucination**: Completed work is explicitly listed
+- **Efficient tokens**: Only injected on "continue", not every turn
+
+---
+
+## Sub-Task Spawning (Phase 2)
+
+For complex multi-part tasks, the AI can propose sub-tasks that break work into independent units with optional dependency management.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant AI as 🤖 AI
+    participant Handler as ⚙️ SubTask Handler
+    participant Registry as 💾 SubTask Registry
+    
+    User->>AI: Complex multi-part request
+    AI->>Handler: Response with subTasks[]
+    Handler->>Handler: Parse and validate sub-tasks
+    Handler->>Handler: Compute ready status (no deps = ready)
+    Handler->>Registry: storeSubTaskRegistry()
+    Handler->>User: Show task cards (Run/Skip)
+    
+    User->>Handler: Click "Run" on task
+    Handler->>Handler: _executeSubTask()
+    Handler->>Registry: updateSubTaskStatus('running')
+    Handler->>AI: Send task goal as message
+    AI->>Handler: Task completion
+    Handler->>Registry: updateSubTaskStatus('completed')
+    Handler->>Handler: Mark dependent tasks as 'ready'
+```
+
+### Sub-Task Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| id | YES | Unique ID (e.g., "api", "frontend") |
+| goal | YES | Clear description of what to accomplish |
+| files | no | Files to attach for this sub-task |
+| dependencies | no | IDs of sub-tasks that must complete first |
+| autoExecute | no | If true, run without user confirmation |
+
+### Task Status Lifecycle
+
+```
+pending → ready → running → completed
+                         ↘ failed
+                         ↘ skipped
+```
+
+- **pending**: Waiting for dependencies
+- **ready**: All dependencies completed, can run
+- **running**: Currently executing
+- **completed**: Successfully finished
+- **failed**: Execution error
+- **skipped**: User chose not to run
+
+### Context Injection
+
+When sub-tasks exist in a session, they're summarized and injected into the AI context:
+
+```markdown
+## 📋 SUB-TASKS (2/3 complete)
+
+| Status | ID | Goal | Dependencies |
+|--------|-----|------|--------------|
+| ✅ completed | api | Create POST /api/users endpoint | - |
+| ✅ completed | frontend | Create UserForm component | - |
+| 🟡 ready | tests | Write unit tests | api, frontend |
+
+### Ready to Execute
+- **tests**: Write unit tests for API and UserForm
+```
+
+### Benefits
+
+- **Work decomposition**: Complex tasks become manageable units
+- **Dependency management**: Tasks execute in correct order
+- **User control**: Approve/skip tasks before execution
+- **Progress tracking**: Clear visibility into task status
+- **Context preservation**: AI sees completed results in subsequent turns
 
 ---
 

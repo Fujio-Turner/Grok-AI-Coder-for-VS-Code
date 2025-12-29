@@ -51,12 +51,26 @@ import {
     updateFileRegistry,
     markFileModified,
     buildFileRegistrySummary,
-    FileRegistryEntry
+    FileRegistryEntry,
+    // Directory listing
+    storePendingDirectoryResults,
+    clearPendingDirectoryResults,
+    buildDirectoryListingSummary,
+    DirectoryListingResult,
+    DirectoryListingEntry,
+    // Sub-task registry
+    storeSubTaskRegistry,
+    getSubTaskRegistry,
+    updateSubTaskStatus,
+    buildSubTasksSummary,
+    SubTaskRegistryData,
+    SubTaskData,
+    SubTaskStatus
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
 import { parseResponse, GrokStructuredResponse } from '../prompts/responseParser';
-import { STRUCTURED_OUTPUT_SCHEMA } from '../prompts/responseSchema';
+import { STRUCTURED_OUTPUT_SCHEMA, DirectoryRequest, SubTaskRequest } from '../prompts/responseSchema';
 import { parseWithCleanup } from '../prompts/jsonCleaner';
 import { getModelName, ModelType, debug, info, error as logError, detectModelType } from '../utils/logger';
 import { 
@@ -88,11 +102,18 @@ import {
     setFileTtl,
     getExpiredFilesGlobal,
     removeExpiredFileRecords,
-    needsRehydration
+    needsRehydration,
+    // Proactive file bundling
+    storePendingBundledFiles,
+    clearPendingBundledFiles,
+    buildBundledFilesSummary,
+    BundledFileEntry
 } from '../storage/chatSessionRepository';
 import { findFiles } from '../agent/workspaceFiles';
 import { fetchUrl } from '../agent/httpFetcher';
 import { generateImages, detectImageGenerationRequest, generateImagePrompts, createImageId, GeneratedImage } from '../api/imageGenClient';
+import { bundleRelatedFiles, BundledFile } from '../utils/importAnalyzer';
+import { isContinueMessage, buildMemoryBlock } from '../utils/memoryBuilder';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -300,6 +321,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'rewindToOriginalState':
                     await this._rewindToOriginal();
+                    break;
+                case 'executeSubTask':
+                    await this._executeSubTask(message.taskId);
+                    break;
+                case 'skipSubTask':
+                    await this._skipSubTask(message.taskId);
                     break;
             }
         });
@@ -2891,6 +2918,12 @@ ${cliSummary}
             // Check if AI response indicates to continue pending commands
             await this._checkContinueCommands(structured);
 
+            // Handle directory listing requests from AI
+            await this._handleDirectoryRequests(structured.directoryRequests, pairIndex);
+
+            // Handle sub-task proposals from AI
+            await this._handleSubTasks(structured.subTasks, pairIndex);
+
             vscode.window.showInformationMessage('Grok completed the request.');
 
         } catch (error: any) {
@@ -3224,6 +3257,9 @@ ${cliSummary}
                 // Signal webview to use fallback behavior
                 completedTodoIndexes.push(-1); // -1 signals "use fallback" 
             }
+            
+            // Proactive File Bundling: Analyze modified files for imports/tests
+            await this._bundleRelatedFilesForNextTurn(editsToApply, currentPairIndex);
             
             this._postMessage({
                 type: 'editsApplied',
@@ -3616,6 +3652,449 @@ ${cliSummary}
         }
     }
 
+    /**
+     * Bundle related files (imports, tests) for injection into next turn.
+     * Called after user applies file changes.
+     */
+    private async _bundleRelatedFilesForNextTurn(
+        appliedEdits: Array<{ fileUri: vscode.Uri }>,
+        currentPairIndex: number
+    ): Promise<void> {
+        if (!this._currentSessionId || appliedEdits.length === 0) {
+            return;
+        }
+
+        const config = vscode.workspace.getConfiguration('grok');
+        const bundlingEnabled = config.get<boolean>('proactiveBundling', true);
+        const bundleImports = config.get<boolean>('bundleImports', true);
+        const bundleTests = config.get<boolean>('bundleTests', true);
+        const maxBundledFiles = config.get<number>('maxBundledFiles', 5);
+
+        if (!bundlingEnabled) {
+            return;
+        }
+
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+            return;
+        }
+
+        try {
+            const allBundled: BundledFileEntry[] = [];
+            const triggeredBy: string[] = [];
+
+            for (const edit of appliedEdits) {
+                const filePath = edit.fileUri.fsPath;
+                const relativePath = filePath.replace(workspaceRoot + '/', '').replace(workspaceRoot, '');
+                triggeredBy.push(relativePath);
+
+                // Get bundled files for this modified file
+                const bundled = await bundleRelatedFiles(filePath, {
+                    includeImports: bundleImports,
+                    includeTests: bundleTests,
+                    maxFiles: Math.max(1, Math.floor(maxBundledFiles / appliedEdits.length))
+                });
+
+                // Convert to BundledFileEntry format
+                for (const b of bundled) {
+                    // Skip if already bundled
+                    if (allBundled.some(existing => existing.path === b.path)) {
+                        continue;
+                    }
+
+                    allBundled.push({
+                        path: b.path,
+                        relativePath: b.relativePath,
+                        type: b.type,
+                        sourceFile: relativePath,
+                        sizeBytes: b.sizeBytes
+                    });
+                }
+            }
+
+            // Limit total bundled files
+            const filesToBundle = allBundled.slice(0, maxBundledFiles);
+
+            if (filesToBundle.length > 0) {
+                await storePendingBundledFiles(
+                    this._currentSessionId,
+                    currentPairIndex,
+                    filesToBundle,
+                    triggeredBy
+                );
+                info(`Bundled ${filesToBundle.length} related files for next turn`);
+            }
+        } catch (err) {
+            debug('Error bundling related files:', err);
+        }
+    }
+
+    /**
+     * Process directory listing requests from AI response.
+     * Executes the listings and stores results for injection into next turn.
+     */
+    private async _handleDirectoryRequests(
+        directoryRequests: DirectoryRequest[] | undefined,
+        pairIndex: number
+    ): Promise<void> {
+        if (!directoryRequests || directoryRequests.length === 0 || !this._currentSessionId) {
+            return;
+        }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            debug('No workspace folder - cannot process directory requests');
+            return;
+        }
+
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const results: DirectoryListingResult[] = [];
+        const MAX_DEPTH = 3;  // Security limit for recursive listings
+        const MAX_ENTRIES = 100;  // Limit entries per directory
+
+        for (const request of directoryRequests) {
+            const requestedPath = request.path.replace(/^[/\\]+/, '');  // Remove leading slashes
+            
+            // Security: Prevent directory traversal
+            if (requestedPath.includes('..') || requestedPath.startsWith('/')) {
+                results.push({
+                    path: request.path,
+                    entries: [],
+                    error: 'Invalid path: directory traversal not allowed',
+                    recursive: request.recursive || false,
+                    requestedAt: new Date().toISOString()
+                });
+                continue;
+            }
+
+            const fullPath = vscode.Uri.joinPath(workspaceFolders[0].uri, requestedPath);
+            
+            try {
+                const entries = await this._listDirectory(
+                    fullPath,
+                    request.filter,
+                    request.recursive || false,
+                    0,
+                    MAX_DEPTH,
+                    MAX_ENTRIES,
+                    workspaceRoot
+                );
+
+                results.push({
+                    path: request.path,
+                    entries,
+                    filter: request.filter,
+                    recursive: request.recursive || false,
+                    requestedAt: new Date().toISOString()
+                });
+
+                info(`Directory listing: ${request.path} - ${entries.length} entries`);
+            } catch (err: any) {
+                results.push({
+                    path: request.path,
+                    entries: [],
+                    error: err.message || 'Failed to list directory',
+                    recursive: request.recursive || false,
+                    requestedAt: new Date().toISOString()
+                });
+                debug(`Directory listing failed: ${request.path}`, err);
+            }
+        }
+
+        if (results.length > 0) {
+            await storePendingDirectoryResults(this._currentSessionId, pairIndex, results);
+            
+            // Notify user that directory listing was processed
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: `\n\n📁 *Processed ${results.length} directory request(s) - results will appear in next response*\n`
+            });
+        }
+    }
+
+    /**
+     * List directory contents with optional filter and recursion.
+     */
+    private async _listDirectory(
+        dirUri: vscode.Uri,
+        filter: string | undefined,
+        recursive: boolean,
+        currentDepth: number,
+        maxDepth: number,
+        maxEntries: number,
+        workspaceRoot: string
+    ): Promise<DirectoryListingEntry[]> {
+        const entries: DirectoryListingEntry[] = [];
+        
+        if (currentDepth > maxDepth) {
+            return entries;
+        }
+
+        try {
+            const dirEntries = await vscode.workspace.fs.readDirectory(dirUri);
+            
+            for (const [name, type] of dirEntries) {
+                if (entries.length >= maxEntries) {
+                    break;
+                }
+
+                const isDirectory = type === vscode.FileType.Directory;
+                
+                // Apply filter if provided (simple glob matching)
+                if (filter && !isDirectory) {
+                    const filterPattern = filter
+                        .replace(/\./g, '\\.')
+                        .replace(/\*/g, '.*')
+                        .replace(/\?/g, '.');
+                    const regex = new RegExp(`^${filterPattern}$`, 'i');
+                    if (!regex.test(name)) {
+                        continue;
+                    }
+                }
+
+                let sizeBytes: number | undefined;
+                if (!isDirectory) {
+                    try {
+                        const fileUri = vscode.Uri.joinPath(dirUri, name);
+                        const stat = await vscode.workspace.fs.stat(fileUri);
+                        sizeBytes = stat.size;
+                    } catch {
+                        // Ignore stat errors
+                    }
+                }
+
+                // For recursive listings, include subdirectory path
+                const displayName = currentDepth > 0 && recursive
+                    ? dirUri.fsPath.replace(workspaceRoot, '').replace(/^[/\\]/, '') + '/' + name
+                    : name;
+
+                entries.push({
+                    name: currentDepth > 0 ? displayName : name,
+                    isDirectory,
+                    sizeBytes
+                });
+
+                // Recurse into subdirectories
+                if (isDirectory && recursive && currentDepth < maxDepth) {
+                    const subDirUri = vscode.Uri.joinPath(dirUri, name);
+                    const subEntries = await this._listDirectory(
+                        subDirUri,
+                        filter,
+                        recursive,
+                        currentDepth + 1,
+                        maxDepth,
+                        maxEntries - entries.length,
+                        workspaceRoot
+                    );
+                    entries.push(...subEntries);
+                }
+            }
+        } catch (err: any) {
+            if (err.code === 'FileNotFound' || err.code === 'ENOENT') {
+                throw new Error('Directory not found');
+            }
+            throw err;
+        }
+
+        return entries;
+    }
+
+    /**
+     * Process sub-task proposals from AI response.
+     * Stores sub-tasks in registry and sends UI update for task cards.
+     */
+    private async _handleSubTasks(
+        subTasks: SubTaskRequest[] | undefined,
+        pairIndex: number
+    ): Promise<void> {
+        if (!subTasks || subTasks.length === 0 || !this._currentSessionId) {
+            return;
+        }
+
+        // Convert SubTaskRequest to SubTaskData for storage
+        const now = new Date().toISOString();
+        const taskData: SubTaskData[] = subTasks.map(task => ({
+            id: task.id,
+            goal: task.goal,
+            files: task.files || [],
+            dependencies: task.dependencies || [],
+            autoExecute: task.autoExecute || false,
+            status: 'pending' as SubTaskStatus,
+            createdAt: now
+        }));
+
+        // Update ready status based on dependencies
+        for (const task of taskData) {
+            const allDepsCompleted = task.dependencies.every(depId => {
+                const dep = taskData.find(t => t.id === depId);
+                return dep && dep.status === 'completed';
+            });
+            if (allDepsCompleted || task.dependencies.length === 0) {
+                task.status = 'ready';
+            }
+        }
+
+        // Get existing registry or create new one
+        let registry = await getSubTaskRegistry(this._currentSessionId);
+        
+        if (registry) {
+            // Merge new tasks with existing ones
+            const existingIds = new Set(registry.tasks.map(t => t.id));
+            const newTasks = taskData.filter(t => !existingIds.has(t.id));
+            registry.tasks.push(...newTasks);
+            registry.updatedAt = now;
+        } else {
+            registry = {
+                tasks: taskData,
+                parentSessionId: this._currentSessionId,
+                createdAt: now,
+                updatedAt: now
+            };
+        }
+
+        await storeSubTaskRegistry(this._currentSessionId, registry);
+
+        // Send sub-task update to UI
+        this._postMessage({
+            type: 'subTasksUpdate',
+            pairIndex,
+            subTasks: registry.tasks.map(t => ({
+                id: t.id,
+                goal: t.goal,
+                status: t.status,
+                dependencies: t.dependencies,
+                files: t.files,
+                autoExecute: t.autoExecute,
+                result: t.result,
+                error: t.error
+            }))
+        });
+
+        // Notify user
+        const readyCount = registry.tasks.filter(t => t.status === 'ready').length;
+        this._postMessage({
+            type: 'updateResponseChunk',
+            pairIndex,
+            deltaText: `\n\n📋 *${subTasks.length} sub-task(s) proposed, ${readyCount} ready to run*\n`
+        });
+
+        info(`Processed ${subTasks.length} sub-tasks`, { 
+            ids: subTasks.map(t => t.id),
+            readyCount 
+        });
+    }
+
+    /**
+     * Execute a specific sub-task by ID.
+     * Creates a child session and runs the task goal.
+     */
+    private async _executeSubTask(taskId: string): Promise<void> {
+        if (!this._currentSessionId) {
+            vscode.window.showErrorMessage('No active session');
+            return;
+        }
+
+        const registry = await getSubTaskRegistry(this._currentSessionId);
+        if (!registry) {
+            vscode.window.showErrorMessage('No sub-tasks found');
+            return;
+        }
+
+        const task = registry.tasks.find(t => t.id === taskId);
+        if (!task) {
+            vscode.window.showErrorMessage(`Sub-task not found: ${taskId}`);
+            return;
+        }
+
+        if (task.status !== 'ready') {
+            vscode.window.showErrorMessage(`Sub-task ${taskId} is not ready (status: ${task.status})`);
+            return;
+        }
+
+        // Mark as running
+        await updateSubTaskStatus(this._currentSessionId, taskId, 'running');
+        
+        this._postMessage({
+            type: 'subTaskStatusUpdate',
+            taskId,
+            status: 'running'
+        });
+
+        try {
+            // Build handoff context for the sub-task
+            const session = await getSession(this._currentSessionId);
+            const parentSummary = session?.summary || 'Working on multi-step task';
+
+            // Create the task message with file requests
+            let taskMessage = `## Sub-Task: ${task.goal}\n\n`;
+            if (task.files.length > 0) {
+                taskMessage += `Please work with these files:\n`;
+                for (const file of task.files) {
+                    taskMessage += `- ${file}\n`;
+                }
+                taskMessage += '\n';
+            }
+            taskMessage += `Focus on the stated goal. When complete, summarize what you accomplished.`;
+
+            // Execute in current session as a new message
+            await this.sendMessage(taskMessage);
+
+            // After completion, mark task as completed
+            // Note: In Phase 2, we'd create a child session. For now, we run in current session.
+            await updateSubTaskStatus(
+                this._currentSessionId,
+                taskId,
+                'completed',
+                'Task executed in current session'
+            );
+
+            this._postMessage({
+                type: 'subTaskStatusUpdate',
+                taskId,
+                status: 'completed',
+                result: 'Task executed in current session'
+            });
+
+        } catch (err: any) {
+            logError(`Sub-task ${taskId} failed:`, err);
+            
+            await updateSubTaskStatus(
+                this._currentSessionId,
+                taskId,
+                'failed',
+                undefined,
+                err.message
+            );
+
+            this._postMessage({
+                type: 'subTaskStatusUpdate',
+                taskId,
+                status: 'failed',
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * Skip a sub-task (user chose not to run it)
+     */
+    private async _skipSubTask(taskId: string): Promise<void> {
+        if (!this._currentSessionId) {
+            return;
+        }
+
+        await updateSubTaskStatus(this._currentSessionId, taskId, 'skipped');
+        
+        this._postMessage({
+            type: 'subTaskStatusUpdate',
+            taskId,
+            status: 'skipped'
+        });
+
+        info(`Sub-task ${taskId} skipped by user`);
+    }
+
     private async _buildMessages(userText: string, images?: string[], fileIds?: string[]): Promise<GrokMessage[]> {
         const messages: GrokMessage[] = [];
 
@@ -3690,6 +4169,71 @@ ${parentSession.handoffText}`;
                         const registrySummary = buildFileRegistrySummary(session.fileRegistry, currentTurn, 15);
                         if (registrySummary) {
                             systemPrompt += registrySummary;
+                        }
+                    }
+                    
+                    // Add pending directory listing results (from previous turn's request)
+                    if (session.pendingDirectoryResults && session.pendingDirectoryResults.results.length > 0) {
+                        const dirSummary = buildDirectoryListingSummary(session.pendingDirectoryResults.results);
+                        if (dirSummary) {
+                            systemPrompt += dirSummary;
+                        }
+                        // Clear after injection so they don't persist across multiple turns
+                        clearPendingDirectoryResults(session.id).catch(err => 
+                            debug('Failed to clear pending directory results:', err)
+                        );
+                    }
+                    
+                    // Add pending bundled files (imports/tests from previous turn's modifications)
+                    if (session.pendingBundledFiles && session.pendingBundledFiles.files.length > 0) {
+                        const bundleSummary = buildBundledFilesSummary(session.pendingBundledFiles);
+                        if (bundleSummary) {
+                            systemPrompt += bundleSummary;
+                        }
+                        
+                        // Attach bundled file contents
+                        let bundledContent = '\n\n## 📦 BUNDLED FILE CONTENTS\n';
+                        for (const bundledFile of session.pendingBundledFiles.files) {
+                            try {
+                                const fileUri = vscode.Uri.file(bundledFile.path);
+                                const doc = await vscode.workspace.openTextDocument(fileUri);
+                                const content = doc.getText();
+                                const truncated = content.length > 6000 
+                                    ? content.slice(0, 6000) + '\n\n... (truncated, file too large)'
+                                    : content;
+                                const hash = computeFileHash(content);
+                                bundledContent += `\n### 📄 ${bundledFile.relativePath} (MD5: ${hash})\n\`\`\`\n${addLineNumbers(truncated)}\n\`\`\`\n`;
+                                debug(`Attached bundled file: ${bundledFile.relativePath}`);
+                            } catch (err) {
+                                debug(`Could not load bundled file: ${bundledFile.path}`);
+                            }
+                        }
+                        systemPrompt += bundledContent;
+                        
+                        // Clear after injection
+                        clearPendingBundledFiles(session.id).catch(err => 
+                            debug('Failed to clear pending bundled files:', err)
+                        );
+                    }
+                    
+                    // Inject AI Memory Block on "continue" messages for instant context recovery
+                    if (isContinueMessage(userText) && session.pairs.length > 1) {
+                        const currentTurn = session.pairs.length;
+                        const memoryBlock = buildMemoryBlock(session, currentTurn);
+                        if (memoryBlock) {
+                            systemPrompt += memoryBlock;
+                            debug('Injected AI Memory Block for continue message, turn:', currentTurn);
+                        }
+                    }
+                    
+                    // Inject sub-task registry summary if any sub-tasks exist
+                    if (session.subTaskRegistry && session.subTaskRegistry.tasks.length > 0) {
+                        const subTaskSummary = buildSubTasksSummary(session.subTaskRegistry);
+                        if (subTaskSummary) {
+                            systemPrompt += subTaskSummary;
+                            debug('Injected sub-tasks summary', { 
+                                taskCount: session.subTaskRegistry.tasks.length 
+                            });
                         }
                     }
                     

@@ -539,6 +539,30 @@
           "default": 24,
           "description": "Hours to keep uploaded files before cleanup (0 = delete immediately on session end, -1 = never auto-delete)",
           "order": 34
+        },
+        "grok.proactiveBundling": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically bundle related files (imports, tests) when AI modifies a file. Bundled files are attached to the next message.",
+          "order": 35
+        },
+        "grok.bundleImports": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include imported files when bundling (requires proactiveBundling enabled)",
+          "order": 36
+        },
+        "grok.bundleTests": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include related test files when bundling (requires proactiveBundling enabled)",
+          "order": 37
+        },
+        "grok.maxBundledFiles": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum number of files to bundle per apply action (to prevent context explosion)",
+          "order": 38
         }
       }
     },
