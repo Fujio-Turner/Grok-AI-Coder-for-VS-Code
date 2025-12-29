@@ -609,6 +609,38 @@ export async function updateLastPairResponse(
 }
 
 /**
+ * Update contextFiles for the last pair's request.
+ * Called after agent workflow loads files so we persist which files were loaded.
+ */
+export async function updateLastPairContextFiles(
+    sessionId: string,
+    contextFiles: string[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    if (doc.pairs.length > 0) {
+        const lastPair = doc.pairs[doc.pairs.length - 1];
+        lastPair.request.contextFiles = contextFiles;
+    }
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update pair contextFiles');
+    }
+    
+    console.log('Updated last pair contextFiles for session:', sessionId, 'files:', contextFiles.length);
+}
+
+/**
  * Update session summary
  */
 export async function updateSessionSummary(sessionId: string, summary: string): Promise<void> {

@@ -188,31 +188,22 @@
         "grok.couchbaseConnectionMode": {
           "type": "string",
           "default": "rest",
-          "enum": [
-            "sdk",
-            "rest"
-          ],
-          "enumDescriptions": [
-            "SDK - Native Couchbase Node.js SDK (faster KV ops, requires native module)",
-            "REST - HTTP/REST API (default, works everywhere)"
-          ],
-          "description": "Connection mode: SDK uses native Couchbase client (faster), REST uses HTTP APIs (more compatible)",
-          "order": 8
+          "description": "Connection mode (internal - always REST for compatibility)",
+          "order": 8,
+          "markdownDescription": "**Note:** SDK mode is disabled. REST API is used for maximum compatibility."
         },
         "grok.couchbaseDeployment": {
           "type": "string",
           "default": "self-hosted",
           "enum": [
             "self-hosted",
-            "capella-sdk",
             "capella-data-api"
           ],
           "enumDescriptions": [
-            "Self-hosted Couchbase Server",
-            "Couchbase Capella - SDK (uses native SDK with TLS)",
-            "Couchbase Capella - Data API (uses REST API)"
+            "Self-Hosted REST API - Connect to your own Couchbase Server via N1QL REST",
+            "Capella Data API - Connect to Couchbase Capella cloud via REST API"
           ],
-          "description": "Couchbase deployment type (affects connection method)",
+          "description": "Couchbase deployment type",
           "order": 9
         },
         "grok.selfHostedUrl": {

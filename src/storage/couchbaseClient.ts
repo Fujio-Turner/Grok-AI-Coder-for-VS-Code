@@ -18,7 +18,12 @@ async function loadCouchbaseSDK(): Promise<typeof import('couchbase') | null> {
         return couchbase;
     } catch (err) {
         couchbaseLoadError = err as Error;
-        warn('Couchbase SDK failed to load, falling back to REST mode:', err);
+        error('Couchbase SDK failed to load:', {
+            message: couchbaseLoadError.message,
+            name: couchbaseLoadError.name,
+            stack: couchbaseLoadError.stack?.split('\n').slice(0, 5).join('\n')
+        });
+        warn('Falling back to REST mode. Common causes: native module mismatch, VS Code Node version incompatibility, or missing prebuilt binaries.');
         return null;
     }
 }
@@ -1326,25 +1331,13 @@ export function getCouchbaseClient(): ICouchbaseClient {
 export function refreshCouchbaseClient(): ICouchbaseClient {
     const config = getConfig();
     let deployment = config.couchbaseDeployment;
-    let connectionMode = config.couchbaseConnectionMode || 'rest';
     
-    // Capella-SDK deployment forces SDK mode
+    // BYPASS: Always use REST mode for compatibility
+    const connectionMode = 'rest';
+    
+    // Handle legacy 'capella-sdk' setting - redirect to capella-data-api
     if (deployment === 'capella-sdk') {
-        connectionMode = 'sdk';
-    }
-    // Capella Data API deployment forces REST mode
-    if (deployment === 'capella-data-api') {
-        connectionMode = 'rest';
-    }
-    
-    // If SDK load already failed, force REST mode
-    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
-        warn('Couchbase SDK not available, falling back to REST mode');
-        connectionMode = 'rest';
-        if (deployment === 'capella-sdk') {
-            warn('Capella SDK not available, falling back to Capella Data API.');
-            deployment = 'capella-data-api';
-        }
+        deployment = 'capella-data-api';
     }
     
     // Check if mode actually changed
@@ -1372,36 +1365,27 @@ export function refreshCouchbaseClient(): ICouchbaseClient {
 
 /**
  * Internal: Creates the appropriate client based on current config.
+ * 
+ * NOTE: SDK mode is bypassed for compatibility. Native Couchbase SDK requires
+ * platform-specific binaries that don't work reliably in VS Code's Electron.
+ * REST API mode works everywhere without native module issues.
  */
 function createCouchbaseClient(): ICouchbaseClient {
     const config = getConfig();
     let deployment = config.couchbaseDeployment;
-    let connectionMode = config.couchbaseConnectionMode || 'rest';
     
-    // Capella-SDK deployment forces SDK mode
+    // BYPASS: Always use REST mode for compatibility
+    // SDK mode code is preserved but not used - native modules don't load reliably in Electron
+    const connectionMode = 'rest';
+    
+    // Handle legacy 'capella-sdk' setting - redirect to capella-data-api
     if (deployment === 'capella-sdk') {
-        connectionMode = 'sdk';
+        info('Capella SDK mode redirected to Capella Data API (SDK disabled for compatibility)');
+        deployment = 'capella-data-api';
     }
-    // Capella Data API deployment forces REST mode
+    
+    // Create the appropriate REST client
     if (deployment === 'capella-data-api') {
-        connectionMode = 'rest';
-    }
-    
-    // If SDK load already failed, force REST mode
-    if (connectionMode === 'sdk' && couchbaseLoadAttempted && !couchbase) {
-        warn('Couchbase SDK not available, falling back to REST mode');
-        connectionMode = 'rest';
-        if (deployment === 'capella-sdk') {
-            warn('Capella SDK not available, falling back to Capella Data API.');
-            deployment = 'capella-data-api';
-        }
-    }
-    
-    // Create the appropriate client
-    if (connectionMode === 'sdk') {
-        info('Creating Couchbase SDK client (persistent connection)', { deployment });
-        clientInstance = new SdkCouchbaseClient();
-    } else if (deployment === 'capella-data-api') {
         info('Creating Capella Data API client (REST)');
         clientInstance = new CapellaDataApiClient();
     } else {
@@ -1423,6 +1407,31 @@ export async function shutdownCouchbase(): Promise<void> {
     clientInstance = null;
     currentDeploymentMode = null;
     currentConnectionMode = null;
+}
+
+/**
+ * Returns current connection mode info for UI display.
+ * Shows what deployment type and protocol is currently in use.
+ * Note: SDK mode is disabled - always returns REST mode.
+ */
+export function getConnectionModeInfo(): { deployment: string; mode: string; label: string } {
+    const deployment = currentDeploymentMode || 'unknown';
+    const mode = 'rest'; // Always REST - SDK mode is bypassed
+    
+    // Create a short, readable label for the UI
+    let label = '';
+    switch (deployment) {
+        case 'self-hosted':
+            label = 'Self-Hosted REST API';
+            break;
+        case 'capella-data-api':
+            label = 'Capella Data API';
+            break;
+        default:
+            label = `${deployment} (${mode})`;
+    }
+    
+    return { deployment, mode, label };
 }
 
 // Export concrete classes for type checking if needed

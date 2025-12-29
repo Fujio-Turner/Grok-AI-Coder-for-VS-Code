@@ -1,12 +1,13 @@
 import * as vscode from 'vscode';
 import { v4 as uuidv4 } from 'uuid';
 import { sendChatCompletion, GrokMessage, createVisionMessage, testApiConnection, fetchLanguageModels, GrokModelInfo, ChatCompletionOptions } from '../api/grokClient';
-import { getCouchbaseClient } from '../storage/couchbaseClient';
+import { getCouchbaseClient, refreshCouchbaseClient, getConnectionModeInfo } from '../storage/couchbaseClient';
 import { 
     createSession, 
     getSession, 
     appendPair, 
     updateLastPairResponse,
+    updateLastPairContextFiles,
     updateSessionSummary,
     updateSessionUsage,
     updateSessionModelUsage,
@@ -954,9 +955,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _testAndSendConnectionStatus() {
         try {
-            // Test Couchbase
-            const cbClient = getCouchbaseClient();
+            // Test Couchbase - refresh client to pick up any new settings
+            const cbClient = refreshCouchbaseClient();
             const cbResult = await cbClient.ping();
+            
+            // Get connection mode info after refresh
+            const modeInfo = getConnectionModeInfo();
 
             // Test Grok API
             const apiKey = await this._context.secrets.get('grokApiKey');
@@ -969,13 +973,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._postMessage({
                 type: 'connectionStatus',
                 couchbase: cbResult,
-                api: apiResult
+                api: apiResult,
+                cbDeployment: modeInfo.deployment,
+                cbMode: modeInfo.mode,
+                cbLabel: modeInfo.label
             });
         } catch (error) {
+            const modeInfo = getConnectionModeInfo();
             this._postMessage({
                 type: 'connectionStatus',
                 couchbase: false,
-                api: false
+                api: false,
+                cbDeployment: modeInfo.deployment,
+                cbMode: modeInfo.mode,
+                cbLabel: modeInfo.label
             });
         }
     }
@@ -1835,6 +1846,16 @@ ${cliSummary}
             const isContinueMessage = /^continue/i.test(messageText.trim());
             if (isContinueMessage && this._currentSessionId) {
                 try {
+                    // Carry forward contextFiles from previous pair so AI knows which files were loaded
+                    if (session && session.pairs.length >= 2) {
+                        const prevPair = session.pairs[session.pairs.length - 2];
+                        if (prevPair.request.contextFiles && prevPair.request.contextFiles.length > 0) {
+                            const prevContextFiles = prevPair.request.contextFiles as string[];
+                            debug('Carrying forward contextFiles from previous pair:', prevContextFiles.length);
+                            await updateLastPairContextFiles(this._currentSessionId, prevContextFiles);
+                        }
+                    }
+                    
                     const tracker = getChangeTracker();
                     const autoApply = config.get<boolean>('autoApply', true);
                     
@@ -2042,6 +2063,32 @@ ${cliSummary}
                             });
                             finalMessageText = agentResult.augmentedMessage;
                             info(`Agent loaded ${parts.join(', ')}`);
+                            
+                            // Persist loaded files to contextFiles for session continuity
+                            if (hasFiles && this._currentSessionId) {
+                                const filePaths = agentResult.filesLoaded.map(f => f.path);
+                                try {
+                                    await updateLastPairContextFiles(this._currentSessionId, filePaths);
+                                    debug('Saved contextFiles:', filePaths.length);
+                                    
+                                    // Also track file reads in pairFileHistory
+                                    for (const file of agentResult.filesLoaded) {
+                                        try {
+                                            await appendPairFileOperation(this._currentSessionId, pairIndex, {
+                                                file: file.path,
+                                                md5: file.md5Hash,
+                                                op: 'read',
+                                                size: file.content.length,
+                                                by: 'auto'
+                                            });
+                                        } catch (trackErr) {
+                                            debug('Failed to track agent file read:', trackErr);
+                                        }
+                                    }
+                                } catch (err) {
+                                    debug('Failed to save contextFiles:', err);
+                                }
+                            }
                         } else if (!agentResult.skipped) {
                             this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: '⚠️ No matching files or URLs found\n\n' });
                         }
@@ -3668,6 +3715,7 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #cfg:hover{background:var(--vscode-button-secondaryHoverBackground)}
 #status-dot{font-size:12px;cursor:pointer;transition:color .3s}
 #status-dot.ok{color:#4ec9b0}
+#cb-mode{font-size:9px;color:var(--vscode-descriptionForeground);margin-left:-2px;cursor:default}
 #status-dot.warn{color:#dcdcaa}
 #status-dot.err{color:#f14c4c}
 #status-dot.checking{animation:pulse 1s infinite}
@@ -4097,7 +4145,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 .pie-legend-value{color:var(--vscode-descriptionForeground);font-size:10px}
 .no-data{padding:20px;text-align:center;color:var(--vscode-descriptionForeground);font-size:12px}
 </style></head><body>
-<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
+<div id="hdr"><div id="sess" title="Click to view chat history"><span>▼</span><span id="sess-text">New Chat</span></div><div id="hdr-btns"><span id="status-dot" title="Connection status">●</span><span id="cb-mode" title="Couchbase connection mode"></span><button id="model-btn" class="fast" title="Model: F=Fast, S=Smart, B=Base&#10;Click to cycle">F</button><button id="auto-btn" class="auto" title="Auto/Manual apply">A</button><button id="new">+ New Chat</button><button id="cfg">⚙️</button></div></div>
 <div id="hist"></div>
 
 <!-- Settings View -->
@@ -4123,11 +4171,10 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
             <div class="setting-row">
                 <label>Deployment Type</label>
                 <select id="set-couchbaseDeployment">
-                    <option value="self-hosted">Self-hosted</option>
-                    <option value="capella-sdk">Couchbase Capella - SDK</option>
-                    <option value="capella-data-api">Couchbase Capella - Data API</option>
+                    <option value="self-hosted">Self-Hosted REST API</option>
+                    <option value="capella-data-api">Capella Data API</option>
                 </select>
-                <div class="desc">Choose between self-hosted Couchbase Server or Couchbase Capella DBaaS</div>
+                <div class="desc">Choose between self-hosted Couchbase Server or Couchbase Capella cloud</div>
             </div>
             
             <!-- Self-hosted fields -->
@@ -4151,23 +4198,6 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
                 <div class="setting-row">
                     <label>Password</label>
                     <input type="password" id="set-selfHostedPassword" placeholder="password">
-                </div>
-            </div>
-            
-            <!-- Capella SDK fields -->
-            <div id="section-capella-sdk" style="display:none">
-                <div class="setting-row">
-                    <label>SDK Connection URL</label>
-                    <input type="text" id="set-capellaSdkUrl" placeholder="cb.xxxxx.cloud.couchbase.com">
-                    <div class="desc">Capella SDK hostname (e.g., cb.xxxxx.cloud.couchbase.com)</div>
-                </div>
-                <div class="setting-row">
-                    <label>Username</label>
-                    <input type="text" id="set-capellaSdkUsername" placeholder="database_user">
-                </div>
-                <div class="setting-row">
-                    <label>Password</label>
-                    <input type="password" id="set-capellaSdkPassword" placeholder="password">
                 </div>
             </div>
             
@@ -4965,12 +4995,10 @@ function renderCharts(data){
 function updateDeploymentFields(){
     const deployment=document.getElementById('set-couchbaseDeployment').value;
     const isSelfHosted=deployment==='self-hosted';
-    const isCapellaSdk=deployment==='capella-sdk';
     const isCapellaDataApi=deployment==='capella-data-api';
     
-    // Show/hide deployment-specific sections
+    // Show/hide deployment-specific sections (SDK section removed)
     document.getElementById('section-self-hosted').style.display=isSelfHosted?'block':'none';
-    document.getElementById('section-capella-sdk').style.display=isCapellaSdk?'block':'none';
     document.getElementById('section-capella-data-api').style.display=isCapellaDataApi?'block':'none';
 }
 document.getElementById('set-couchbaseDeployment').onchange=updateDeploymentFields;
@@ -4994,11 +5022,6 @@ function populateSettings(s){
     document.getElementById('set-selfHostedQueryPort').value=s.selfHostedQueryPort||8093;
     document.getElementById('set-selfHostedUsername').value=s.selfHostedUsername||'';
     document.getElementById('set-selfHostedPassword').value=s.selfHostedPassword||'';
-    
-    // Capella SDK settings
-    document.getElementById('set-capellaSdkUrl').value=s.capellaSdkUrl||'';
-    document.getElementById('set-capellaSdkUsername').value=s.capellaSdkUsername||'';
-    document.getElementById('set-capellaSdkPassword').value=s.capellaSdkPassword||'';
     
     // Capella Data API settings
     document.getElementById('set-capellaDataApiUrl').value=s.capellaDataApiUrl||'';
@@ -5061,11 +5084,6 @@ function collectSettings(){
         selfHostedQueryPort:parseInt(document.getElementById('set-selfHostedQueryPort').value)||8093,
         selfHostedUsername:document.getElementById('set-selfHostedUsername').value,
         selfHostedPassword:document.getElementById('set-selfHostedPassword').value,
-        
-        // Capella SDK settings
-        capellaSdkUrl:document.getElementById('set-capellaSdkUrl').value,
-        capellaSdkUsername:document.getElementById('set-capellaSdkUsername').value,
-        capellaSdkPassword:document.getElementById('set-capellaSdkPassword').value,
         
         // Capella Data API settings
         capellaDataApiUrl:document.getElementById('set-capellaDataApiUrl').value,
@@ -5582,10 +5600,16 @@ case'config':enterToSend=m.enterToSend||false;autoApply=m.autoApply!==false;auto
 case'fullConfig':if(m.settings)populateSettings(m.settings);break;
 case'connectionStatus':
     connectionStatus.couchbase=m.couchbase;connectionStatus.api=m.api;updateStatusDot();
+    // Update connection mode label in header
+    const cbModeEl=document.getElementById('cb-mode');
+    if(cbModeEl&&m.cbLabel){
+        cbModeEl.textContent=m.cbLabel;
+        cbModeEl.title='Couchbase: '+m.cbLabel+'\\nDeployment: '+m.cbDeployment+'\\nMode: '+m.cbMode.toUpperCase();
+    }
     // Update settings panel test results
     const dbResult=document.getElementById('db-test-result');
     const apiResult=document.getElementById('api-test-result');
-    if(dbResult){dbResult.innerHTML='<div class="test-result '+(m.couchbase?'success':'error')+'">'+(m.couchbase?'✓ Couchbase connected':'✗ Couchbase connection failed')+'</div>';}
+    if(dbResult){dbResult.innerHTML='<div class="test-result '+(m.couchbase?'success':'error')+'">'+(m.couchbase?'✓ Couchbase connected ('+m.cbLabel+')':'✗ Couchbase connection failed')+'</div>';}
     if(apiResult){apiResult.innerHTML='<div class="test-result '+(m.api?'success':'error')+'">'+(m.api?'✓ Grok API connected':'✗ API connection failed')+'</div>';}
     break;
 case'fileSearchResults':showAutocomplete(m.files||[]);break;
