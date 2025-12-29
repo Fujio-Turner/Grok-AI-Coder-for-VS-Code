@@ -46,7 +46,12 @@ import {
     // Audit generation
     appendAuditEntry,
     updateSessionAuditFlag,
-    getProjectId
+    getProjectId,
+    // File registry
+    updateFileRegistry,
+    markFileModified,
+    buildFileRegistrySummary,
+    FileRegistryEntry
 } from '../storage/chatSessionRepository';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
@@ -2085,6 +2090,23 @@ ${cliSummary}
                                             debug('Failed to track agent file read:', trackErr);
                                         }
                                     }
+                                    
+                                    // Update file registry with loaded files
+                                    try {
+                                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                                        const registryEntries = agentResult.filesLoaded.map(f => ({
+                                            path: f.path,
+                                            absolutePath: f.path.startsWith('/') ? f.path : `${workspaceRoot}/${f.path}`,
+                                            md5: f.md5Hash,
+                                            sizeBytes: f.content.length,
+                                            language: f.language || 'text',
+                                            loadedBy: 'auto' as const
+                                        }));
+                                        await updateFileRegistry(this._currentSessionId, registryEntries, pairIndex);
+                                        debug('Updated file registry with', registryEntries.length, 'files');
+                                    } catch (regErr) {
+                                        debug('Failed to update file registry:', regErr);
+                                    }
                                 } catch (err) {
                                     debug('Failed to save contextFiles:', err);
                                 }
@@ -3161,6 +3183,15 @@ ${cliSummary}
                         by: 'user'
                     });
                     debug(`Tracked file ${isNewFile ? 'create' : 'update'}: ${edit.fileUri.fsPath} (MD5: ${newMd5.slice(0, 8)}...)`);
+                    
+                    // Also update file registry to mark as modified
+                    try {
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        const relativePath = edit.fileUri.fsPath.replace(workspaceRoot + '/', '').replace(workspaceRoot, '');
+                        await markFileModified(this._currentSessionId!, relativePath, newMd5, currentPairIndex);
+                    } catch (regErr) {
+                        debug('Failed to update file registry for modification:', regErr);
+                    }
                 } catch (trackErr) {
                     debug('Failed to track file update:', trackErr);
                 }
@@ -3650,6 +3681,15 @@ ${parentSession.handoffText}`;
                         const fileHistorySummary = buildFileHistorySummary(session.pairFileHistory, 5);
                         if (fileHistorySummary) {
                             systemPrompt += fileHistorySummary;
+                        }
+                    }
+                    
+                    // Add file registry summary - shows all files AI has "seen" across conversation
+                    if (session.fileRegistry && Object.keys(session.fileRegistry).length > 0) {
+                        const currentTurn = session.pairs.length;
+                        const registrySummary = buildFileRegistrySummary(session.fileRegistry, currentTurn, 15);
+                        if (registrySummary) {
+                            systemPrompt += registrySummary;
                         }
                     }
                     

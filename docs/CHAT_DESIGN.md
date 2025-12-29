@@ -1965,6 +1965,139 @@ Image generation uses a flat per-image pricing model:
 
 ---
 
+## File Registry (Session Memory)
+
+### Overview
+
+The **File Registry** is a persistent metadata store that tracks all files the AI has "seen" across a conversation. Unlike `pairFileHistory` which tracks per-turn operations, the registry provides a session-wide view of file states.
+
+### Purpose
+
+| Problem | Solution |
+|---------|----------|
+| AI forgets which files it has seen | Registry persists file metadata across turns |
+| AI uses stale file content | `lastModifiedTurn` flags when file changed after last seen |
+| AI hallucinates file content | Registry shows what's in context vs what needs re-attachment |
+| Context explosion | Registry tracks sizeBytes for budget decisions |
+
+### Data Structure
+
+```typescript
+interface FileRegistryEntry {
+    path: string;              // Relative path from workspace root
+    absolutePath: string;      // Full filesystem path
+    md5: string;               // Last known hash
+    lastSeenTurn: number;      // Which pairIndex last had this file attached
+    lastModifiedTurn?: number; // Which pairIndex last modified this file
+    sizeBytes: number;         // File size for context budget decisions
+    language: string;          // Detected language
+    loadedBy: 'user' | 'auto' | 'ai-adhoc';  // How file was loaded
+}
+
+// Stored in session document
+interface ChatSessionDocument {
+    // ... existing fields ...
+    fileRegistry?: Record<string, FileRegistryEntry>;
+}
+```
+
+### How It Works
+
+```mermaid
+flowchart TD
+    subgraph Load["📂 File Load"]
+        A[Agent loads files] --> B[Update fileRegistry]
+        C[User attaches file] --> B
+        B --> D[Set lastSeenTurn = current]
+    end
+    
+    subgraph Modify["✏️ File Modify"]
+        E[User applies change] --> F[markFileModified]
+        F --> G[Set lastModifiedTurn = current]
+        F --> H[Update md5 hash]
+    end
+    
+    subgraph Context["🤖 AI Context"]
+        I[Build system prompt] --> J{Registry has entries?}
+        J -->|Yes| K[Inject KNOWN FILES table]
+        J -->|No| L[Skip registry section]
+        K --> M[AI sees file states]
+    end
+    
+    subgraph AIAction["🎯 AI Decision"]
+        M --> N{File in registry?}
+        N -->|No| O[Request attachment]
+        N -->|Yes| P{Modified since seen?}
+        P -->|Yes| Q[⚠️ Request re-attachment]
+        P -->|No| R[Can reference structure]
+    end
+    
+    style Load fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Modify fill:#2a2a1a,stroke:#dcdcaa,color:#fff
+    style Context fill:#1a2a3a,stroke:#4ea5c9,color:#fff
+    style AIAction fill:#2a1a3a,stroke:#c94eb0,color:#fff
+```
+
+### AI Context Injection
+
+The registry is injected into the system prompt as a markdown table:
+
+```markdown
+## 📂 KNOWN FILES (Session Registry)
+Files you have seen in this conversation. Check "Modified Since" before using cached knowledge.
+
+| File | Last Seen | Modified Since | Hash (first 12) |
+|------|-----------|----------------|-----------------|
+| src/utils.py | This turn | No | 9a906fd5909d... |
+| src/api.py | 2 turn(s) ago | ⚠️ Yes (turn 4) | abc123def456... |
+| config/settings.json | 3 turn(s) ago | No | def789ghi012... |
+
+**If "Modified Since" shows ⚠️, request re-attachment before making changes.**
+```
+
+### Registry Functions
+
+| Function | Purpose |
+|----------|---------|
+| `updateFileRegistry(sessionId, entries, currentTurn)` | Add/update files when loaded |
+| `markFileModified(sessionId, path, newMd5, modifiedTurn)` | Mark file as modified after apply |
+| `getFileRegistry(sessionId)` | Get full registry |
+| `getFileFromRegistry(sessionId, path)` | Get single file entry |
+| `buildFileRegistrySummary(registry, currentTurn, maxFiles)` | Generate markdown table for context |
+
+### System Prompt Instructions
+
+The AI is instructed to use the registry:
+
+```
+## 📂 FILE REGISTRY (Session Memory)
+
+The context may include a **KNOWN FILES** section showing files you've seen:
+- **Last Seen**: Which turn you last had the file content
+- **Modified Since**: ⚠️ means file changed AFTER you last saw it - request re-attachment!
+- **Hash**: Use this to verify you have the latest version
+
+**Using the registry:**
+1. Before modifying a file, check if it appears in KNOWN FILES
+2. If "Modified Since" shows ⚠️, the file changed - ask for re-attachment
+3. If file was seen recently and not modified, you can reference its structure
+4. The registry helps you know WHAT files exist, not their current content
+```
+
+### Comparison with pairFileHistory
+
+| Aspect | pairFileHistory | fileRegistry |
+|--------|-----------------|--------------|
+| Scope | Per-turn operations | Session-wide file states |
+| Purpose | Track read/update/create ops | Track what AI has "seen" |
+| Granularity | Every operation logged | Latest state per file |
+| AI Use | Check recent modifications | Know available files |
+| Staleness Detection | Check `by: user` updates | Check `lastModifiedTurn > lastSeenTurn` |
+
+Both are injected into AI context and serve complementary purposes.
+
+---
+
 ## Debugging & Audit Features
 
 ### Audit Generation (Debug Full AI Responses)

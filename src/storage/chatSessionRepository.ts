@@ -330,6 +330,8 @@ export interface ChatSessionDocument {
     pairFileHistory?: PairFileHistoryEntry[];
     /** Whether audit generation is enabled for this session */
     auditGenerating?: boolean;
+    /** File registry - persistent file metadata across conversation turns */
+    fileRegistry?: Record<string, FileRegistryEntry>;
 }
 
 // ============================================================================
@@ -443,6 +445,25 @@ export interface PairFileOperation {
  * Each entry in pairFileHistory corresponds to a pair index.
  */
 export type PairFileHistoryEntry = PairFileOperation[];
+
+// ============================================================================
+// File Registry - Persistent file metadata across conversation turns
+// ============================================================================
+
+/**
+ * Entry in the file registry tracking file metadata across the conversation.
+ * Allows AI to know which files it has "seen" even if not in current context.
+ */
+export interface FileRegistryEntry {
+    path: string;              // Relative path from workspace root
+    absolutePath: string;      // Full filesystem path
+    md5: string;               // Last known hash
+    lastSeenTurn: number;      // Which pairIndex last had this file attached
+    lastModifiedTurn?: number; // Which pairIndex last modified this file
+    sizeBytes: number;         // File size for context budget decisions
+    language: string;          // Detected language (for syntax highlighting)
+    loadedBy: PairFileOperationBy;  // How file was loaded (user/auto/ai-adhoc)
+}
 
 /**
  * Generate a deterministic projectId from the workspace folder path.
@@ -1356,6 +1377,195 @@ export function buildFileHistorySummary(
             lines.push(`  ${opSymbol} ${op.op}: ${op.file} (md5: ${op.md5.slice(0, 12)}...)${byLabel}`);
         }
     }
+    
+    return lines.join('\n');
+}
+
+// ============================================================================
+// File Registry - Persistent file metadata across conversation
+// ============================================================================
+
+/**
+ * Update the file registry with new file entries.
+ * Merges entries - existing files are updated, new files are added.
+ * 
+ * @param sessionId - The session ID
+ * @param entries - Array of file registry entries to add/update
+ * @param currentTurn - The current pair index (for lastSeenTurn)
+ */
+export async function updateFileRegistry(
+    sessionId: string,
+    entries: Array<{
+        path: string;
+        absolutePath: string;
+        md5: string;
+        sizeBytes: number;
+        language: string;
+        loadedBy: PairFileOperationBy;
+    }>,
+    currentTurn: number
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    if (!doc.fileRegistry) {
+        doc.fileRegistry = {};
+    }
+    
+    for (const entry of entries) {
+        const existing = doc.fileRegistry[entry.path];
+        
+        doc.fileRegistry[entry.path] = {
+            path: entry.path,
+            absolutePath: entry.absolutePath,
+            md5: entry.md5,
+            lastSeenTurn: currentTurn,
+            lastModifiedTurn: existing?.lastModifiedTurn,
+            sizeBytes: entry.sizeBytes,
+            language: entry.language,
+            loadedBy: entry.loadedBy
+        };
+    }
+    
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to update file registry');
+    }
+    
+    debug(`[FileRegistry] Updated ${entries.length} entries for session ${sessionId}`);
+}
+
+/**
+ * Mark a file as modified in the registry.
+ * Updates the lastModifiedTurn and MD5 hash.
+ * 
+ * @param sessionId - The session ID
+ * @param path - Relative path of the file
+ * @param newMd5 - New MD5 hash after modification
+ * @param modifiedTurn - The pair index where modification occurred
+ */
+export async function markFileModified(
+    sessionId: string,
+    path: string,
+    newMd5: string,
+    modifiedTurn: number
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    if (!doc.fileRegistry) {
+        doc.fileRegistry = {};
+    }
+    
+    const existing = doc.fileRegistry[path];
+    if (existing) {
+        existing.md5 = newMd5;
+        existing.lastModifiedTurn = modifiedTurn;
+        existing.lastSeenTurn = modifiedTurn;
+    } else {
+        warn(`[FileRegistry] markFileModified called for unknown file: ${path}`);
+    }
+    
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to mark file as modified');
+    }
+    
+    debug(`[FileRegistry] Marked ${path} as modified at turn ${modifiedTurn}`);
+}
+
+/**
+ * Get the file registry for a session.
+ */
+export async function getFileRegistry(
+    sessionId: string
+): Promise<Record<string, FileRegistryEntry>> {
+    const session = await getSession(sessionId);
+    return session?.fileRegistry || {};
+}
+
+/**
+ * Get a specific file from the registry.
+ */
+export async function getFileFromRegistry(
+    sessionId: string,
+    path: string
+): Promise<FileRegistryEntry | null> {
+    const registry = await getFileRegistry(sessionId);
+    return registry[path] || null;
+}
+
+/**
+ * Build a summary of the file registry for inclusion in AI context.
+ * Shows files the AI has "seen" across the conversation.
+ * 
+ * @param fileRegistry - The file registry from the session
+ * @param currentTurn - Current pair index to calculate staleness
+ * @param maxFiles - Maximum number of files to show (default 15)
+ */
+export function buildFileRegistrySummary(
+    fileRegistry: Record<string, FileRegistryEntry> | undefined,
+    currentTurn: number,
+    maxFiles: number = 15
+): string {
+    if (!fileRegistry || Object.keys(fileRegistry).length === 0) {
+        return '';
+    }
+    
+    const entries = Object.values(fileRegistry);
+    
+    // Sort by lastSeenTurn descending (most recent first)
+    entries.sort((a, b) => b.lastSeenTurn - a.lastSeenTurn);
+    
+    // Limit to maxFiles
+    const displayEntries = entries.slice(0, maxFiles);
+    
+    const lines: string[] = [];
+    lines.push('\n## 📂 KNOWN FILES (Session Registry)');
+    lines.push('Files you have seen in this conversation. Check "Modified Since" before using cached knowledge.\n');
+    lines.push('| File | Last Seen | Modified Since | Hash (first 12) |');
+    lines.push('|------|-----------|----------------|-----------------|');
+    
+    for (const entry of displayEntries) {
+        const turnsAgo = currentTurn - entry.lastSeenTurn;
+        const lastSeenLabel = turnsAgo === 0 ? 'This turn' : `${turnsAgo} turn(s) ago`;
+        
+        let modifiedLabel = 'No';
+        if (entry.lastModifiedTurn !== undefined) {
+            if (entry.lastModifiedTurn > entry.lastSeenTurn) {
+                modifiedLabel = `⚠️ Yes (turn ${entry.lastModifiedTurn})`;
+            } else if (entry.lastModifiedTurn === entry.lastSeenTurn) {
+                modifiedLabel = 'Just now';
+            }
+        }
+        
+        const hashPreview = entry.md5.slice(0, 12);
+        lines.push(`| ${entry.path} | ${lastSeenLabel} | ${modifiedLabel} | ${hashPreview}... |`);
+    }
+    
+    if (entries.length > maxFiles) {
+        lines.push(`\n*...and ${entries.length - maxFiles} more files in registry*`);
+    }
+    
+    lines.push('\n**If "Modified Since" shows ⚠️, request re-attachment before making changes.**');
     
     return lines.join('\n');
 }
