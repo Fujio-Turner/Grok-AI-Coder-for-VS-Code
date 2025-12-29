@@ -11,7 +11,11 @@ import { listSessions } from './storage/chatSessionRepository';
 export function activate(context: vscode.ExtensionContext) {
     // Initialize logger first
     const outputChannel = initLogger();
-    info('Grok AI Coder extension activated');
+    
+    // Get and log extension version
+    const extension = vscode.extensions.getExtension('fujio-turner.grok-ai-coder');
+    const version = extension?.packageJSON?.version || 'unknown';
+    info(`Grok AI Coder extension activated (v${version})`);
     
     const config = getConfig();
     debug('Configuration loaded:', config);

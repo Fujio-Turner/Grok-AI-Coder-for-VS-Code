@@ -180,6 +180,15 @@ The `config/` folder contains **externalized AI prompts and schemas** that were 
 
 **Config loader:** `src/utils/configLoader.ts` handles loading these files at runtime.
 
+## Version Display
+
+The extension version is displayed in two places for easy identification:
+
+1. **Settings Panel** - Version badge shown between "Settings" title and "← Back to Chat" button (e.g., `v1.0.24`)
+2. **Startup Log** - Output channel shows version on activation: `Grok AI Coder extension activated (v1.0.24)`
+
+**Important:** Always update the version in `package.json` before building a new VSIX release. This ensures users can identify which version they're running.
+
 ## Commands
 
 ```bash

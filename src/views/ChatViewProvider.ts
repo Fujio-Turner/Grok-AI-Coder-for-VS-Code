@@ -123,11 +123,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _abortController?: AbortController;
     private _isRequestInProgress = false;
     private _modelInfoCache: Map<string, GrokModelInfo> = new Map();
+    private _extensionVersion: string;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _context: vscode.ExtensionContext
     ) {
+        // Get version from extension manifest
+        const extension = vscode.extensions.getExtension('fujio-turner.grok-ai-coder');
+        this._extensionVersion = extension?.packageJSON?.version || 'unknown';
+        
         const tracker = getChangeTracker();
         tracker.onChange((changes, position) => {
             this._sendChangesUpdate(changes, position);
@@ -4655,6 +4660,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 #chat.hide,#inp.hide,#todo-bar.hide,#todo-list.hide{display:none!important}
 .settings-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--vscode-panel-border)}
 .settings-header h2{font-size:16px;font-weight:600;margin:0;color:var(--vscode-foreground)}
+.version-badge{font-size:11px;font-weight:500;color:var(--vscode-descriptionForeground);background:var(--vscode-badge-background);padding:2px 8px;border-radius:10px;margin-left:auto;margin-right:12px}
 .settings-close{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:none;border-radius:4px;padding:6px 12px;cursor:pointer;font-size:12px}
 .settings-close:hover{background:var(--vscode-button-secondaryHoverBackground)}
 .settings-tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}
@@ -4736,6 +4742,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 <div id="settings-view">
     <div class="settings-header">
         <h2>⚙️ Settings</h2>
+        <span id="version-badge" class="version-badge">v${this._extensionVersion}</span>
         <button class="settings-close" id="settings-close">← Back to Chat</button>
     </div>
     <div class="settings-tabs">

@@ -41,11 +41,15 @@ npm install && npm run compile && vsce package
 
 ## Version Management
 
+**⚠️ IMPORTANT:** Always update the version before building a release. The version is displayed:
+- In the **Settings panel** (badge between title and back button)
+- On **extension activation** in the output log
+
 To update the version before building, edit the `version` field in `package.json`:
 
 ```json
 {
-  "version": "1.0.1"
+  "version": "1.0.24"
 }
 ```
 
@@ -55,6 +59,8 @@ npm version patch  # 1.0.0 → 1.0.1
 npm version minor  # 1.0.0 → 1.1.0
 npm version major  # 1.0.0 → 2.0.0
 ```
+
+**Verify after install:** Check the Settings panel for `v1.0.24` or look in the output channel for `Grok AI Coder extension activated (v1.0.24)`.
 
 ## Install the Extension
 

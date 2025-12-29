@@ -84,11 +84,36 @@ ${RESPONSE_JSON_SCHEMA}
 | summary | YES | Brief 1-2 sentence summary. Plain text only, no markdown. |
 | sections | no | Array of sections with heading, content (plain text), and optional codeBlocks |
 | codeBlocks | no | Standalone code examples: { language, code, caption } |
-| todos | no | Task list: [{ "text": "step", "completed": false }] |
+| todos | **YES when fileChanges exist** | Task list for progress tracking: [{ "text": "short step", "completed": false }]. ALWAYS include when making file changes! |
 | fileHashes | **REQUIRED when using lineOperations** | MD5 hashes of files you read: { "path/file.py": "abc123..." } |
-| fileChanges | no | Files to create/modify |
+| fileChanges | no | Files to create/modify. Each should have todoIndex linking to a todo item. |
 | commands | no | Terminal commands to run |
 | nextSteps | no | Follow-up action suggestions: [{ "html": "display text", "inputText": "what to send" }] - ordered by priority |
+
+## ⚠️ CRITICAL: ALWAYS INCLUDE TODOS WITH FILE CHANGES
+
+When you include fileChanges, you MUST also include a todos array so the user can see progress:
+
+**CORRECT - todos with fileChanges:**
+\`\`\`json
+{
+  "summary": "Updated all 3 scripts.",
+  "todos": [{"text": "Add third INT parameter to all scripts", "completed": false}],
+  "fileChanges": [
+    {"path": "base.py", "todoIndex": 0, ...},
+    {"path": "greeter.py", "todoIndex": 0, ...},
+    {"path": "welcomer.py", "todoIndex": 0, ...}
+  ]
+}
+\`\`\`
+
+**WRONG - fileChanges without todos (user sees no progress):**
+\`\`\`json
+{
+  "summary": "Updated all 3 scripts.",
+  "fileChanges": [...]  // NO todos array = user has no checklist!
+}
+\`\`\`
 
 ## FORMATTING RULES
 

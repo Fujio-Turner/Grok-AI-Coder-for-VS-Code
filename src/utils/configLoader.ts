@@ -19,7 +19,26 @@ const configCache = new Map<string, any>();
 function getConfigPath(): string {
     // __dirname is the compiled output folder (out/utils)
     // Go up two levels to get to the extension root, then into config
-    return path.join(__dirname, '..', '..', 'config');
+    let configPath = path.join(__dirname, '..', '..', 'config');
+    
+    // Check if config folder exists at this path
+    if (!fs.existsSync(configPath)) {
+        // Try alternative paths for development mode
+        const altPaths = [
+            path.join(__dirname, '..', '..', '..', 'config'),  // One more level up
+            path.join(__dirname, '..', '..', 'Grok_AI_Coder', 'config'),  // Nested folder
+        ];
+        
+        for (const altPath of altPaths) {
+            if (fs.existsSync(altPath)) {
+                debug(`Using alternative config path: ${altPath}`);
+                configPath = altPath;
+                break;
+            }
+        }
+    }
+    
+    return configPath;
 }
 
 /**

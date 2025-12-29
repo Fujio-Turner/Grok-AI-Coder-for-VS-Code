@@ -305,6 +305,7 @@ export interface ChatSessionDocument {
     docType: 'chat';
     projectId: string;
     projectName: string;
+    workspacePath?: string;  // Absolute path to workspace root folder
     createdAt: string;
     updatedAt: string;
     summary?: string;  // AI-generated summary of the chat topic
@@ -586,6 +587,17 @@ export function getProjectName(): string {
 }
 
 /**
+ * Get the absolute path to the workspace folder.
+ */
+export function getWorkspacePath(): string | undefined {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return undefined;
+    }
+    return workspaceFolders[0].uri.fsPath;
+}
+
+/**
  * Create a new chat session.
  * Uses insert which fails if document exists (05_cb_exception_handling.py pattern).
  * On DocumentExists error (extremely rare with UUIDs), fetches existing session with CAS.
@@ -596,12 +608,14 @@ export async function createSession(parentSessionId?: string): Promise<ChatSessi
     const now = new Date().toISOString();
     const projectId = getProjectId();
     const projectName = getProjectName();
+    const workspacePath = getWorkspacePath();
     
     const doc: ChatSessionDocument = {
         id,
         docType: 'chat',
         projectId,
         projectName,
+        workspacePath,
         createdAt: now,
         updatedAt: now,
         cost: 0,
