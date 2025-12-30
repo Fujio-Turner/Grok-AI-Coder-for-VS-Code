@@ -290,6 +290,22 @@
           "description": "Couchbase collection name",
           "order": 17
         },
+        "grok.promptVerbosity": {
+          "type": "string",
+          "enum": [
+            "full",
+            "compact",
+            "minimal"
+          ],
+          "default": "compact",
+          "enumDescriptions": [
+            "Full: Complete system prompt with all examples (~6000 tokens)",
+            "Compact: Essential rules with key examples (~800 tokens)",
+            "Minimal: Just output format, for experienced users (~400 tokens)"
+          ],
+          "description": "System prompt verbosity level. Lower = faster responses, lower cost.",
+          "order": 19
+        },
         "grok.debug": {
           "type": "boolean",
           "default": false,

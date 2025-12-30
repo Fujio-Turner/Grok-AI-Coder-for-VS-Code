@@ -59,6 +59,9 @@ import {
     buildDirectoryListingSummary,
     DirectoryListingResult,
     DirectoryListingEntry,
+    // File search results
+    clearPendingFileSearchResults,
+    buildFileSearchResultsSummary,
     // Sub-task registry
     storeSubTaskRegistry,
     getSubTaskRegistry,
@@ -76,12 +79,17 @@ import {
     storeAnalysisResult,
     getAnalysisResults,
     buildAnalysisResultsSummary,
-    AnalysisResult
+    AnalysisResult,
+    // Telemetry
+    TelemetryEntry,
+    TelemetryOperationType,
+    createTelemetryTimer
 } from '../storage/chatSessionRepository';
+import { TelemetryCollector, createTelemetryCollector } from '../agent/actionTypes';
 import { readAgentContext } from '../context/workspaceContext';
 import { buildSystemPrompt, getWorkspaceInfo } from '../prompts/systemPrompt';
 import { parseResponse, GrokStructuredResponse } from '../prompts/responseParser';
-import { STRUCTURED_OUTPUT_SCHEMA, DirectoryRequest, SubTaskRequest } from '../prompts/responseSchema';
+import { STRUCTURED_OUTPUT_SCHEMA, DirectoryRequest, SubTaskRequest, FileSearchRequest } from '../prompts/responseSchema';
 import { parseWithCleanup } from '../prompts/jsonCleaner';
 import { getModelName, ModelType, debug, info, error as logError, detectModelType } from '../utils/logger';
 import { 
@@ -103,8 +111,19 @@ import {
 import { updateUsage, setCurrentSession, startStepTimer, endStepTimer, recordStep } from '../usage/tokenTracker';
 import { ChangeSet } from '../edits/changeTracker';
 import { validateAndApplyOperations, LineOperation } from '../edits/lineOperations';
+import { consolidateFileChanges, needsConsolidation, getConsolidationPreview } from '../edits/changeConsolidator';
+import { checkFileCorruption, formatCorruptionReport, needsCorruptionCheck, FileCorruptionResult } from '../edits/fileCorruptionDetector';
 import { runAgentWorkflow, runFilesApiWorkflow, buildFilesApiMessage } from '../agent/agentOrchestrator';
 import { addLineNumbers } from '../agent/workspaceFiles';
+import { 
+    smartReadFile, 
+    createFileInfo, 
+    shouldUseSmartReading,
+    getReadingRecommendation,
+    smartReadFilesParallel,
+    SmartReadResult,
+    ParallelReadResult
+} from '../agent/smartFileReader';
 import { createFileMessage } from '../api/grokClient';
 import { deleteFiles } from '../api/fileUploader';
 import { 
@@ -126,6 +145,18 @@ import { generateImages, detectImageGenerationRequest, generateImagePrompts, cre
 import { bundleRelatedFiles, BundledFile } from '../utils/importAnalyzer';
 import { isContinueMessage, buildMemoryBlock } from '../utils/memoryBuilder';
 import { PendingChunks, getNextChunk, ChunkProcessingContext } from '../agent/agentOrchestrator';
+import { 
+    getAgentStepTracker, 
+    AgentStep, 
+    AgentWorkflow,
+    agentStepTracker 
+} from '../agent/agentStepTracker';
+import { 
+    previewStepRevert, 
+    revertAgentStep, 
+    revertToAgentStep, 
+    getWorkflowStatus 
+} from '../edits/codeActions';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'grokChatView';
@@ -140,6 +171,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _pendingChunks?: PendingChunks;
     /** Context accumulated from processing previous chunks */
     private _chunkContext?: ChunkProcessingContext;
+    /** Counter for auto-continue attempts to prevent infinite loops */
+    private _autoContinueCount = 0;
+    /** Max auto-continue attempts before stopping (prevents infinite loops) */
+    private static readonly MAX_AUTO_CONTINUE_ATTEMPTS = 10;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -348,6 +383,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'skipSubTask':
                     await this._skipSubTask(message.taskId);
+                    break;
+                // Agent Step Workflow handlers
+                case 'getWorkflowStatus':
+                    this._sendWorkflowStatus();
+                    break;
+                case 'previewStepRevert':
+                    await this._previewStepRevert(message.stepId);
+                    break;
+                case 'revertStep':
+                    await this._revertStep(message.stepId);
+                    break;
+                case 'revertToStep':
+                    await this._revertToStepNumber(message.stepNumber);
+                    break;
+                case 'cancelWorkflow':
+                    this._cancelWorkflow();
                     break;
             }
         });
@@ -1488,6 +1539,159 @@ ${cliSummary}
         }
     }
 
+    // ============================================================================
+    // Agent Step Workflow Methods
+    // ============================================================================
+    
+    /**
+     * Send current workflow status to webview
+     */
+    private _sendWorkflowStatus() {
+        const status = getWorkflowStatus();
+        this._postMessage({
+            type: 'workflowStatus',
+            ...status
+        });
+    }
+    
+    /**
+     * Preview what would be reverted if a step is rolled back
+     */
+    private async _previewStepRevert(stepId: string) {
+        try {
+            const preview = await previewStepRevert(stepId);
+            this._postMessage({
+                type: 'stepRevertPreview',
+                stepId,
+                ...preview
+            });
+        } catch (err: any) {
+            logError('Preview step revert failed:', err);
+            vscode.window.showErrorMessage(`Preview failed: ${err.message}`);
+        }
+    }
+    
+    /**
+     * Revert a specific step (and all dependent steps)
+     */
+    private async _revertStep(stepId: string) {
+        try {
+            const result = await revertAgentStep(stepId);
+            
+            if (result.success) {
+                vscode.window.showInformationMessage(
+                    `Reverted ${result.revertedSteps.length} step(s), ${result.revertedChangeSets.length} change(s)`
+                );
+            } else {
+                vscode.window.showWarningMessage(
+                    `Revert completed with errors: ${result.errors.join(', ')}`
+                );
+            }
+            
+            // Refresh UI
+            this._sendWorkflowStatus();
+            this._sendInitialChanges();
+            await this._persistChangeHistory();
+        } catch (err: any) {
+            logError('Revert step failed:', err);
+            vscode.window.showErrorMessage(`Revert failed: ${err.message}`);
+        }
+    }
+    
+    /**
+     * Revert to a specific step number (revert everything after it)
+     */
+    private async _revertToStepNumber(stepNumber: number) {
+        try {
+            const result = await revertToAgentStep(stepNumber);
+            
+            if (result.success) {
+                vscode.window.showInformationMessage(
+                    `Reverted to step ${stepNumber}: ${result.revertedSteps.length} step(s) rolled back`
+                );
+            } else {
+                vscode.window.showWarningMessage(
+                    `Revert completed with errors: ${result.errors.join(', ')}`
+                );
+            }
+            
+            // Refresh UI
+            this._sendWorkflowStatus();
+            this._sendInitialChanges();
+            await this._persistChangeHistory();
+        } catch (err: any) {
+            logError('Revert to step failed:', err);
+            vscode.window.showErrorMessage(`Revert failed: ${err.message}`);
+        }
+    }
+    
+    /**
+     * Cancel the current workflow
+     */
+    private _cancelWorkflow() {
+        const tracker = getAgentStepTracker();
+        tracker.cancelWorkflow();
+        vscode.window.showInformationMessage('Workflow cancelled');
+        this._sendWorkflowStatus();
+    }
+    
+    /**
+     * Create or update workflow from TODOs in AI response.
+     * If no workflow exists and TODOs > 1, create a new workflow.
+     * If workflow exists, update current step status.
+     */
+    private async _updateWorkflowFromTodos(userRequest: string, todos: Array<{ text: string; completed: boolean }>) {
+        const tracker = getAgentStepTracker();
+        const workflow = tracker.getCurrentWorkflow();
+        
+        // Skip if no TODOs
+        if (!todos || todos.length === 0) {
+            return;
+        }
+        
+        // If no workflow and multiple TODOs, create one
+        if (!workflow && todos.length > 1 && this._currentSessionId) {
+            tracker.startWorkflow(this._currentSessionId, userRequest);
+            
+            // Add steps for each TODO
+            for (const todo of todos) {
+                tracker.addStep(todo.text);
+            }
+            
+            // Start first step
+            tracker.startStep();
+            
+            info(`[Workflow] Created workflow with ${todos.length} steps`);
+            this._sendWorkflowStatus();
+            return;
+        }
+        
+        // If workflow exists, update step status based on completed TODOs
+        if (workflow) {
+            const completedCount = todos.filter(t => t.completed).length;
+            const currentStep = tracker.getCurrentStep();
+            
+            if (currentStep) {
+                // If current step matches a completed TODO, mark it complete
+                const matchingTodo = todos.find(t => 
+                    t.completed && currentStep.description.toLowerCase().includes(t.text.toLowerCase().slice(0, 20))
+                );
+                
+                if (matchingTodo || completedCount > workflow.currentStepIndex + 1) {
+                    tracker.markStepApplied();
+                    
+                    // Start next step if available
+                    const nextPending = workflow.steps.find(s => s.status === 'pending');
+                    if (nextPending) {
+                        tracker.startStep(nextPending.id);
+                    }
+                    
+                    this._sendWorkflowStatus();
+                }
+            }
+        }
+    }
+
     private async _forwardStep() {
         // Ensure tracker is synced with Couchbase first
         await this._ensureTrackerSynced();
@@ -1564,6 +1768,11 @@ ${cliSummary}
             // Cleanup files from previous session before switching
             if (this._currentSessionId && this._currentSessionId !== sessionId) {
                 await this._cleanupSessionFiles();
+                
+                // Clear workflow tracker when switching sessions
+                const stepTracker = getAgentStepTracker();
+                stepTracker.clear();
+                debug('Cleared workflow tracker for session switch');
             }
             
             const session = await getSessionWithExtensions(sessionId);
@@ -1590,6 +1799,9 @@ ${cliSummary}
                 
                 // Send the restored changes to the UI
                 this._sendInitialChanges();
+                
+                // Send workflow status (will be empty for loaded sessions)
+                this._sendWorkflowStatus();
                 
                 info('Loaded session:', sessionId);
             }
@@ -1678,6 +1890,15 @@ ${cliSummary}
             const tracker = getChangeTracker();
             tracker.clear();
             debug('Cleared change tracker for new session');
+            
+            // CRITICAL: Clear workflow tracker when starting new session
+            // This prevents old workflow from persisting in the UI
+            const stepTracker = getAgentStepTracker();
+            stepTracker.clear();
+            debug('Cleared workflow tracker for new session');
+            
+            // Send cleared workflow status to UI
+            this._sendWorkflowStatus();
             
             debug('Creating new session in Couchbase...');
             const session = await createSession();
@@ -1799,6 +2020,13 @@ ${cliSummary}
         const messageText = text || '';
         debug('sendMessage called with:', { text: messageText.substring(0, 50) || '(empty)', imageCount: images?.length || 0 });
         
+        // Reset auto-continue counter for user-initiated messages (not auto-continue triggers)
+        const isAutoContinueTrigger = messageText === 'continue' || messageText === 'continue with next chunk';
+        if (!isAutoContinueTrigger) {
+            this._autoContinueCount = 0;
+            debug('Reset auto-continue counter for user-initiated message');
+        }
+        
         if (this._isRequestInProgress) {
             debug('Request already in progress, ignoring');
             return;
@@ -1842,6 +2070,9 @@ ${cliSummary}
         };
 
         const pair: ChatPair = { request, response: pendingResponse };
+        
+        // Telemetry collector - declared outside try so it's accessible in finally
+        let telemetry: TelemetryCollector | null = null;
 
         try {
             info('Saving message to Couchbase...');
@@ -1850,6 +2081,10 @@ ${cliSummary}
             
             const session = await getSessionWithExtensions(this._currentSessionId);
             const pairIndex = session ? session.pairs.length - 1 : 0;
+            
+            // Create telemetry collector for this request
+            const projectId = getProjectId();
+            telemetry = createTelemetryCollector(this._currentSessionId, projectId, pairIndex);
             
             this._postMessage({
                 type: 'newMessagePair',
@@ -2230,6 +2465,65 @@ ${cliSummary}
                 }
             }
 
+            // Auto-inject recently-seen file contents for non-continue messages
+            // This prevents AI from "forgetting" files it saw in previous turns
+            if (!isContinueMessage && !requestContentHandled && this._currentSessionId && session?.fileRegistry) {
+                try {
+                    const currentTurn = session.pairs.length;
+                    // Include files seen in the last 3 turns (or all if early in conversation)
+                    const recentThreshold = currentTurn <= 3 ? 0 : currentTurn - 3;
+                    const recentFiles: string[] = [];
+                    
+                    for (const [path, entry] of Object.entries(session.fileRegistry)) {
+                        if (entry.lastSeenTurn >= recentThreshold) {
+                            recentFiles.push(path);
+                        }
+                    }
+                    
+                    if (recentFiles.length > 0) {
+                        debug(`Auto-injecting ${recentFiles.length} recently-seen files from fileRegistry (threshold: turn ${recentThreshold})`);
+                        
+                        const fileContents: string[] = [];
+                        const attachedNames: string[] = [];
+                        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                        
+                        for (const filePath of recentFiles.slice(0, 5)) { // Limit to 5 files
+                            try {
+                                const content = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
+                                const textContent = Buffer.from(content).toString('utf8');
+                                const relativePath = workspaceRoot && filePath.startsWith(workspaceRoot) 
+                                    ? filePath.slice(workspaceRoot.length + 1)
+                                    : filePath;
+                                const md5Hash = computeFileHash(textContent);
+                                const numberedContent = addLineNumbers(textContent);
+                                fileContents.push(`📄 ${relativePath} [MD5: ${md5Hash}]\n\`\`\`\n${numberedContent}\n\`\`\``);
+                                attachedNames.push(relativePath);
+                                
+                                // Track file re-read in pairFileHistory
+                                await appendPairFileOperation(this._currentSessionId!, pairIndex, {
+                                    file: filePath,
+                                    md5: md5Hash,
+                                    op: 'read',
+                                    size: textContent.length,
+                                    by: 'auto'
+                                });
+                            } catch (readErr) {
+                                debug(`Failed to read registry file ${filePath}:`, readErr);
+                            }
+                        }
+                        
+                        if (fileContents.length > 0) {
+                            finalMessageText = `${finalMessageText}\n\n## 📚 PREVIOUSLY LOADED FILES (from earlier in conversation)\nThese files were attached in previous turns. Use them for context:\n\n${fileContents.join('\n\n')}`;
+                            const fileList = attachedNames.map(f => `   └─ ${f}`).join('\n');
+                            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📚 Re-injecting ${fileContents.length} context file(s) from previous turns\n${fileList}\n\n` });
+                            info(`Auto-injected ${fileContents.length} files from fileRegistry for context continuity`);
+                        }
+                    }
+                } catch (injectErr) {
+                    debug('Failed to auto-inject fileRegistry files:', injectErr);
+                }
+            }
+
             // Agent workflow: analyze if files are needed and load them
             // Use Files API if enabled (uploads files to xAI for document_search)
             // Skip if request_content was already handled (file content already loaded)
@@ -2302,7 +2596,8 @@ ${cliSummary}
                             fastModel,
                             (progress) => {
                                 this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `📂 ${progress}\n` });
-                            }
+                            },
+                            telemetry
                         );
                         
                         // Record planning step metrics
@@ -2543,6 +2838,12 @@ ${cliSummary}
             // Track main response step timing
             const mainStepStart = startStepTimer();
             
+            // Start AI request telemetry
+            const aiWallClock = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const aiTimerId = telemetry?.startTimer('ai-request', `AI: ${model}`);
+            telemetry?.getTimer(aiTimerId!)?.addDetails({ model });
+            this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `🤖 [${aiWallClock}] Calling ${model}...\n` });
+            
             // Check if structured outputs are enabled (API guarantees valid JSON)
             const useStructuredOutputs = config.get<boolean>('useStructuredOutputs', false);
             
@@ -2571,6 +2872,17 @@ ${cliSummary}
             );
             
             const mainStepTime = endStepTimer(mainStepStart);
+            
+            // End AI request telemetry
+            if (aiTimerId) {
+                telemetry?.getTimer(aiTimerId)?.addDetails({
+                    tokensIn: grokResponse.usage?.promptTokens,
+                    tokensOut: grokResponse.usage?.completionTokens
+                });
+                telemetry?.endTimer(aiTimerId, true);
+            }
+            const aiDoneWc = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            info(`[${aiDoneWc}] AI response received in ${mainStepTime}ms (${grokResponse.usage?.completionTokens || 0} output tokens)`);
             
             // Record main step metrics
             recordStep(
@@ -2634,6 +2946,10 @@ ${cliSummary}
             let structured: GrokStructuredResponse = { summary: '', message: grokResponse.text };
             let usedCleanup = false;
             let parsingSucceeded = false;
+            
+            // Start JSON parsing telemetry
+            const parseWc = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const parseTimerId = telemetry?.startTimer('json-parse', 'JSON Parsing');
             
             const processCleanupResult = async (forceAI: boolean): Promise<GrokStructuredResponse | null> => {
                 debug(`Starting parseWithCleanup, fastModel: ${fastModel}, forceAI: ${forceAI}`);
@@ -2769,6 +3085,17 @@ ${cliSummary}
                 }
             }
             
+            // End JSON parsing telemetry
+            if (parseTimerId) {
+                telemetry?.getTimer(parseTimerId)?.addDetails({
+                    itemCount: (structured.fileChanges?.length || 0) + (structured.todos?.length || 0)
+                });
+                if (usedCleanup) {
+                    telemetry?.getTimer(parseTimerId)?.addFlags({ retry: true }); // Required AI cleanup
+                }
+                telemetry?.endTimer(parseTimerId, parsingSucceeded);
+            }
+            
             debug('Parsed structured response:', { 
                 hasTodos: !!structured.todos?.length,
                 hasFileChanges: !!structured.fileChanges?.length,
@@ -2806,6 +3133,9 @@ ${cliSummary}
             const validCommands = structured.commands?.filter(
                 (cmd: { command?: string }) => cmd.command && cmd.command.trim().length > 0
             );
+
+            // Create or update workflow based on TODOs
+            await this._updateWorkflowFromTodos(messageText, structured.todos || []);
 
             const successResponse: ChatResponse = {
                 text: grokResponse.text,
@@ -2871,7 +3201,20 @@ ${cliSummary}
             }
             
             if (structured.fileChanges && structured.fileChanges.length > 0) {
-                const editPromises = structured.fileChanges.map(async (fc, idx) => {
+                // CONSOLIDATE: Merge multiple changes for the same file into single operations
+                // This prevents hash mismatch errors when AI sends multiple changes for one file
+                let changesToApply = structured.fileChanges;
+                if (needsConsolidation(structured.fileChanges)) {
+                    const consolidation = consolidateFileChanges(structured.fileChanges);
+                    changesToApply = consolidation.consolidatedChanges;
+                    
+                    const mergeNote = `📦 Consolidated ${consolidation.stats.originalCount} changes into ${consolidation.stats.consolidatedCount} ` +
+                        `(merged ${consolidation.mergedFiles.join(', ')})`;
+                    debug(mergeNote);
+                    this._postMessage({ type: 'updateResponseChunk', pairIndex, deltaText: `\n\n${mergeNote}\n` });
+                }
+                
+                const editPromises = changesToApply.map(async (fc, idx) => {
                     // Use async search-enabled resolver to find files even if AI provides incorrect path
                     const fileUri = await resolveFilePathToUriWithSearch(fc.path);
                     if (!fileUri) {
@@ -2889,6 +3232,68 @@ ${cliSummary}
                         debug(`File is outside workspace: ${fc.path}`);
                     }
                     
+                    // FILE CORRUPTION CHECK: Detect if file is already in a corrupted state
+                    // This prevents applying changes to files with unresolved conflicts,
+                    // truncated content, or other integrity issues
+                    const providedHash = structured.fileHashes?.[fc.path];
+                    const shouldCheckCorruption = await needsCorruptionCheck(fileUri, providedHash);
+                    if (shouldCheckCorruption) {
+                        const corruptionResult = await checkFileCorruption(fileUri, {
+                            expectedHash: providedHash,
+                            checkSyntax: true
+                        });
+                        
+                        if (corruptionResult.isCorrupted) {
+                            // File is corrupted - block changes to prevent further damage
+                            const report = formatCorruptionReport(corruptionResult, fc.path);
+                            blockedChanges.push(`${fc.path}: File corruption detected - ${corruptionResult.summary}`);
+                            logError(`BLOCKED: File corruption detected for ${fc.path}:`, corruptionResult.indicators);
+                            
+                            // Show detailed warning to user
+                            vscode.window.showErrorMessage(
+                                `🛑 File "${fc.path}" appears corrupted. Changes blocked to prevent further damage. ` +
+                                `Issues: ${corruptionResult.indicators.map(i => i.message).join('; ')}`,
+                                'View Details'
+                            ).then(action => {
+                                if (action === 'View Details') {
+                                    // Show in output channel
+                                    const outputChannel = vscode.window.createOutputChannel('Grok File Integrity');
+                                    outputChannel.appendLine(report);
+                                    outputChannel.show();
+                                }
+                            });
+                            
+                            // Log to Couchbase for analytics
+                            if (this._currentSessionId) {
+                                appendOperationFailure(this._currentSessionId, {
+                                    pairIndex,
+                                    filePath: fc.path,
+                                    operationType: 'corruptionDetected',
+                                    error: corruptionResult.summary,
+                                    fileSnapshot: {
+                                        hash: corruptionResult.currentHash,
+                                        lineCount: corruptionResult.lineCount,
+                                        sizeBytes: corruptionResult.sizeBytes,
+                                        capturedAt: new Date().toISOString()
+                                    }
+                                }).catch(err => debug('Failed to log corruption detection:', err));
+                            }
+                            return null;
+                        } else if (corruptionResult.isSuspicious) {
+                            // File has warnings but we can proceed - log and notify
+                            const report = formatCorruptionReport(corruptionResult, fc.path);
+                            suspiciousChanges.push(`${fc.path}: ${corruptionResult.summary}`);
+                            debug(`Suspicious file state for ${fc.path}:`, corruptionResult.indicators);
+                            
+                            // Show warning but proceed
+                            this._postMessage({ 
+                                type: 'updateResponseChunk', 
+                                pairIndex, 
+                                deltaText: `\n⚡ **Warning:** ${fc.path} has potential issues: ${corruptionResult.indicators.map(i => i.message).join(', ')}\n` 
+                            });
+                        }
+                    }
+                    
                     let newText = fc.content;
                     
                     // PREFERRED: Use lineOperations if provided (safest method)
@@ -2899,8 +3304,9 @@ ${cliSummary}
                             const originalHash = computeFileHash(originalContent);
                             
                             // HASH VERIFICATION: Check if AI provided correct hash (proves it read the file)
-                            const providedHash = structured.fileHashes?.[fc.path];
-                            if (!providedHash) {
+                            // Note: providedHash is already computed in corruption check above, reuse it
+                            const lineOpProvidedHash = providedHash ?? structured.fileHashes?.[fc.path];
+                            if (!lineOpProvidedHash) {
                                 // AI didn't provide hash - it may not have read the file
                                 blockedChanges.push(`${fc.path}: No file hash provided - AI may not have read the file`);
                                 logError(`BLOCKED: No fileHash for ${fc.path}. AI may be hallucinating content.`);
@@ -2911,10 +3317,10 @@ ${cliSummary}
                                 return null;
                             }
                             
-                            if (providedHash !== originalHash) {
+                            if (lineOpProvidedHash !== originalHash) {
                                 // Hash mismatch - AI has stale or wrong content
                                 blockedChanges.push(`${fc.path}: Hash mismatch - AI has outdated or wrong file content`);
-                                logError(`BLOCKED: Hash mismatch for ${fc.path}. Provided: ${providedHash}, Actual: ${originalHash}`);
+                                logError(`BLOCKED: Hash mismatch for ${fc.path}. Provided: ${lineOpProvidedHash}, Actual: ${originalHash}`);
                                 vscode.window.showWarningMessage(
                                     `⚠️ Hash mismatch for ${fc.path}. AI's file content is outdated or incorrect. Please re-attach the file.`,
                                     'OK'
@@ -2926,7 +3332,7 @@ ${cliSummary}
                                         pairIndex,
                                         filePath: fc.path,
                                         operationType: 'hashMismatch',
-                                        error: `Hash mismatch: provided=${providedHash}, actual=${originalHash}`,
+                                        error: `Hash mismatch: provided=${lineOpProvidedHash}, actual=${originalHash}`,
                                         fileSnapshot: {
                                             hash: originalHash,
                                             lineCount: originalContent.split('\n').length,
@@ -3250,6 +3656,9 @@ ${cliSummary}
             // Handle directory listing requests from AI
             await this._handleDirectoryRequests(structured.directoryRequests, pairIndex);
 
+            // Handle file search requests from AI (auto-find files before asking user)
+            await this._handleFileSearchRequests(structured.fileSearchRequests, pairIndex);
+
             // Handle sub-task proposals from AI
             await this._handleSubTasks(structured.subTasks, pairIndex);
 
@@ -3310,6 +3719,21 @@ ${cliSummary}
             });
 
         } finally {
+            // Save telemetry data to Couchbase (fire-and-forget)
+            if (telemetry) {
+                telemetry.save().then(() => {
+                    const summary = telemetry?.getSummary();
+                    if (summary && summary.slowCount > 0) {
+                        info(`[Telemetry] Request complete: ${summary.operationCount} ops, ${summary.totalMs}ms, ${summary.slowCount} slow ops`);
+                        if (summary.bottleneck) {
+                            info(`[Telemetry] Bottleneck: ${summary.bottleneck}`);
+                        }
+                    }
+                }).catch(err => {
+                    debug('[Telemetry] Failed to save:', err);
+                });
+            }
+            
             this._isRequestInProgress = false;
             this._abortController = undefined;
             vscode.commands.executeCommand('setContext', 'grok.requestInProgress', false);
@@ -3417,6 +3841,33 @@ ${cliSummary}
                         : true;
                     if (isOutsideWorkspace) {
                         debug(`File is outside workspace: ${filePath}`);
+                    }
+                    
+                    // FILE CORRUPTION CHECK: Detect if file is in a corrupted state before applying
+                    // Note: fileHashes may not be available in stored structured response, so we check without hash
+                    const needsCheck = await needsCorruptionCheck(fileUri);
+                    if (needsCheck) {
+                        const corruptionResult = await checkFileCorruption(fileUri, {
+                            checkSyntax: true
+                        });
+                        
+                        if (corruptionResult.isCorrupted) {
+                            logError(`BLOCKED manual apply: File corruption detected for ${filePath}:`, corruptionResult.indicators);
+                            vscode.window.showErrorMessage(
+                                `🛑 Cannot apply changes to "${filePath}" - file appears corrupted. ` +
+                                `Issues: ${corruptionResult.indicators.map(i => i.message).join('; ')}`
+                            );
+                            return null;
+                        } else if (corruptionResult.isSuspicious) {
+                            // Warn but allow manual apply with confirmation
+                            const proceed = await vscode.window.showWarningMessage(
+                                `⚠️ File "${filePath}" has potential issues: ${corruptionResult.indicators.map(i => i.message).join(', ')}. Proceed anyway?`,
+                                'Proceed', 'Cancel'
+                            );
+                            if (proceed !== 'Proceed') {
+                                return null;
+                            }
+                        }
                     }
                     
                     let newText = fc.content;
@@ -4249,6 +4700,142 @@ ${cliSummary}
     }
 
     /**
+     * Handle file search requests from AI - searches for files before asking user to attach.
+     * This allows the AI to programmatically find files like config.json, app.js, etc.
+     */
+    private async _handleFileSearchRequests(
+        fileSearchRequests: FileSearchRequest[] | undefined,
+        pairIndex: number
+    ): Promise<void> {
+        if (!fileSearchRequests || fileSearchRequests.length === 0 || !this._currentSessionId) {
+            return;
+        }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            debug('No workspace folder - cannot process file search requests');
+            return;
+        }
+
+        const foundFiles: { path: string; relativePath: string; reason: string }[] = [];
+        const notFoundPatterns: { pattern: string; reason: string }[] = [];
+
+        for (const request of fileSearchRequests) {
+            try {
+                // Convert simple filename to glob pattern if needed
+                let pattern = request.pattern;
+                if (!pattern.includes('*') && !pattern.includes('/')) {
+                    // Simple filename like "config.json" -> search anywhere
+                    pattern = `**/${pattern}`;
+                }
+
+                debug(`File search: pattern="${pattern}", reason="${request.reason}"`);
+
+                // Use VS Code's findFiles API with exclusions
+                const exclusions = '{**/node_modules/**,**/dist/**,**/build/**,**/out/**,**/.git/**}';
+                const maxResults = request.maxResults || 5;
+                const uris = await vscode.workspace.findFiles(pattern, exclusions, maxResults);
+
+                if (uris.length > 0) {
+                    for (const uri of uris) {
+                        const relativePath = vscode.workspace.asRelativePath(uri);
+                        foundFiles.push({
+                            path: uri.fsPath,
+                            relativePath,
+                            reason: request.reason
+                        });
+                        info(`File search found: ${relativePath} (for: ${request.reason})`);
+                    }
+
+                    // Auto-attach files if requested
+                    if (request.autoAttach !== false) {
+                        for (const uri of uris) {
+                            try {
+                                const doc = await vscode.workspace.openTextDocument(uri);
+                                const content = doc.getText();
+                                const relativePath = vscode.workspace.asRelativePath(uri);
+                                const md5Hash = require('crypto').createHash('md5').update(content, 'utf8').digest('hex');
+                                
+                                // Store as pending file attachment for next context build
+                                await this._storeAutoAttachedFile(
+                                    this._currentSessionId!,
+                                    pairIndex,
+                                    relativePath,
+                                    content,
+                                    md5Hash,
+                                    request.reason
+                                );
+                            } catch (readErr) {
+                                debug(`Failed to read found file ${uri.fsPath}:`, readErr);
+                            }
+                        }
+                    }
+                } else {
+                    notFoundPatterns.push({
+                        pattern: request.pattern,
+                        reason: request.reason
+                    });
+                    debug(`File search: no files found for pattern "${pattern}"`);
+                }
+            } catch (err: any) {
+                debug(`File search error for pattern "${request.pattern}":`, err);
+                notFoundPatterns.push({
+                    pattern: request.pattern,
+                    reason: `Search failed: ${err.message}`
+                });
+            }
+        }
+
+        // Update UI with results
+        if (foundFiles.length > 0 || notFoundPatterns.length > 0) {
+            let message = '';
+            
+            if (foundFiles.length > 0) {
+                const fileList = foundFiles.map(f => f.relativePath).join(', ');
+                message += `\n\n🔍 *Found ${foundFiles.length} file(s): ${fileList}*\n`;
+            }
+            
+            if (notFoundPatterns.length > 0) {
+                const patternList = notFoundPatterns.map(p => `\`${p.pattern}\` (${p.reason})`).join(', ');
+                message += `\n⚠️ *Could not find: ${patternList} - please attach manually*\n`;
+            }
+
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: message
+            });
+        }
+    }
+
+    /**
+     * Store an auto-attached file for the next context build.
+     */
+    private async _storeAutoAttachedFile(
+        sessionId: string,
+        pairIndex: number,
+        relativePath: string,
+        content: string,
+        md5Hash: string,
+        reason: string
+    ): Promise<void> {
+        try {
+            // Store in pending file attachments (will be included in next AI context)
+            const { storePendingFileSearchResults } = await import('../storage/chatSessionRepository');
+            await storePendingFileSearchResults(sessionId, pairIndex, [{
+                relativePath,
+                content,
+                md5Hash,
+                reason,
+                foundAt: new Date().toISOString()
+            }]);
+            info(`Auto-attached file: ${relativePath} (${reason})`);
+        } catch (err) {
+            debug('Failed to store auto-attached file:', err);
+        }
+    }
+
+    /**
      * Process sub-task proposals from AI response.
      * Stores sub-tasks in registry and sends UI update for task cards.
      */
@@ -4349,6 +4936,19 @@ ${cliSummary}
             return;
         }
 
+        // Check if we've exceeded max auto-continue attempts (prevent infinite loops)
+        if (this._autoContinueCount >= ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS) {
+            info(`Auto-continue: Max attempts (${ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS}) reached, stopping to prevent infinite loop`);
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: `\n⚠️ Auto-continue stopped after ${ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS} attempts. Please review the remaining tasks and continue manually if needed.\n`
+            });
+            // Reset counter for next user-initiated request
+            this._autoContinueCount = 0;
+            return;
+        }
+
         // Check for pending chunks (large file processing) - PRIORITY
         if (this._pendingChunks && Object.keys(this._pendingChunks).length > 0) {
             const pendingCount = Object.values(this._pendingChunks).reduce((sum, chunks) => sum + chunks.length, 0);
@@ -4360,6 +4960,10 @@ ${cliSummary}
                 pairIndex,
                 deltaText: `\n🔄 Auto-continuing with remaining ${pendingCount} chunk(s)...\n\n`
             });
+            
+            // Increment counter before auto-continuing
+            this._autoContinueCount++;
+            info(`Auto-continue attempt ${this._autoContinueCount}/${ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS}`);
             
             // Wait a bit for changes to be applied, then auto-continue with chunk
             setTimeout(async () => {
@@ -4398,17 +5002,39 @@ ${cliSummary}
             return;
         }
 
+        // Check if pending TODOs are only CLI/install-related (these shouldn't trigger auto-continue loops)
+        const pendingTodos = todos.filter((t: any) => !t.completed);
+        const cliRelatedKeywords = ['install', 'pip', 'npm', 'yarn', 'dependencies', 'run ', 'execute', 'command'];
+        const allPendingAreCli = pendingTodos.every((t: any) => {
+            const text = (t.text || '').toLowerCase();
+            return cliRelatedKeywords.some(kw => text.includes(kw));
+        });
+        
+        if (allPendingAreCli) {
+            info(`Auto-continue: Skipping - all ${pendingCount} pending TODO(s) are CLI-related, user should handle manually`);
+            this._postMessage({
+                type: 'updateResponseChunk',
+                pairIndex,
+                deltaText: `\n⏸️ Remaining task(s) require manual action (CLI commands). Please run them yourself or type "continue" when ready.\n`
+            });
+            return;
+        }
+
         // If there are file changes but also pending TODOs, this is a batched response
         const hasFileChanges = structured.fileChanges && structured.fileChanges.length > 0;
         
         if (hasFileChanges && pendingCount > 0) {
             info(`Auto-continue: ${completedCount}/${todos.length} TODOs complete, ${pendingCount} pending`);
             
+            // Increment counter before auto-continuing
+            this._autoContinueCount++;
+            info(`Auto-continue attempt ${this._autoContinueCount}/${ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS}`);
+            
             // Notify user
             this._postMessage({
                 type: 'updateResponseChunk',
                 pairIndex,
-                deltaText: `\n🔄 Auto-continuing with remaining ${pendingCount} TODO(s)...\n\n`
+                deltaText: `\n🔄 Auto-continuing with remaining ${pendingCount} TODO(s)... (attempt ${this._autoContinueCount}/${ChatViewProvider.MAX_AUTO_CONTINUE_ATTEMPTS})\n\n`
             });
             
             // Wait a bit for changes to be applied, then auto-continue
@@ -4578,26 +5204,40 @@ ${parentSession.handoffText}`;
                                     }
                                 }
                                 
-                                // Load and include file contents (limit to avoid token explosion)
+                                // Load and include file contents using PARALLEL reading with smart chunking
                                 const filesToLoad = Array.from(fileSet).slice(0, 5);
                                 if (filesToLoad.length > 0) {
                                     let fileContents = '\n\n## Current File Contents (from parent session)\n';
-                                    for (const filePath of filesToLoad) {
+                                    
+                                    // Read all files in parallel first
+                                    const fileReadPromises = filesToLoad.map(async (filePath) => {
                                         try {
                                             const uri = vscode.Uri.file(filePath);
                                             const doc = await vscode.workspace.openTextDocument(uri);
-                                            const content = doc.getText();
-                                            // Truncate very large files
-                                            const truncated = content.length > 8000 
-                                                ? content.slice(0, 8000) + '\n\n... (truncated, file too large)'
-                                                : content;
-                                            const fileName = filePath.split('/').pop() || filePath;
-                                            fileContents += `\n### ${fileName}\n\`\`\`\n${truncated}\n\`\`\`\n`;
-                                            info(`Loaded handoff file: ${fileName}`);
+                                            return {
+                                                path: filePath,
+                                                content: doc.getText(),
+                                                language: doc.languageId,
+                                                success: true
+                                            };
                                         } catch (err) {
                                             debug(`Could not load handoff file: ${filePath}`);
+                                            return { path: filePath, content: '', language: 'text', success: false };
                                         }
-                                    }
+                                    });
+                                    
+                                    const loadedFiles = await Promise.all(fileReadPromises);
+                                    const successfulFiles = loadedFiles.filter(f => f.success);
+                                    
+                                    // Now process with smart reading (also in parallel)
+                                    const parallelResult = await smartReadFilesParallel(
+                                        successfulFiles.map(f => ({ path: f.path, content: f.content, language: f.language })),
+                                        { maxOutputSize: 15000 }
+                                    );
+                                    
+                                    fileContents += parallelResult.formattedContent;
+                                    info(`Parallel-loaded ${successfulFiles.length} handoff files in ${parallelResult.readTimeMs}ms (~${parallelResult.totalTokens} tokens)`);
+                                    
                                     systemPrompt += fileContents;
                                 }
                             }
@@ -4633,6 +5273,18 @@ ${parentSession.handoffText}`;
                         );
                     }
                     
+                    // Add pending file search results (AI-requested files from previous turn)
+                    if (session.pendingFileSearchResults && session.pendingFileSearchResults.files.length > 0) {
+                        const searchSummary = buildFileSearchResultsSummary(session.pendingFileSearchResults);
+                        if (searchSummary) {
+                            systemPrompt += searchSummary;
+                        }
+                        // Clear after injection
+                        clearPendingFileSearchResults(session.id).catch(err => 
+                            debug('Failed to clear pending file search results:', err)
+                        );
+                    }
+                    
                     // Add pending bundled files (imports/tests from previous turn's modifications)
                     if (session.pendingBundledFiles && session.pendingBundledFiles.files.length > 0) {
                         const bundleSummary = buildBundledFilesSummary(session.pendingBundledFiles);
@@ -4640,23 +5292,39 @@ ${parentSession.handoffText}`;
                             systemPrompt += bundleSummary;
                         }
                         
-                        // Attach bundled file contents
+                        // Attach bundled file contents using PARALLEL reading with smart chunking
                         let bundledContent = '\n\n## 📦 BUNDLED FILE CONTENTS\n';
-                        for (const bundledFile of session.pendingBundledFiles.files) {
+                        
+                        // Read all bundled files in parallel
+                        const bundleReadPromises = session.pendingBundledFiles.files.map(async (bundledFile) => {
                             try {
                                 const fileUri = vscode.Uri.file(bundledFile.path);
                                 const doc = await vscode.workspace.openTextDocument(fileUri);
-                                const content = doc.getText();
-                                const truncated = content.length > 6000 
-                                    ? content.slice(0, 6000) + '\n\n... (truncated, file too large)'
-                                    : content;
-                                const hash = computeFileHash(content);
-                                bundledContent += `\n### 📄 ${bundledFile.relativePath} (MD5: ${hash})\n\`\`\`\n${addLineNumbers(truncated)}\n\`\`\`\n`;
-                                debug(`Attached bundled file: ${bundledFile.relativePath}`);
+                                return {
+                                    path: bundledFile.path,
+                                    relativePath: bundledFile.relativePath,
+                                    content: doc.getText(),
+                                    language: doc.languageId,
+                                    success: true
+                                };
                             } catch (err) {
                                 debug(`Could not load bundled file: ${bundledFile.path}`);
+                                return { path: bundledFile.path, relativePath: bundledFile.relativePath, content: '', language: 'text', success: false };
                             }
-                        }
+                        });
+                        
+                        const loadedBundles = await Promise.all(bundleReadPromises);
+                        const successfulBundles = loadedBundles.filter(f => f.success);
+                        
+                        // Process with smart reading in parallel
+                        const bundleResult = await smartReadFilesParallel(
+                            successfulBundles.map(f => ({ path: f.path, content: f.content, language: f.language })),
+                            { maxOutputSize: 12000 }
+                        );
+                        
+                        bundledContent += bundleResult.formattedContent;
+                        debug(`Parallel-loaded ${successfulBundles.length} bundled files in ${bundleResult.readTimeMs}ms (~${bundleResult.totalTokens} tokens)`);
+                        
                         systemPrompt += bundledContent;
                         
                         // Clear after injection
@@ -4803,6 +5471,30 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 .stat-add{color:#4ec9b0}
 .stat-rem{color:#f14c4c}
 .stat-mod{color:#dcdcaa}
+
+/* Workflow Timeline - Step-based agent workflow display */
+#workflow-bar{display:none;padding:8px 10px;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border);font-size:11px}
+#workflow-bar.active{display:block}
+.workflow-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.workflow-title{font-weight:600;color:var(--vscode-textLink-foreground)}
+.workflow-progress{color:var(--vscode-descriptionForeground)}
+.workflow-cancel{background:none;border:none;color:var(--vscode-descriptionForeground);cursor:pointer;font-size:10px;padding:2px 6px}
+.workflow-cancel:hover{color:var(--vscode-foreground)}
+.step-timeline{display:flex;align-items:center;gap:4px;overflow-x:auto;padding:4px 0}
+.step-node{display:flex;flex-direction:column;align-items:center;min-width:60px;cursor:pointer;padding:4px;border-radius:4px;transition:background .2s}
+.step-node:hover{background:var(--vscode-list-hoverBackground)}
+.step-icon{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600}
+.step-icon.pending{background:#444;color:#888;border:2px dashed #666}
+.step-icon.in-progress{background:#0099ff;color:#fff;border:2px solid #0077cc;animation:step-pulse 1.5s infinite}
+.step-icon.applied{background:#2d7d46;color:#fff;border:2px solid #1d5d36}
+.step-icon.reverted{background:#666;color:#999;border:2px solid #555;text-decoration:line-through}
+.step-icon.failed{background:#c44;color:#fff;border:2px solid #a33}
+@keyframes step-pulse{0%,100%{box-shadow:0 0 0 0 rgba(0,153,255,0.4)}50%{box-shadow:0 0 0 6px rgba(0,153,255,0)}}
+.step-label{font-size:9px;color:var(--vscode-descriptionForeground);max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;margin-top:2px}
+.step-connector{width:16px;height:2px;background:#555}
+.step-connector.done{background:#2d7d46}
+.step-revert-btn{display:none;position:absolute;top:-4px;right:-4px;width:14px;height:14px;border-radius:50%;background:#c44;color:#fff;font-size:8px;border:none;cursor:pointer;line-height:14px;text-align:center}
+.step-node:hover .step-revert-btn{display:block}
 
 /* Expanded Changes Panel (dropdown from stats bar) */
 #changes-panel{display:none;position:absolute;bottom:80px;left:0;right:0;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);max-height:250px;overflow:hidden;flex-direction:column;z-index:99;box-shadow:0 -4px 12px rgba(0,0,0,.3)}
@@ -5681,6 +6373,15 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 
 <div id="inp" style="position:relative">
 <div id="autocomplete"></div>
+<!-- Workflow Timeline - shows multi-step agent workflow progress -->
+<div id="workflow-bar">
+    <div class="workflow-header">
+        <span class="workflow-title">📋 Workflow</span>
+        <span class="workflow-progress" id="workflow-progress">0/0</span>
+        <button class="workflow-cancel" id="workflow-cancel" title="Cancel workflow">✕</button>
+    </div>
+    <div class="step-timeline" id="step-timeline"></div>
+</div>
 <!-- TODO Panel - above stats bar (hidden by default until items added) -->
 <div id="todo-bar" class="hide"><span id="todo-toggle" class="open">▼</span><span id="todo-title">TODOs</span><span id="todo-count">(0/0)</span></div>
 <div id="todo-list" class="hide"></div>
@@ -5697,6 +6398,7 @@ code{font-family:var(--vscode-editor-font-family);background:var(--vscode-textCo
 const vs=acquireVsCodeApi(),chat=document.getElementById('chat'),msg=document.getElementById('msg'),send=document.getElementById('send'),stop=document.getElementById('stop'),sessEl=document.getElementById('sess'),sessTxt=document.getElementById('sess-text'),hist=document.getElementById('hist'),attachBtn=document.getElementById('attach'),fileInput=document.getElementById('file-input'),imgPreview=document.getElementById('img-preview'),statsEl=document.getElementById('stats');
 const changesPanel=document.getElementById('changes-panel'),changesList=document.getElementById('changes-list'),changesClose=document.getElementById('changes-close');
 const todoBar=document.getElementById('todo-bar'),todoToggle=document.getElementById('todo-toggle'),todoCount=document.getElementById('todo-count'),todoList=document.getElementById('todo-list');
+const workflowBar=document.getElementById('workflow-bar'),workflowProgress=document.getElementById('workflow-progress'),workflowCancel=document.getElementById('workflow-cancel'),stepTimeline=document.getElementById('step-timeline');
 const stickySummary=document.getElementById('sticky-summary'),stickySummaryText=document.getElementById('sticky-summary-text'),stickyNextSteps=document.getElementById('sticky-next-steps');
 let lastResponseSummary='',lastResponseNextSteps=[],stickySummaryDismissed=false;
 const autoBtn=document.getElementById('auto-btn');
@@ -6311,6 +7013,61 @@ function parseTodos(text){
     return [];
 }
 
+// Workflow Timeline rendering
+let currentWorkflow=null;
+function renderWorkflow(m){
+    currentWorkflow=m.workflow;
+    if(!m.hasActiveWorkflow||!m.workflow){
+        workflowBar.classList.remove('active');
+        return;
+    }
+    workflowBar.classList.add('active');
+    const w=m.workflow;
+    const completed=w.steps.filter(s=>s.status==='applied').length;
+    workflowProgress.textContent=completed+'/'+w.steps.length;
+    
+    let html='';
+    w.steps.forEach((step,i)=>{
+        if(i>0)html+='<div class="step-connector'+(w.steps[i-1].status==='applied'?' done':'')+'"></div>';
+        const icon=step.status==='applied'?'✓':step.status==='in-progress'?'●':step.status==='failed'?'✗':step.status==='reverted'?'↺':(i+1);
+        const label=step.description.length>15?step.description.slice(0,15)+'...':step.description;
+        html+='<div class="step-node" data-step-id="'+step.id+'" data-step-num="'+(i+1)+'" title="'+esc(step.description)+'\\nStatus: '+step.status+'">';
+        html+='<div class="step-icon '+step.status+'">'+icon+'</div>';
+        html+='<div class="step-label">'+esc(label)+'</div>';
+        if(step.status==='applied'||step.status==='in-progress'){
+            html+='<button class="step-revert-btn" title="Revert to before this step">↺</button>';
+        }
+        html+='</div>';
+    });
+    stepTimeline.innerHTML=html;
+    
+    // Add click handlers for step nodes
+    stepTimeline.querySelectorAll('.step-node').forEach(node=>{
+        node.onclick=function(e){
+            if(e.target.classList.contains('step-revert-btn')){
+                const stepId=this.dataset.stepId;
+                vs.postMessage({type:'previewStepRevert',stepId:stepId});
+            }
+        };
+    });
+}
+
+function showStepRevertPreview(m){
+    if(m.stepsToRevert.length===0){return;}
+    const stepNames=m.stepsToRevert.map(s=>'Step '+s.stepNumber+': '+s.description).join('\\n');
+    const fileNames=m.filesAffected.map(f=>f.split('/').pop()).join(', ');
+    const msg='⚠️ Reverting this step will also revert:\\n\\n'+stepNames+'\\n\\nFiles affected: '+(fileNames||'none')+'\\n\\nContinue?';
+    if(confirm(msg)){
+        vs.postMessage({type:'revertStep',stepId:m.stepId});
+    }
+}
+
+workflowCancel.onclick=function(){
+    if(confirm('Cancel the current workflow?')){
+        vs.postMessage({type:'cancelWorkflow'});
+    }
+};
+
 function renderChanges(){
     // Calculate totals from all changes
     let totalFiles=0,totalAdd=0,totalRem=0,totalMod=0;
@@ -6613,7 +7370,14 @@ d.appendChild(sum);d.appendChild(meta);d.onclick=()=>{vs.postMessage({type:'load
 case'newMessagePair':addPair(m.pair,m.pairIndex,1);busy=1;activityLog=[];updUI();hideStickySummary();scrollToBottom();break;
 case'updateResponseChunk':if(curDiv){stream+=m.deltaText;updStream();scrollToBottom();}break;
 case'requestComplete':
+// Render response into curDiv if available
 if(curDiv){curDiv.classList.remove('p');const pi=m.pairIndex||parseInt(curDiv.dataset.i)||0;const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';let content='<div class="msg-actions">'+bugBtn+'</div>';const persistedActivity=fmtActivityLog(activityLog,true);content+=persistedActivity;if(m.imageGalleryHtml){content+=m.imageGalleryHtml;}else{content+=fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup);}curDiv.querySelector('.c').innerHTML=content;if(m.response?.usage)updStats(m.response.usage);}
+else{
+// curDiv missing (webview reloaded?) - try to find the response element by pairIndex
+const pi=m.pairIndex||0;const targetDiv=chat.querySelector('.msg.a[data-i="'+pi+'"]');
+if(targetDiv){const bugIcon='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="14" rx="6" ry="7"/><path d="M12 7V3M8 4c0 1.5 1.8 3 4 3s4-1.5 4-3"/><path d="M4 10h3M17 10h3M4 14h3M17 14h3M4 18h3M17 18h3"/><path d="M8 3l-1-1M16 3l1-1"/></svg>';const bugBtn='<button class="bug-btn" onclick="reportBug('+pi+')" title="Report bug in this response">'+bugIcon+'</button>';targetDiv.classList.remove('p');targetDiv.innerHTML='<div class="c"><div class="msg-actions">'+bugBtn+'</div>'+fmtFinalStructured(m.structured,m.response?.usage,m.diffPreview,m.usedCleanup)+'</div>';if(m.response?.usage)updStats(m.response.usage);}
+console.warn('[Grok] requestComplete: curDiv was null, recovered using pairIndex',pi);
+}
 // Use structured TODOs if available, fallback to legacy parsing
 let todos=[];
 if(m.structured&&m.structured.todos&&m.structured.todos.length>0){todos=parseTodosFromStructured(m.structured);}
@@ -6635,6 +7399,8 @@ case'usageUpdate':updStats(m.usage);break;
 case'commandOutput':showCmdOutput(m.command,m.output,m.isError);updateActionSummary('commands',1);break;
 case'cliSummaryUpdate':updateCliSummary(m);break;
 case'changesUpdate':changeHistory=m.changes;currentChangePos=m.currentPosition;isAtOriginalState=m.isAtOriginal||false;renderChanges();break;
+case'workflowStatus':renderWorkflow(m);break;
+case'stepRevertPreview':showStepRevertPreview(m);break;
 case'editsApplied':if(m.changeSet){vs.postMessage({type:'getChanges'});
 // Mark specific todos as complete based on todoIndex linkage from TS
 if(m.completedTodoIndexes&&m.completedTodoIndexes.length>0){
@@ -6827,7 +7593,23 @@ const newItems=extractActivityItems(stream);
 newItems.forEach(item=>{if(!activityLog.includes(item))activityLog.push(item);});
 // Build HTML: spinner + streaming text + activity log
 let html='<div class="think"><div class="spin"></div><span class="think-toggle" onclick="toggleStream()"><span class="'+arrowClass+'">▶</span> Generating...</span></div>';
-if(!isJson){html+='<div class="'+contentClass+'">'+esc(stream.slice(-500))+'</div>';}
+// ALWAYS show stream content for debugging - format JSON if detected
+const streamLen=stream.length;
+const streamPreview=stream.slice(-2000);
+let formattedStream='';
+if(isJson){
+    // Try to format JSON for readability
+    try{
+        // Find JSON boundaries
+        const jsonStart=streamPreview.lastIndexOf('{');
+        const jsonPart=jsonStart>=0?streamPreview.slice(jsonStart):streamPreview;
+        // Show raw JSON with syntax highlighting hints
+        formattedStream='<div style="font-size:10px;color:#888;margin-bottom:4px">📊 JSON Response ('+streamLen+' chars)</div>'+esc(jsonPart);
+    }catch(e){formattedStream=esc(streamPreview);}
+}else{
+    formattedStream=esc(streamPreview);
+}
+html+='<div class="stream-content show" style="max-height:200px;display:block;background:var(--vscode-textCodeBlock-background);padding:8px;border-radius:4px;margin:8px 0;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;">'+formattedStream+'</div>';
 html+=fmtActivityLog(activityLog,false);
 curDiv.querySelector('.c').innerHTML=html;
 }

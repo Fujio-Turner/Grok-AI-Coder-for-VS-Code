@@ -156,6 +156,10 @@ export interface ExecutionResult {
 export interface ProgressUpdate {
     type: 'plan' | 'file-start' | 'file-done' | 'url-start' | 'url-done' | 'dir-start' | 'dir-done' | 'error';
     message: string;
+    /** Wall clock timestamp when this operation started/completed */
+    timestamp?: string;
+    /** Duration in milliseconds for completed operations */
+    durationMs?: number;
     details?: {
         path?: string;
         url?: string;
@@ -182,4 +186,121 @@ export interface DirectoryListingResult {
     error?: string;
     filter?: string;
     recursive: boolean;
+}
+
+// ============================================================================
+// Telemetry Collector - Collects timing entries during a request
+// ============================================================================
+
+import { 
+    TelemetryEntry, 
+    TelemetryOperationType, 
+    TelemetryTimer,
+    createTelemetryTimer,
+    appendTelemetry,
+    generateTurnSummary,
+    saveTurnSummary
+} from '../storage/chatSessionRepository';
+
+/**
+ * Collects telemetry entries during a request for batch saving.
+ * Pass this to operations to track their timing.
+ */
+export class TelemetryCollector {
+    private entries: TelemetryEntry[] = [];
+    private activeTimers: Map<string, TelemetryTimer> = new Map();
+    private pairIndex: number;
+    private sessionId: string;
+    private projectId: string;
+
+    constructor(sessionId: string, projectId: string, pairIndex: number) {
+        this.sessionId = sessionId;
+        this.projectId = projectId;
+        this.pairIndex = pairIndex;
+    }
+
+    /** Start timing an operation, returns timer ID */
+    startTimer(type: TelemetryOperationType, operation: string): string {
+        const timer = createTelemetryTimer(type, operation, this.pairIndex);
+        const timerId = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        this.activeTimers.set(timerId, timer);
+        return timerId;
+    }
+
+    /** Get an active timer by ID */
+    getTimer(timerId: string): TelemetryTimer | undefined {
+        return this.activeTimers.get(timerId);
+    }
+
+    /** End a timer and record the entry */
+    endTimer(timerId: string, success: boolean, errorMessage?: string): TelemetryEntry | undefined {
+        const timer = this.activeTimers.get(timerId);
+        if (!timer) return undefined;
+        
+        const entry = timer.end(success, errorMessage);
+        this.entries.push(entry);
+        this.activeTimers.delete(timerId);
+        return entry;
+    }
+
+    /** Manually add an entry (for operations that manage their own timing) */
+    addEntry(entry: TelemetryEntry): void {
+        this.entries.push(entry);
+    }
+
+    /** Get all collected entries */
+    getEntries(): TelemetryEntry[] {
+        return [...this.entries];
+    }
+
+    /** Get slow operations (for debugging/logging) */
+    getSlowOperations(): TelemetryEntry[] {
+        return this.entries.filter(e => e.flags?.slow);
+    }
+
+    /** Save all collected entries to Couchbase */
+    async save(): Promise<void> {
+        if (this.entries.length === 0) return;
+        
+        await appendTelemetry(this.sessionId, this.projectId, this.entries);
+        
+        // Generate and save turn summary
+        const summary = generateTurnSummary(this.entries, this.pairIndex);
+        await saveTurnSummary(this.sessionId, this.projectId, summary);
+    }
+
+    /** Get a summary of collected telemetry */
+    getSummary(): { operationCount: number; totalMs: number; slowCount: number; bottleneck?: string } {
+        let totalMs = 0;
+        let slowCount = 0;
+        let bottleneck: { operation: string; durationMs: number } | undefined;
+
+        for (const entry of this.entries) {
+            totalMs += entry.durationMs;
+            if (entry.flags?.slow) slowCount++;
+            if (!bottleneck || entry.durationMs > bottleneck.durationMs) {
+                bottleneck = { operation: entry.operation, durationMs: entry.durationMs };
+            }
+        }
+
+        return {
+            operationCount: this.entries.length,
+            totalMs,
+            slowCount,
+            bottleneck: bottleneck ? `${bottleneck.operation} (${bottleneck.durationMs}ms)` : undefined
+        };
+    }
+}
+
+/**
+ * Create a telemetry collector for a request.
+ * Returns null if telemetry is disabled or sessionId is missing.
+ */
+export function createTelemetryCollector(
+    sessionId: string | undefined,
+    projectId: string | undefined,
+    pairIndex: number
+): TelemetryCollector | null {
+    if (!sessionId || !projectId) return null;
+    return new TelemetryCollector(sessionId, projectId, pairIndex);
 }

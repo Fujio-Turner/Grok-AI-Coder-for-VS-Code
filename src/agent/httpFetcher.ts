@@ -100,55 +100,66 @@ export async function fetchUrl(url: string): Promise<FetchResult> {
 }
 
 /**
- * Extract readable text from HTML, removing scripts, styles, nav, etc.
+ * Extract readable text from HTML, focusing on body content only.
+ * Removes scripts, styles, nav, and other non-content elements.
  */
 function extractTextFromHtml(html: string): string {
-    // Remove script and style tags with content
-    let text = html
+    // STEP 1: Extract body content only (ignore head, meta, etc.)
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    let text = bodyMatch ? bodyMatch[1] : html;
+    
+    // STEP 2: Remove non-content elements
+    text = text
         .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
         .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
         .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
         .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
         .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
-        .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '');
+        .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '')
+        .replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '')
+        .replace(/<!--[\s\S]*?-->/gi, ''); // Remove HTML comments
 
-    // Extract content from article or main if present
+    // STEP 3: Prefer main content areas (article > main > body)
     const articleMatch = text.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
     const mainMatch = text.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+    const contentMatch = text.match(/<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
     
     if (articleMatch) {
         text = articleMatch[1];
     } else if (mainMatch) {
         text = mainMatch[1];
+    } else if (contentMatch) {
+        text = contentMatch[1];
     }
 
-    // Convert headers to markdown-style
+    // STEP 4: Convert headers to markdown-style
     text = text
         .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '\n# $1\n')
         .replace(/<h2[^>]*>(.*?)<\/h2>/gi, '\n## $1\n')
         .replace(/<h3[^>]*>(.*?)<\/h3>/gi, '\n### $1\n')
         .replace(/<h4[^>]*>(.*?)<\/h4>/gi, '\n#### $1\n');
 
-    // Convert code blocks
+    // STEP 5: Convert code blocks
     text = text
         .replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, '\n```\n$1\n```\n')
         .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`');
 
-    // Convert lists
+    // STEP 6: Convert lists
     text = text
         .replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n')
         .replace(/<\/?[ou]l[^>]*>/gi, '\n');
 
-    // Convert paragraphs and line breaks
+    // STEP 7: Convert paragraphs and line breaks
     text = text
         .replace(/<p[^>]*>/gi, '\n\n')
         .replace(/<\/p>/gi, '')
         .replace(/<br\s*\/?>/gi, '\n');
 
-    // Remove all remaining tags
+    // STEP 8: Remove all remaining tags
     text = text.replace(/<[^>]+>/g, '');
 
-    // Decode HTML entities
+    // STEP 9: Decode HTML entities
     text = text
         .replace(/&nbsp;/g, ' ')
         .replace(/&amp;/g, '&')
@@ -156,14 +167,16 @@ function extractTextFromHtml(html: string): string {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
+        .replace(/&#\d+;/g, '') // Remove numeric entities
         .replace(/&hellip;/g, '...')
         .replace(/&mdash;/g, '—')
         .replace(/&ndash;/g, '–');
 
-    // Clean up whitespace
+    // STEP 10: Clean up whitespace aggressively
     text = text
         .replace(/\n{3,}/g, '\n\n')
         .replace(/[ \t]+/g, ' ')
+        .replace(/^\s+/gm, '') // Remove leading whitespace per line
         .trim();
 
     return text;

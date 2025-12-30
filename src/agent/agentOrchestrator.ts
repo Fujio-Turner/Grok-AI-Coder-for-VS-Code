@@ -8,7 +8,7 @@
 
 import * as vscode from 'vscode';
 import { sendChatCompletion, GrokMessage } from '../api/grokClient';
-import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent, addLineNumbers } from './workspaceFiles';
+import { findAndReadFiles, formatFilesForPrompt, getFilesSummary, FileContent, addLineNumbers, applyErrorContextTruncation, filterByRelevance, truncatePastedCode } from './workspaceFiles';
 import { fetchUrl, extractUrls } from './httpFetcher';
 import { followImports, formatImportContext } from './importResolver';
 import { 
@@ -23,8 +23,13 @@ import {
     ActionResult, 
     ExecutionResult,
     ProgressUpdate,
-    TodoAction
+    TodoAction,
+    TelemetryCollector
 } from './actionTypes';
+import { 
+    TelemetryEntry,
+    createTelemetryTimer 
+} from '../storage/chatSessionRepository';
 import { debug, info, error as logError } from '../utils/logger';
 import { getPromptFromConfig, getSchemaFromConfig } from '../utils/configLoader';
 import { 
@@ -438,7 +443,8 @@ function isLargeFile(file: FileContent): boolean {
  */
 export async function executeActions(
     plan: AgentPlan,
-    onProgress?: (update: ProgressUpdate) => void
+    onProgress?: (update: ProgressUpdate) => void,
+    telemetry?: TelemetryCollector | null
 ): Promise<ExecuteResult> {
     const startTime = Date.now();
     const results: ActionResult[] = [];
@@ -446,6 +452,9 @@ export async function executeActions(
     const fileHashes = new Map<string, string>();
     const urlsContent = new Map<string, string>();
     const largeFileMetadata: FileMetadata[] = [];
+    
+    // Helper to format wall clock time
+    const wallClock = () => new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
     for (const action of plan.actions) {
         if (action.type === 'file') {
@@ -468,15 +477,24 @@ export async function executeActions(
             let foundFiles: FileContent[] = [];
             let successfulPattern: string | null = null;
             let lastError: string | null = null;
+            let searchStart = Date.now(); // Track timing across pattern attempts
+            let fileSearchTimerId: string | undefined;
             
             // Try each pattern in order until one succeeds
             for (let i = 0; i < patternsToTry.length; i++) {
                 const pattern = patternsToTry[i];
                 const isLastPattern = i === patternsToTry.length - 1;
+                searchStart = Date.now(); // Reset for each pattern attempt
+                const wc = wallClock();
+                
+                // Start telemetry timer for file search
+                fileSearchTimerId = telemetry?.startTimer('file-search', `Search: ${pattern}`);
+                telemetry?.getTimer(fileSearchTimerId!)?.addDetails({ pattern });
                 
                 onProgress?.({
                     type: 'file-start',
-                    message: `🔍 Searching: \`${pattern}\`${patternsToTry.length > 1 ? ` (${i + 1}/${patternsToTry.length})` : ''}`,
+                    message: `🔍 [${wc}] Searching: \`${pattern}\`${patternsToTry.length > 1 ? ` (${i + 1}/${patternsToTry.length})` : ''}`,
+                    timestamp: new Date().toISOString(),
                     details: { path: pattern }
                 });
 
@@ -487,17 +505,33 @@ export async function executeActions(
                         foundFiles = files;
                         successfulPattern = pattern;
                         
+                        // End telemetry with success
+                        if (fileSearchTimerId) {
+                            telemetry?.getTimer(fileSearchTimerId)?.addDetails({ 
+                                fileCount: files.length,
+                                lines: files.reduce((sum, f) => sum + f.lineCount, 0),
+                                bytes: files.reduce((sum, f) => sum + f.content.length, 0)
+                            });
+                            telemetry?.endTimer(fileSearchTimerId, true);
+                        }
+                        
                         // Log which pattern worked if we tried multiple
                         if (i > 0) {
                             info(`Pattern fallback succeeded: "${pattern}" (attempt ${i + 1}/${patternsToTry.length})`);
                         }
                         break; // Stop trying patterns
                     } else if (!isLastPattern) {
-                        // Pattern didn't find anything, try next
+                        // Pattern didn't find anything, try next - end timer as not-success but not error
+                        if (fileSearchTimerId) {
+                            telemetry?.endTimer(fileSearchTimerId, false, 'No files found');
+                        }
                         debug(`Pattern "${pattern}" found nothing, trying next fallback...`);
                     }
                 } catch (err: any) {
                     lastError = err.message;
+                    if (fileSearchTimerId) {
+                        telemetry?.endTimer(fileSearchTimerId, false, err.message);
+                    }
                     if (!isLastPattern) {
                         debug(`Pattern "${pattern}" error: ${err.message}, trying next fallback...`);
                     }
@@ -543,13 +577,17 @@ export async function executeActions(
 
                 const totalLines = regularFiles.reduce((sum, f) => sum + f.lineCount, 0);
                 const fileNames = regularFiles.map(f => f.name);
+                const searchMs = Date.now() - searchStart;
                 
                 if (regularFiles.length > 0) {
                     // Show each file found on its own line for better visibility
                     const fileList = fileNames.map(f => `   └─ ${f}`).join('\n');
+                    const wallClockDone = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
                     onProgress?.({
                         type: 'file-done',
-                        message: `✅ Loaded ${regularFiles.length} file(s) (${totalLines} lines)\n${fileList}`,
+                        message: `✅ [${wallClockDone}] Loaded ${regularFiles.length} file(s) (${totalLines} lines) in ${searchMs}ms\n${fileList}`,
+                        timestamp: new Date().toISOString(),
+                        durationMs: searchMs,
                         details: { 
                             path: successfulPattern,
                             lines: totalLines,
@@ -560,17 +598,22 @@ export async function executeActions(
 
                 // Follow imports for each loaded file (max depth 3) - only for regular files
                 for (const file of regularFiles) {
+                    const importWc = wallClock();
+                    const importTimerId = telemetry?.startTimer('import-analysis', `Imports: ${file.name}`);
+                    telemetry?.getTimer(importTimerId!)?.addDetails({ path: file.path });
+                    
                     try {
                         onProgress?.({
                             type: 'file-start',
-                            message: `🔗 Analyzing imports: ${file.name}`,
+                            message: `🔗 [${importWc}] Analyzing imports: ${file.name}`,
+                            timestamp: new Date().toISOString(),
                             details: { path: file.path }
                         });
                         
                         const importResult = await followImports(
                             file.path, 
                             file.content,
-                            (msg) => onProgress?.({ type: 'file-start', message: msg, details: {} })
+                            (msg) => onProgress?.({ type: 'file-start', message: msg, timestamp: new Date().toISOString(), details: {} })
                         );
                         
                         // Add imported files to context (with hashes)
@@ -588,18 +631,38 @@ export async function executeActions(
                             }
                         }
                         
+                        // End telemetry with details
+                        if (importTimerId) {
+                            const entry = telemetry?.getTimer(importTimerId);
+                            entry?.addDetails({
+                                itemCount: importResult.files.size + importResult.external.size,
+                                fileCount: importResult.files.size
+                            });
+                            if (importResult.external.size > 0) {
+                                entry?.addFlags({ concurrent: true }); // External fetches are parallel
+                            }
+                            telemetry?.endTimer(importTimerId, true);
+                        }
+                        
+                        const importMs = telemetry?.getTimer(importTimerId!)?.getElapsedMs() || (Date.now() - (Date.now() - 1));
                         if (importResult.files.size > 0 || importResult.external.size > 0) {
                             const importedNames = Array.from(importResult.files.keys()).map(p => p.split('/').pop() || p);
                             const importList = importedNames.length > 0 
                                 ? '\n' + importedNames.slice(0, 5).map(f => `   └─ ${f}`).join('\n') + (importedNames.length > 5 ? `\n   └─ ...and ${importedNames.length - 5} more` : '')
                                 : '';
+                            const importDoneWc = wallClock();
                             onProgress?.({
                                 type: 'file-done',
-                                message: `✅ Found ${importResult.files.size} import(s), ${importResult.external.size} external doc(s)${importList}`,
+                                message: `✅ [${importDoneWc}] Found ${importResult.files.size} import(s), ${importResult.external.size} external doc(s) in ${importMs}ms${importList}`,
+                                timestamp: new Date().toISOString(),
+                                durationMs: importMs,
                                 details: { files: importedNames }
                             });
                         }
                     } catch (importErr: any) {
+                        if (importTimerId) {
+                            telemetry?.endTimer(importTimerId, false, importErr.message);
+                        }
                         debug('Import following error:', importErr);
                     }
                 }
@@ -648,9 +711,14 @@ export async function executeActions(
                 urlLabel = `${parsedUrl.hostname}/${fileName}`;
             } catch { /* keep full URL */ }
             
+            const urlWc = wallClock();
+            const urlTimerId = telemetry?.startTimer('url-fetch', `Fetch: ${urlLabel}`);
+            telemetry?.getTimer(urlTimerId!)?.addDetails({ url: urlAction.url });
+            
             onProgress?.({
                 type: 'url-start',
-                message: `🌐 Fetching: ${urlLabel}`,
+                message: `🌐 [${urlWc}] Fetching: ${urlLabel}`,
+                timestamp: new Date().toISOString(),
                 details: { url: urlAction.url }
             });
 
@@ -661,10 +729,20 @@ export async function executeActions(
                 if (fetchResult.success && fetchResult.content) {
                     urlsContent.set(urlAction.url, fetchResult.content);
                     
+                    // End telemetry with success
+                    if (urlTimerId) {
+                        telemetry?.getTimer(urlTimerId)?.addDetails({ bytes: fetchResult.bytes });
+                        telemetry?.endTimer(urlTimerId, true);
+                    }
+                    
                     const sizeKB = Math.round((fetchResult.bytes || 0) / 1024);
+                    const urlDoneWc = wallClock();
+                    const urlDurationMs = telemetry?.getTimer(urlTimerId!)?.getElapsedMs();
                     onProgress?.({
                         type: 'url-done',
-                        message: `✅ Fetched ${urlLabel} (${sizeKB}KB)`,
+                        message: `✅ [${urlDoneWc}] Fetched ${urlLabel} (${sizeKB}KB)${urlDurationMs ? ` in ${urlDurationMs}ms` : ''}`,
+                        timestamp: new Date().toISOString(),
+                        durationMs: urlDurationMs,
                         details: { url: urlAction.url, bytes: fetchResult.bytes }
                     });
 
@@ -675,6 +753,10 @@ export async function executeActions(
                         metadata: { bytes: fetchResult.bytes }
                     });
                 } else {
+                    if (urlTimerId) {
+                        telemetry?.endTimer(urlTimerId, false, fetchResult.error);
+                    }
+                    
                     onProgress?.({
                         type: 'error',
                         message: `⚠️ Failed to fetch ${urlAction.url}: ${fetchResult.error}`,
@@ -688,6 +770,10 @@ export async function executeActions(
                     });
                 }
             } catch (err: any) {
+                if (urlTimerId) {
+                    telemetry?.endTimer(urlTimerId, false, err.message);
+                }
+                
                 onProgress?.({
                     type: 'error',
                     message: `❌ Error fetching ${urlAction.url}: ${err.message}`,
@@ -1104,7 +1190,15 @@ export function buildAugmentedMessage(
     plan: AgentPlan,
     execution: ExecutionResult
 ): AugmentedMessageResult {
-    let augmented = originalMessage;
+    // Step 0: Truncate pasted code in user message if it's too long
+    // This prevents users from accidentally sending 300+ line code dumps
+    const truncationResult = truncatePastedCode(originalMessage, 100);
+    let augmented = truncationResult.message;
+    
+    if (truncationResult.wasTruncated) {
+        info(`Truncated pasted code in user message: ${truncationResult.originalLines} -> ${truncationResult.keptLines} lines`);
+    }
+    
     const pendingChunksMap: PendingChunks = {};
 
     // Add plan context
@@ -1203,10 +1297,38 @@ export function buildAugmentedMessage(
             }
         }
         
-        // Add regular (small) files normally
-        for (const file of regularFiles) {
-            const numberedContent = addLineNumbers(file.content);
-            augmented += `\n### ${file.path} [MD5: ${file.hash}]\n\`\`\`\n${numberedContent}\n\`\`\`\n`;
+        // Add regular (small) files normally - apply relevance filtering and error context truncation
+        // Convert to FileContent format for filtering/truncation
+        let fileContents: FileContent[] = regularFiles.map(f => ({
+            path: f.path,
+            relativePath: f.path,
+            name: f.path.split('/').pop() || f.path,
+            content: f.content,
+            language: f.path.split('.').pop() || 'text',
+            lineCount: f.content.split('\n').length,
+            md5Hash: f.hash
+        }));
+        
+        // Step 1: Apply relevance filtering - remove large files not related to the error context
+        // (e.g., don't include CSS/JS files when debugging a Python error)
+        const relevanceResult = filterByRelevance(fileContents, originalMessage);
+        if (relevanceResult.filtered.length > 0) {
+            augmented += `\n⚠️ **Filtered ${relevanceResult.filtered.length} irrelevant file(s):** ${relevanceResult.filtered.join(', ')}\n`;
+            fileContents = relevanceResult.files;
+        }
+        
+        // Step 2: Apply smart error context truncation - only shows ±50 lines around error references
+        const truncatedFiles = applyErrorContextTruncation(fileContents, originalMessage, 50);
+        
+        for (let i = 0; i < truncatedFiles.length; i++) {
+            const file = truncatedFiles[i];
+            // Find the original file to get the hash
+            const originalFile = regularFiles.find(f => f.path === file.path);
+            const hash = originalFile?.hash || file.md5Hash;
+            // If truncated, content already has line numbers from truncation
+            const wasTruncated = file.content !== (originalFile?.content || '');
+            const displayContent = wasTruncated ? file.content : addLineNumbers(file.content);
+            augmented += `\n### ${file.path} [MD5: ${hash}]\n\`\`\`\n${displayContent}\n\`\`\`\n`;
         }
         
         // Add chunked files - ONLY FIRST CHUNK with summary
@@ -1448,7 +1570,8 @@ export async function runAgentWorkflow(
     userMessage: string,
     apiKey: string,
     fastModel: string,
-    onProgress?: (message: string) => void
+    onProgress?: (message: string) => void,
+    telemetry?: TelemetryCollector | null
 ): Promise<AgentWorkflowResult> {
     
     // Convert string progress to ProgressUpdate for internal use
@@ -1457,9 +1580,22 @@ export async function runAgentWorkflow(
     };
 
     // Pass 1: Create plan
-    onProgress?.('🧠 Planning...');
+    const planWc = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    onProgress?.(`🧠 [${planWc}] Planning...`);
+    
+    const planTimerId = telemetry?.startTimer('planning', 'AI Planning Pass');
     const planResult = await createPlan(userMessage, apiKey, fastModel, progressHandler);
     const plan = planResult.plan;
+    
+    // End planning telemetry
+    if (planTimerId) {
+        telemetry?.getTimer(planTimerId)?.addDetails({
+            tokensIn: planResult.tokensIn,
+            tokensOut: planResult.tokensOut,
+            itemCount: plan.actions.length
+        });
+        telemetry?.endTimer(planTimerId, true);
+    }
     
     if (plan.actions.length === 0) {
         debug('No actions in plan, proceeding directly');
@@ -1476,10 +1612,11 @@ export async function runAgentWorkflow(
         };
     }
 
-    info(`Plan created: ${plan.todos.length} todos, ${plan.actions.length} actions`);
+    const planDoneWc = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    info(`[${planDoneWc}] Plan created in ${planResult.timeMs}ms: ${plan.todos.length} todos, ${plan.actions.length} actions`);
 
     // Pass 2: Execute actions
-    const executeResult = await executeActions(plan, progressHandler);
+    const executeResult = await executeActions(plan, progressHandler, telemetry);
     const execution = executeResult.execution;
     
     // Collect loaded files for return value

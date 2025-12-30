@@ -12,9 +12,11 @@ export interface TodoItem {
 
 export interface LineOperation {
     type: 'insert' | 'delete' | 'replace' | 'insertAfter' | 'insertBefore';
-    line: number;              // 1-indexed line number
+    line: number;              // 1-indexed line number (start of range)
+    endLine?: number;          // 1-indexed end line (inclusive) for range operations
     expectedContent?: string;  // For delete/replace: what we expect to find (validation)
-    newContent?: string;       // For insert/replace: what to add
+                               // For ranges: expected content of FIRST line (or all lines joined with \n)
+    newContent?: string;       // For insert/replace: what to add (use \n for multiple lines)
 }
 
 export interface FileChange {
@@ -51,6 +53,13 @@ export interface DirectoryRequest {
     filter?: string;     // Optional glob filter (e.g., '*.ts')
 }
 
+export interface FileSearchRequest {
+    pattern: string;     // Glob pattern (e.g., '**/config.json') or filename (e.g., 'app.js')
+    reason: string;      // Why the AI needs this file - shown to user if not found
+    maxResults?: number; // Max files to return (default: 5)
+    autoAttach?: boolean; // If true, automatically attach found files (default: true)
+}
+
 export interface SubTaskRequest {
     id: string;              // Unique ID for tracking
     goal: string;            // Clear description of what to accomplish
@@ -83,6 +92,8 @@ export interface GrokStructuredResponse {
     fileHashes?: Record<string, string>;
     // Directory exploration - AI can request directory listings
     directoryRequests?: DirectoryRequest[];
+    // File search - AI can search for files by pattern before asking user
+    fileSearchRequests?: FileSearchRequest[];
     // Sub-tasks for parallel/sequential work decomposition
     subTasks?: SubTaskRequest[];
     // Legacy field - kept for backward compatibility
@@ -123,6 +134,9 @@ export const RESPONSE_JSON_SCHEMA = `{
   ],
   "directoryRequests": [
     { "path": "src/prompts", "recursive": false, "filter": "*.ts" }
+  ],
+  "fileSearchRequests": [
+    { "pattern": "**/config.json", "reason": "Need cluster configuration", "autoAttach": true }
   ]
 }`;
 
@@ -301,6 +315,24 @@ export function validateResponse(parsed: unknown): GrokStructuredResponse | null
         }));
     }
 
+    // Validate optional fileSearchRequests
+    if (obj.fileSearchRequests !== undefined) {
+        if (!Array.isArray(obj.fileSearchRequests)) {
+            return null;
+        }
+        response.fileSearchRequests = obj.fileSearchRequests.filter((f): f is FileSearchRequest =>
+            typeof f === 'object' && f !== null &&
+            typeof (f as FileSearchRequest).pattern === 'string' &&
+            (f as FileSearchRequest).pattern.trim().length > 0 &&
+            typeof (f as FileSearchRequest).reason === 'string'
+        ).map(f => ({
+            pattern: f.pattern.trim(),
+            reason: f.reason.trim(),
+            maxResults: typeof f.maxResults === 'number' ? f.maxResults : 5,
+            autoAttach: typeof f.autoAttach === 'boolean' ? f.autoAttach : true
+        }));
+    }
+
     // Validate optional subTasks
     if (obj.subTasks !== undefined) {
         if (!Array.isArray(obj.subTasks)) {
@@ -429,9 +461,10 @@ export const STRUCTURED_OUTPUT_SCHEMA = {
                                             type: "string", 
                                             enum: ["insert", "delete", "replace", "insertAfter", "insertBefore"]
                                         },
-                                        line: { type: "integer", description: "1-indexed line number" },
-                                        expectedContent: { type: "string", description: "Content expected at line (for validation)" },
-                                        newContent: { type: "string", description: "New content to insert/replace" }
+                                        line: { type: "integer", description: "1-indexed line number (start of range)" },
+                                        endLine: { type: "integer", description: "1-indexed end line (inclusive) for range ops" },
+                                        expectedContent: { type: "string", description: "Content expected at first line (for validation)" },
+                                        newContent: { type: "string", description: "New content (use \\n for multi-line)" }
                                     },
                                     required: ["type", "line"],
                                     additionalProperties: false
@@ -478,6 +511,21 @@ export const STRUCTURED_OUTPUT_SCHEMA = {
                             filter: { type: "string", description: "Optional glob filter (e.g., '*.ts')" }
                         },
                         required: ["path"],
+                        additionalProperties: false
+                    }
+                },
+                fileSearchRequests: {
+                    type: "array",
+                    description: "Search for files by pattern - use BEFORE asking user to attach files",
+                    items: {
+                        type: "object",
+                        properties: {
+                            pattern: { type: "string", description: "Glob pattern (e.g., '**/config.json') or filename" },
+                            reason: { type: "string", description: "Why this file is needed (shown if not found)" },
+                            maxResults: { type: "integer", description: "Max files to return (default: 5)" },
+                            autoAttach: { type: "boolean", description: "Auto-attach found files (default: true)" }
+                        },
+                        required: ["pattern", "reason"],
                         additionalProperties: false
                     }
                 },

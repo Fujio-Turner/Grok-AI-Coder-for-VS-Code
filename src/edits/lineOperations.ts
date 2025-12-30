@@ -13,9 +13,11 @@ export type LineOperationType = 'insert' | 'delete' | 'replace' | 'insertAfter' 
 
 export interface LineOperation {
     type: LineOperationType;
-    line: number;              // 1-indexed line number
+    line: number;              // 1-indexed line number (start of range)
+    endLine?: number;          // 1-indexed end line (inclusive) for range operations
     expectedContent?: string;  // For delete/replace: what we expect to find (validation)
-    newContent?: string;       // For insert/replace: what to add
+                               // For ranges: expected content of FIRST line (or all lines joined with \n)
+    newContent?: string;       // For insert/replace: what to add (use \n for multiple lines)
     fuzzyMatch?: boolean;      // Allow whitespace/case differences in validation
 }
 
@@ -35,14 +37,16 @@ export interface ValidationResult {
 
 /**
  * Validate a single line operation against the current file content
+ * Supports range operations via endLine field.
  */
 export function validateOperation(
     lines: string[],
     op: LineOperation
 ): ValidationResult {
     const lineIndex = op.line - 1; // Convert to 0-indexed
+    const endLineIndex = op.endLine ? op.endLine - 1 : lineIndex; // Default to single line
     
-    // Check line exists (for operations that need it)
+    // Check line range exists (for operations that need it)
     if (op.type !== 'insert' && op.type !== 'insertAfter' && op.type !== 'insertBefore') {
         if (lineIndex < 0 || lineIndex >= lines.length) {
             return {
@@ -50,31 +54,52 @@ export function validateOperation(
                 error: `Line ${op.line} does not exist (file has ${lines.length} lines)`
             };
         }
+        if (op.endLine && (endLineIndex < 0 || endLineIndex >= lines.length)) {
+            return {
+                valid: false,
+                error: `End line ${op.endLine} does not exist (file has ${lines.length} lines)`
+            };
+        }
+        if (op.endLine && endLineIndex < lineIndex) {
+            return {
+                valid: false,
+                error: `End line ${op.endLine} is before start line ${op.line}`
+            };
+        }
     }
     
     // For delete/replace, validate expected content matches
     if ((op.type === 'delete' || op.type === 'replace') && op.expectedContent !== undefined) {
-        const actualLine = lines[lineIndex];
+        // For ranges, join the lines and compare
+        const actualContent = op.endLine 
+            ? lines.slice(lineIndex, endLineIndex + 1).join('\n')
+            : lines[lineIndex];
         const expected = op.expectedContent;
         
         if (op.fuzzyMatch) {
             // Fuzzy: ignore leading/trailing whitespace, case-insensitive
-            const normalizedActual = actualLine.trim().toLowerCase();
+            const normalizedActual = actualContent.trim().toLowerCase();
             const normalizedExpected = expected.trim().toLowerCase();
             if (!normalizedActual.includes(normalizedExpected) && !normalizedExpected.includes(normalizedActual)) {
                 return {
                     valid: false,
-                    error: `Line ${op.line} content mismatch (fuzzy)`,
-                    actualContent: actualLine
+                    error: op.endLine 
+                        ? `Lines ${op.line}-${op.endLine} content mismatch (fuzzy)`
+                        : `Line ${op.line} content mismatch (fuzzy)`,
+                    actualContent
                 };
             }
         } else {
-            // Strict: must contain the expected content
-            if (!actualLine.includes(expected)) {
+            // Strict: must contain the expected content (for single line) or match first line (for range)
+            // For ranges with expectedContent, we validate the first line contains it
+            const firstLine = lines[lineIndex];
+            if (!firstLine.includes(expected)) {
                 return {
                     valid: false,
-                    error: `Line ${op.line} does not contain expected content: "${expected}"`,
-                    actualContent: actualLine
+                    error: op.endLine
+                        ? `Line ${op.line} (start of range) does not contain expected content: "${expected.substring(0, 50)}..."`
+                        : `Line ${op.line} does not contain expected content: "${expected}"`,
+                    actualContent: firstLine
                 };
             }
         }
@@ -85,25 +110,33 @@ export function validateOperation(
 
 /**
  * Apply a single line operation to the lines array (mutates in place)
+ * Supports range operations via endLine field.
  */
 export function applyOperation(
     lines: string[],
     op: LineOperation
 ): void {
     const lineIndex = op.line - 1; // Convert to 0-indexed
+    const endLineIndex = op.endLine ? op.endLine - 1 : lineIndex; // Default to single line
+    const lineCount = endLineIndex - lineIndex + 1;
     
     switch (op.type) {
         case 'delete':
-            lines.splice(lineIndex, 1);
+            // Delete range of lines (or single line)
+            lines.splice(lineIndex, lineCount);
             break;
             
         case 'replace':
             if (op.newContent !== undefined) {
-                // If expectedContent is provided, do a substring replace
-                if (op.expectedContent) {
+                // Split newContent into lines for multi-line replacement
+                const newLines = op.newContent.split('\n');
+                
+                if (op.expectedContent && !op.endLine) {
+                    // Single-line substring replace (legacy behavior)
                     lines[lineIndex] = lines[lineIndex].replace(op.expectedContent, op.newContent);
                 } else {
-                    lines[lineIndex] = op.newContent;
+                    // Range replace: remove old lines, insert new lines
+                    lines.splice(lineIndex, lineCount, ...newLines);
                 }
             }
             break;
@@ -111,19 +144,24 @@ export function applyOperation(
         case 'insert':
             // Insert at the specified line (pushing existing content down)
             if (op.newContent !== undefined) {
-                lines.splice(lineIndex, 0, op.newContent);
+                const newLines = op.newContent.split('\n');
+                lines.splice(lineIndex, 0, ...newLines);
             }
             break;
             
         case 'insertAfter':
             if (op.newContent !== undefined) {
-                lines.splice(lineIndex + 1, 0, op.newContent);
+                const newLines = op.newContent.split('\n');
+                // For range, insert after the endLine
+                const insertIndex = endLineIndex + 1;
+                lines.splice(insertIndex, 0, ...newLines);
             }
             break;
             
         case 'insertBefore':
             if (op.newContent !== undefined) {
-                lines.splice(lineIndex, 0, op.newContent);
+                const newLines = op.newContent.split('\n');
+                lines.splice(lineIndex, 0, ...newLines);
             }
             break;
     }

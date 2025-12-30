@@ -33,6 +33,9 @@
     "directoryRequests": [
       { "path": "src/prompts", "recursive": false, "filter": "*.ts" }
     ],
+    "fileSearchRequests": [
+      { "pattern": "**/config.json", "reason": "Need cluster configuration", "autoAttach": true }
+    ],
     "subTasks": [
       {
         "id": "api",

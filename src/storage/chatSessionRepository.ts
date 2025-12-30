@@ -239,6 +239,62 @@ export interface StoreFileRequest {
     pairIndex: number;
 }
 
+// ============================================================================
+// Agent Workflow Persistence - Multi-step agent workflow tracking
+// ============================================================================
+
+/**
+ * A command executed as part of an agent step (mirrors agentStepTracker.ts)
+ */
+export interface PersistedAgentCommand {
+    id: string;
+    command: string;
+    cwd: string;
+    exitCode?: number;
+    stdout?: string;
+    stderr?: string;
+    durationMs: number;
+    success: boolean;
+}
+
+/**
+ * A single step in a multi-step agent workflow (mirrors agentStepTracker.ts)
+ */
+export interface PersistedAgentStep {
+    id: string;
+    stepNumber: number;
+    sessionId: string;
+    description: string;
+    intent: string;
+    dependsOn: string[];
+    dependents: string[];
+    changeSetIds: string[];
+    execution?: {
+        commands: PersistedAgentCommand[];
+        success: boolean;
+        error?: string;
+    };
+    status: 'pending' | 'in-progress' | 'applied' | 'reverted' | 'failed';
+    createdAt: string;
+    appliedAt?: string;
+    revertedAt?: string;
+}
+
+/**
+ * Persisted agent workflow document for Couchbase storage
+ */
+export interface AgentWorkflowDocument {
+    id: string;                   // Document key: agent-workflow::{workflowId}
+    docType: 'agent-workflow';
+    sessionId: string;
+    userRequest: string;
+    steps: PersistedAgentStep[];
+    currentStepIndex: number;
+    status: 'planning' | 'executing' | 'completed' | 'failed' | 'cancelled';
+    createdAt: string;
+    completedAt?: string;
+}
+
 export interface ModelUsageEntry {
     model: string;      // e.g., "grok-4", "grok-3-mini"
     text: number;       // Number of text-only calls
@@ -277,7 +333,7 @@ export interface OperationFailure {
     timestamp: string;
     pairIndex: number;
     filePath: string;
-    operationType: 'lineOperation' | 'diff' | 'fullReplace' | 'apiError' | 'parseError' | 'hashMismatch' | 'noHash';
+    operationType: 'lineOperation' | 'diff' | 'fullReplace' | 'apiError' | 'parseError' | 'hashMismatch' | 'noHash' | 'corruptionDetected';
     error: string;
     // Snapshot of file state at time of failure
     fileSnapshot?: {
@@ -458,6 +514,8 @@ export interface ChatSessionDocument {
     fileRegistry?: Record<string, FileRegistryEntry>;
     /** Pending directory listing results to inject in next turn */
     pendingDirectoryResults?: PendingDirectoryResults;
+    /** Pending file search results (AI-requested files) to attach in next turn */
+    pendingFileSearchResults?: PendingFileSearchResults;
     /** Pending bundled files (imports/tests) to attach in next turn */
     pendingBundledFiles?: PendingBundledFiles;
     /** Sub-task registry for parallel/sequential work decomposition */
@@ -573,6 +631,81 @@ export interface AuditPairEntry {
 }
 
 /**
+ * Telemetry entry for tracking operation timing and performance.
+ * Used to identify slow operations, bottlenecks, and optimization opportunities.
+ */
+export type TelemetryOperationType = 
+    | 'planning'           // AI planning pass
+    | 'file-search'        // Glob/file search
+    | 'file-read'          // Reading file content
+    | 'import-analysis'    // Following imports
+    | 'url-fetch'          // HTTP fetch
+    | 'url-fetch-parallel' // Parallel URL fetches
+    | 'cb-read'            // Couchbase read
+    | 'cb-write'           // Couchbase write
+    | 'cb-query'           // Couchbase N1QL query
+    | 'ai-request'         // Main AI API call
+    | 'json-parse'         // JSON parsing/cleanup
+    | 'file-apply'         // Applying file changes
+    | 'chunk-process'      // Processing file chunk
+    | 'smart-read'         // Smart file reading
+    | 'bundling'           // Import/test bundling
+    | 'directory-list'     // Directory listing
+    | 'other';             // Catch-all
+
+export interface TelemetryEntry {
+    id: string;                    // Unique ID (uuid)
+    type: TelemetryOperationType;
+    operation: string;             // Human-readable operation name
+    wallClockStart: string;        // ISO timestamp when operation started
+    wallClockEnd: string;          // ISO timestamp when operation ended
+    durationMs: number;            // Duration in milliseconds
+    pairIndex: number;             // Which conversation turn
+    success: boolean;
+    /** Additional context about the operation */
+    details?: {
+        path?: string;             // File path if applicable
+        url?: string;              // URL if applicable
+        pattern?: string;          // Glob pattern if applicable
+        bytes?: number;            // Bytes processed
+        lines?: number;            // Lines processed
+        fileCount?: number;        // Number of files
+        itemCount?: number;        // Generic count (e.g., imports found)
+        errorMessage?: string;     // Error message if failed
+        model?: string;            // AI model if applicable
+        tokensIn?: number;         // Input tokens if AI call
+        tokensOut?: number;        // Output tokens if AI call
+        parallel?: boolean;        // Whether operation was parallelized
+        concurrentOps?: number;    // Number of concurrent operations
+        sequentialEstimateMs?: number;  // Estimated time if sequential
+    };
+    /** Performance flags for quick filtering */
+    flags?: {
+        slow?: boolean;            // Operation took longer than expected
+        largeFile?: boolean;       // Processed a large file
+        concurrent?: boolean;      // Part of parallel execution
+        retry?: boolean;           // Operation was retried
+        cacheMiss?: boolean;       // Had to fetch fresh data
+    };
+}
+
+/**
+ * Telemetry summary for a conversation turn (pair).
+ */
+export interface TelemetryTurnSummary {
+    pairIndex: number;
+    totalDurationMs: number;
+    operationCount: number;
+    slowOperations: number;        // Count of operations with slow flag
+    byType: Record<TelemetryOperationType, { count: number; totalMs: number }>;
+    bottleneck?: {
+        type: TelemetryOperationType;
+        operation: string;
+        durationMs: number;
+    };
+}
+
+/**
  * Audit document stored separately from main session to avoid size limits.
  * Key format: debug:{sessionId}
  */
@@ -584,6 +717,10 @@ export interface ChatAuditDocument {
     createdAt: string;
     updatedAt: string;
     pairs: AuditPairEntry[];       // Full generation text for each pair
+    /** Performance telemetry - detailed timing for all operations */
+    telemetry?: TelemetryEntry[];
+    /** Turn-level summaries for quick analysis */
+    turnSummaries?: TelemetryTurnSummary[];
 }
 
 /**
@@ -727,6 +864,30 @@ export interface DirectoryListingResult {
 export interface PendingDirectoryResults {
     turn: number;           // Which turn requested these listings
     results: DirectoryListingResult[];  // Results to inject
+}
+
+// ============================================================================
+// File Search Results - AI-requested file searches
+// ============================================================================
+
+/**
+ * A file found via AI's fileSearchRequests capability.
+ * These are auto-attached to the next turn's context.
+ */
+export interface FileSearchResult {
+    relativePath: string;   // Relative path to file
+    content: string;        // File content
+    md5Hash: string;        // Hash for change tracking
+    reason: string;         // Why AI requested this file
+    foundAt: string;        // ISO timestamp when found
+}
+
+/**
+ * Pending file search results to inject into next turn.
+ */
+export interface PendingFileSearchResults {
+    turn: number;           // Which turn's AI response triggered the search
+    files: FileSearchResult[];  // Files found and to be attached
 }
 
 // ============================================================================
@@ -2023,6 +2184,117 @@ export async function clearPendingDirectoryResults(sessionId: string): Promise<v
     }
 }
 
+// ============================================================================
+// File Search Results Storage
+// ============================================================================
+
+/**
+ * Store pending file search results for injection into next turn.
+ * These are files the AI requested via fileSearchRequests.
+ */
+export async function storePendingFileSearchResults(
+    sessionId: string,
+    turn: number,
+    files: FileSearchResult[]
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        throw new Error(`Session not found: ${sessionId}`);
+    }
+    
+    const doc = result.content;
+    
+    // Merge with existing results if present (same turn may have multiple searches)
+    const existing = doc.pendingFileSearchResults;
+    if (existing && existing.turn === turn) {
+        // Append to existing files, avoiding duplicates
+        const existingPaths = new Set(existing.files.map(f => f.relativePath));
+        for (const file of files) {
+            if (!existingPaths.has(file.relativePath)) {
+                existing.files.push(file);
+            }
+        }
+    } else {
+        doc.pendingFileSearchResults = { turn, files };
+    }
+    
+    doc.updatedAt = now;
+    
+    const success = await client.replace(sessionId, doc);
+    if (!success) {
+        throw new Error('Failed to store pending file search results');
+    }
+    
+    debug('Stored pending file search results', { sessionId, turn, count: files.length });
+}
+
+/**
+ * Clear pending file search results after they've been injected.
+ */
+export async function clearPendingFileSearchResults(sessionId: string): Promise<void> {
+    const client = getCouchbaseClient();
+    const now = new Date().toISOString();
+    
+    const result = await client.get<ChatSessionDocument>(sessionId);
+    if (!result || !result.content) {
+        return; // Session not found, nothing to clear
+    }
+    
+    const doc = result.content;
+    if (doc.pendingFileSearchResults) {
+        delete doc.pendingFileSearchResults;
+        doc.updatedAt = now;
+        await client.replace(sessionId, doc);
+        debug('Cleared pending file search results', { sessionId });
+    }
+}
+
+/**
+ * Build a summary of file search results for injection into AI context.
+ * Similar to directory listing summary, but for auto-attached files.
+ */
+export function buildFileSearchResultsSummary(
+    results: PendingFileSearchResults | undefined
+): string {
+    if (!results || results.files.length === 0) {
+        return '';
+    }
+    
+    const lines: string[] = [];
+    lines.push('\n## 🔍 AUTO-ATTACHED FILES (from your fileSearchRequests)');
+    lines.push('These files were found and attached based on your search requests.\n');
+    
+    for (const file of results.files) {
+        lines.push(`### 📄 ${file.relativePath} (MD5: ${file.md5Hash.substring(0, 8)}...)`);
+        lines.push(`*Reason: ${file.reason}*\n`);
+        
+        // Include the file content with line numbers
+        const contentLines = file.content.split('\n');
+        const padding = String(contentLines.length).length;
+        const numberedContent = contentLines.map((line, i) => 
+            `${String(i + 1).padStart(padding, ' ')}: ${line}`
+        ).join('\n');
+        
+        // Detect language from file extension
+        const ext = file.relativePath.split('.').pop() || 'text';
+        const langMap: Record<string, string> = {
+            'ts': 'typescript', 'js': 'javascript', 'py': 'python',
+            'json': 'json', 'html': 'html', 'css': 'css',
+            'md': 'markdown', 'yml': 'yaml', 'yaml': 'yaml'
+        };
+        const lang = langMap[ext] || ext;
+        
+        lines.push('```' + lang);
+        lines.push(numberedContent);
+        lines.push('```\n');
+    }
+    
+    return lines.join('\n');
+}
+
 /**
  * Build a summary of directory listing results for injection into AI context.
  * Called when building messages for the next turn.
@@ -2459,6 +2731,285 @@ export async function getAuditDocument(sessionId: string): Promise<ChatAuditDocu
     } catch {
         return null;
     }
+}
+
+// ============================================================================
+// Performance Telemetry - Timing and profiling for all operations
+// ============================================================================
+
+/** Slow operation thresholds in milliseconds */
+const SLOW_THRESHOLDS: Record<TelemetryOperationType, number> = {
+    'planning': 3000,
+    'file-search': 500,
+    'file-read': 200,
+    'import-analysis': 1000,
+    'url-fetch': 5000,
+    'url-fetch-parallel': 8000,
+    'cb-read': 100,
+    'cb-write': 200,
+    'cb-query': 500,
+    'ai-request': 30000,
+    'json-parse': 100,
+    'file-apply': 300,
+    'chunk-process': 2000,
+    'smart-read': 1000,
+    'bundling': 500,
+    'directory-list': 300,
+    'other': 1000
+};
+
+/**
+ * Create a telemetry timer for tracking operation duration.
+ * Call start() when operation begins, end() when it completes.
+ */
+export function createTelemetryTimer(
+    type: TelemetryOperationType,
+    operation: string,
+    pairIndex: number
+): TelemetryTimer {
+    return new TelemetryTimer(type, operation, pairIndex);
+}
+
+export class TelemetryTimer {
+    private startTime: number;
+    private startWallClock: string;
+    private type: TelemetryOperationType;
+    private operation: string;
+    private pairIndex: number;
+    private details: NonNullable<TelemetryEntry['details']> = {};
+    private flags: NonNullable<TelemetryEntry['flags']> = {};
+
+    constructor(type: TelemetryOperationType, operation: string, pairIndex: number) {
+        this.type = type;
+        this.operation = operation;
+        this.pairIndex = pairIndex;
+        this.startTime = Date.now();
+        this.startWallClock = new Date().toISOString();
+    }
+
+    /** Add details to the telemetry entry */
+    addDetails(details: TelemetryEntry['details']): TelemetryTimer {
+        if (details) {
+            this.details = { ...this.details, ...details };
+        }
+        return this;
+    }
+
+    /** Add flags to the telemetry entry */
+    addFlags(flags: TelemetryEntry['flags']): TelemetryTimer {
+        if (flags) {
+            this.flags = { ...this.flags, ...flags };
+        }
+        return this;
+    }
+
+    /** Get the wall clock start time formatted for display */
+    getWallClockFormatted(): string {
+        return new Date(this.startWallClock).toLocaleTimeString('en-US', { 
+            hour12: false, 
+            hour: '2-digit', 
+            minute: '2-digit', 
+            second: '2-digit' 
+        });
+    }
+
+    /** Get elapsed time in milliseconds */
+    getElapsedMs(): number {
+        return Date.now() - this.startTime;
+    }
+
+    /** Complete the timer and return the telemetry entry */
+    end(success: boolean, errorMessage?: string): TelemetryEntry {
+        const endTime = Date.now();
+        const durationMs = endTime - this.startTime;
+        const endWallClock = new Date().toISOString();
+        
+        // Check if operation was slow
+        const threshold = SLOW_THRESHOLDS[this.type] || 1000;
+        if (durationMs > threshold) {
+            this.flags.slow = true;
+        }
+        
+        if (errorMessage) {
+            this.details.errorMessage = errorMessage;
+        }
+
+        return {
+            id: uuidv4(),
+            type: this.type,
+            operation: this.operation,
+            wallClockStart: this.startWallClock,
+            wallClockEnd: endWallClock,
+            durationMs,
+            pairIndex: this.pairIndex,
+            success,
+            details: Object.keys(this.details).length > 0 ? this.details : undefined,
+            flags: Object.keys(this.flags).length > 0 ? this.flags : undefined
+        };
+    }
+}
+
+/**
+ * Append telemetry entries to the audit document.
+ * Fire-and-forget - errors are logged but don't block.
+ */
+export async function appendTelemetry(
+    sessionId: string,
+    projectId: string,
+    entries: TelemetryEntry[]
+): Promise<void> {
+    if (entries.length === 0) return;
+    
+    const client = getCouchbaseClient();
+    const auditKey = getAuditDocumentKey(sessionId);
+    
+    try {
+        let auditDoc = await getOrCreateAuditDocument(sessionId, projectId);
+        const now = new Date().toISOString();
+        
+        // Initialize telemetry array if needed
+        if (!auditDoc.telemetry) {
+            auditDoc.telemetry = [];
+        }
+        
+        // Add new entries
+        auditDoc.telemetry.push(...entries);
+        auditDoc.updatedAt = now;
+        
+        // Trim if too large (keep last 500 entries)
+        const MAX_TELEMETRY = 500;
+        if (auditDoc.telemetry.length > MAX_TELEMETRY) {
+            auditDoc.telemetry = auditDoc.telemetry.slice(-MAX_TELEMETRY);
+        }
+        
+        await client.replace(auditKey, auditDoc);
+        
+        // Log slow operations
+        const slowOps = entries.filter(e => e.flags?.slow);
+        if (slowOps.length > 0) {
+            for (const op of slowOps) {
+                warn(`[Telemetry] SLOW: ${op.operation} took ${op.durationMs}ms (threshold: ${SLOW_THRESHOLDS[op.type]}ms)`, {
+                    type: op.type,
+                    details: op.details
+                });
+            }
+        }
+        
+        debug(`[Telemetry] Saved ${entries.length} entries for session ${sessionId}`);
+    } catch (err: any) {
+        logError('[Telemetry] Failed to save telemetry', { sessionId, error: err.message });
+    }
+}
+
+/**
+ * Append a single telemetry entry.
+ */
+export async function appendTelemetryEntry(
+    sessionId: string,
+    projectId: string,
+    entry: TelemetryEntry
+): Promise<void> {
+    return appendTelemetry(sessionId, projectId, [entry]);
+}
+
+/**
+ * Generate a turn summary from telemetry entries for a specific pair.
+ */
+export function generateTurnSummary(entries: TelemetryEntry[], pairIndex: number): TelemetryTurnSummary {
+    const turnEntries = entries.filter(e => e.pairIndex === pairIndex);
+    
+    const byType: Record<TelemetryOperationType, { count: number; totalMs: number }> = {} as any;
+    let totalDurationMs = 0;
+    let slowOperations = 0;
+    let bottleneck: TelemetryTurnSummary['bottleneck'];
+    
+    for (const entry of turnEntries) {
+        // Aggregate by type
+        if (!byType[entry.type]) {
+            byType[entry.type] = { count: 0, totalMs: 0 };
+        }
+        byType[entry.type].count++;
+        byType[entry.type].totalMs += entry.durationMs;
+        
+        totalDurationMs += entry.durationMs;
+        
+        if (entry.flags?.slow) {
+            slowOperations++;
+        }
+        
+        // Track bottleneck (longest single operation)
+        if (!bottleneck || entry.durationMs > bottleneck.durationMs) {
+            bottleneck = {
+                type: entry.type,
+                operation: entry.operation,
+                durationMs: entry.durationMs
+            };
+        }
+    }
+    
+    return {
+        pairIndex,
+        totalDurationMs,
+        operationCount: turnEntries.length,
+        slowOperations,
+        byType,
+        bottleneck
+    };
+}
+
+/**
+ * Save turn summary to the audit document.
+ */
+export async function saveTurnSummary(
+    sessionId: string,
+    projectId: string,
+    summary: TelemetryTurnSummary
+): Promise<void> {
+    const client = getCouchbaseClient();
+    const auditKey = getAuditDocumentKey(sessionId);
+    
+    try {
+        let auditDoc = await getOrCreateAuditDocument(sessionId, projectId);
+        const now = new Date().toISOString();
+        
+        // Initialize summaries array if needed
+        if (!auditDoc.turnSummaries) {
+            auditDoc.turnSummaries = [];
+        }
+        
+        // Replace or add summary for this pair
+        const existingIdx = auditDoc.turnSummaries.findIndex(s => s.pairIndex === summary.pairIndex);
+        if (existingIdx >= 0) {
+            auditDoc.turnSummaries[existingIdx] = summary;
+        } else {
+            auditDoc.turnSummaries.push(summary);
+        }
+        
+        auditDoc.updatedAt = now;
+        await client.replace(auditKey, auditDoc);
+        
+        // Log summary
+        info(`[Telemetry] Turn ${summary.pairIndex} summary: ${summary.operationCount} ops, ${summary.totalDurationMs}ms total` +
+            (summary.bottleneck ? `, bottleneck: ${summary.bottleneck.operation} (${summary.bottleneck.durationMs}ms)` : ''));
+    } catch (err: any) {
+        logError('[Telemetry] Failed to save turn summary', { sessionId, error: err.message });
+    }
+}
+
+/**
+ * Get telemetry for analysis.
+ */
+export async function getTelemetry(sessionId: string): Promise<TelemetryEntry[]> {
+    const auditDoc = await getAuditDocument(sessionId);
+    return auditDoc?.telemetry || [];
+}
+
+/**
+ * Get turn summaries for analysis.
+ */
+export async function getTurnSummaries(sessionId: string): Promise<TelemetryTurnSummary[]> {
+    const auditDoc = await getAuditDocument(sessionId);
+    return auditDoc?.turnSummaries || [];
 }
 
 /**
@@ -4071,4 +4622,188 @@ export function buildRevisionHistorySummary(index: FileRevisionIndex): string {
     }
     
     return summary;
+}
+
+// ============================================================================
+// Agent Workflow CRUD Operations
+// ============================================================================
+
+/**
+ * Save an agent workflow to Couchbase
+ */
+export async function saveAgentWorkflow(workflow: {
+    id: string;
+    sessionId: string;
+    userRequest: string;
+    steps: PersistedAgentStep[];
+    currentStepIndex: number;
+    status: 'planning' | 'executing' | 'completed' | 'failed' | 'cancelled';
+    createdAt: string;
+    completedAt?: string;
+}): Promise<boolean> {
+    const client = getCouchbaseClient();
+    const docId = `agent-workflow::${workflow.id}`;
+    
+    const doc: AgentWorkflowDocument = {
+        id: docId,
+        docType: 'agent-workflow',
+        sessionId: workflow.sessionId,
+        userRequest: workflow.userRequest,
+        steps: workflow.steps,
+        currentStepIndex: workflow.currentStepIndex,
+        status: workflow.status,
+        createdAt: workflow.createdAt,
+        completedAt: workflow.completedAt
+    };
+    
+    // Try to get existing doc first
+    const existing = await client.get<AgentWorkflowDocument>(docId);
+    
+    if (existing && existing.content) {
+        // Update existing
+        const success = await client.replace(docId, doc);
+        if (success) {
+            debug('Updated agent workflow', { workflowId: workflow.id, steps: workflow.steps.length });
+            return true;
+        }
+    } else {
+        // Insert new
+        const result = await client.insert(docId, doc);
+        if (result.success) {
+            debug('Created agent workflow', { workflowId: workflow.id, steps: workflow.steps.length });
+            return true;
+        }
+        // If document exists (race condition), try replace
+        if (result.error === 'DocumentExists') {
+            const success = await client.replace(docId, doc);
+            if (success) {
+                debug('Updated agent workflow (race)', { workflowId: workflow.id });
+                return true;
+            }
+        }
+        logError('Failed to save agent workflow', { workflowId: workflow.id, error: result.error });
+    }
+    
+    return false;
+}
+
+/**
+ * Get an agent workflow by ID
+ */
+export async function getAgentWorkflow(workflowId: string): Promise<AgentWorkflowDocument | null> {
+    const client = getCouchbaseClient();
+    
+    try {
+        const result = await client.get<AgentWorkflowDocument>(`agent-workflow::${workflowId}`);
+        if (result && result.content) {
+            return result.content;
+        }
+    } catch (err) {
+        debug('Agent workflow not found', { workflowId });
+    }
+    
+    return null;
+}
+
+/**
+ * Get all agent workflows for a session
+ */
+export async function getSessionAgentWorkflows(sessionId: string): Promise<AgentWorkflowDocument[]> {
+    const client = getCouchbaseClient();
+    
+    try {
+        const query = `
+            SELECT META().id, *
+            FROM \`grokCoder\`._default._default
+            WHERE docType = 'agent-workflow' 
+            AND sessionId = $sessionId
+            ORDER BY createdAt DESC
+        `;
+        
+        const result = await client.query<AgentWorkflowDocument>(query, { sessionId });
+        return result || [];
+    } catch (err) {
+        logError('Failed to get session agent workflows', { sessionId, error: err });
+        return [];
+    }
+}
+
+/**
+ * Delete an agent workflow
+ */
+export async function deleteAgentWorkflow(workflowId: string): Promise<boolean> {
+    const client = getCouchbaseClient();
+    
+    const success = await client.remove(`agent-workflow::${workflowId}`);
+    if (success) {
+        debug('Deleted agent workflow', { workflowId });
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Update workflow status
+ */
+export async function updateWorkflowStatus(
+    workflowId: string, 
+    status: 'planning' | 'executing' | 'completed' | 'failed' | 'cancelled',
+    completedAt?: string
+): Promise<boolean> {
+    const client = getCouchbaseClient();
+    const docId = `agent-workflow::${workflowId}`;
+    
+    try {
+        const existing = await client.get<AgentWorkflowDocument>(docId);
+        if (!existing || !existing.content) {
+            return false;
+        }
+        
+        existing.content.status = status;
+        if (completedAt) {
+            existing.content.completedAt = completedAt;
+        }
+        
+        const success = await client.replace(docId, existing.content);
+        return success;
+    } catch (err) {
+        logError('Failed to update workflow status', { workflowId, error: err });
+        return false;
+    }
+}
+
+/**
+ * Update a specific step in a workflow
+ */
+export async function updateWorkflowStep(
+    workflowId: string,
+    stepId: string,
+    updates: Partial<PersistedAgentStep>
+): Promise<boolean> {
+    const client = getCouchbaseClient();
+    const docId = `agent-workflow::${workflowId}`;
+    
+    try {
+        const existing = await client.get<AgentWorkflowDocument>(docId);
+        if (!existing || !existing.content) {
+            return false;
+        }
+        
+        const stepIndex = existing.content.steps.findIndex(s => s.id === stepId);
+        if (stepIndex === -1) {
+            return false;
+        }
+        
+        existing.content.steps[stepIndex] = {
+            ...existing.content.steps[stepIndex],
+            ...updates
+        };
+        
+        const success = await client.replace(docId, existing.content);
+        return success;
+    } catch (err) {
+        logError('Failed to update workflow step', { workflowId, stepId, error: err });
+        return false;
+    }
 }

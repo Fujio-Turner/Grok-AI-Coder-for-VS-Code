@@ -98,9 +98,10 @@
                         "type": "string", 
                         "enum": ["insert", "delete", "replace", "insertAfter", "insertBefore"]
                       },
-                      "line": { "type": "integer", "description": "1-indexed line number" },
-                      "expectedContent": { "type": "string", "description": "Content expected at line (for validation)" },
-                      "newContent": { "type": "string", "description": "New content to insert/replace" }
+                      "line": { "type": "integer", "description": "1-indexed line number (start of range)" },
+                      "endLine": { "type": "integer", "description": "1-indexed end line (inclusive) for range ops" },
+                      "expectedContent": { "type": "string", "description": "Content expected at first line (for validation)" },
+                      "newContent": { "type": "string", "description": "New content (use \\n for multi-line)" }
                     },
                     "required": ["type", "line"],
                     "additionalProperties": false

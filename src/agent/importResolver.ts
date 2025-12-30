@@ -49,6 +49,9 @@ export async function followImports(
     // Track visited files to avoid cycles
     const visited = new Set<string>();
     
+    // Queue external fetches for parallel execution
+    const externalFetchQueue: Array<{ module: string; githubUrl: string }> = [];
+    
     // Queue of files to process: [filePath, content, depth]
     const queue: Array<{ path: string; content: string; depth: number }> = [
         { path: startFilePath, content: startContent, depth: 0 }
@@ -103,30 +106,55 @@ export async function followImports(
                     });
                 }
             } else if (imp.isExternal && imp.githubUrl && result.external.size < MAX_EXTERNAL) {
-                // Fetch external docs (only known packages with GitHub URLs)
-                onProgress?.(`🌐 Fetching docs: ${imp.module}`);
-                
-                try {
-                    // Try to get README from GitHub
-                    const readmeUrl = `${imp.githubUrl}/blob/main/README.md`;
-                    const rawUrl = `https://raw.githubusercontent.com/${imp.githubUrl.replace('https://github.com/', '')}/main/README.md`;
-                    
-                    if (!result.external.has(imp.githubUrl)) {
-                        const fetchResult = await fetchUrl(rawUrl);
-                        if (fetchResult.success && fetchResult.content) {
-                            // Truncate to first 5000 chars
-                            const truncated = fetchResult.content.length > 5000 
-                                ? fetchResult.content.substring(0, 5000) + '\n\n[Truncated...]'
-                                : fetchResult.content;
-                            result.external.set(imp.githubUrl, truncated);
-                            info(`Fetched README for ${imp.module}`);
-                        }
-                    }
-                } catch (err: any) {
-                    debug(`Failed to fetch docs for ${imp.module}: ${err.message}`);
+                // Queue external fetches for parallel execution (collected below)
+                if (!result.external.has(imp.githubUrl)) {
+                    externalFetchQueue.push({ module: imp.module, githubUrl: imp.githubUrl });
                 }
             }
         }
+    }
+    
+    // CONCURRENT FETCH: Execute all external fetches in parallel for speed
+    if (externalFetchQueue.length > 0) {
+        const startTime = Date.now();
+        onProgress?.(`🌐 Fetching ${externalFetchQueue.length} doc(s) in parallel...`);
+        
+        const fetchPromises = externalFetchQueue.map(async ({ module, githubUrl }) => {
+            const fetchStart = Date.now();
+            try {
+                const rawUrl = `https://raw.githubusercontent.com/${githubUrl.replace('https://github.com/', '')}/main/README.md`;
+                const fetchResult = await fetchUrl(rawUrl);
+                const fetchMs = Date.now() - fetchStart;
+                
+                if (fetchResult.success && fetchResult.content) {
+                    const truncated = fetchResult.content.length > 5000 
+                        ? fetchResult.content.substring(0, 5000) + '\n\n[Truncated...]'
+                        : fetchResult.content;
+                    onProgress?.(`✅ ${module} (${fetchMs}ms, ${fetchResult.bytes || 0}B)`);
+                    return { githubUrl, content: truncated, success: true };
+                }
+                onProgress?.(`⚠️ ${module} failed (${fetchMs}ms)`);
+                return { githubUrl, success: false };
+            } catch (err: any) {
+                const fetchMs = Date.now() - fetchStart;
+                debug(`Failed to fetch docs for ${module}: ${err.message}`);
+                onProgress?.(`❌ ${module} error (${fetchMs}ms)`);
+                return { githubUrl, success: false };
+            }
+        });
+        
+        const fetchResults = await Promise.all(fetchPromises);
+        const totalMs = Date.now() - startTime;
+        
+        // Store successful results
+        for (const { githubUrl, content, success } of fetchResults) {
+            if (success && content) {
+                result.external.set(githubUrl, content);
+            }
+        }
+        
+        const successCount = fetchResults.filter(r => r.success).length;
+        onProgress?.(`✅ Fetched ${successCount}/${externalFetchQueue.length} in ${totalMs}ms (parallel)`);
     }
     
     info(`Import following complete: ${result.files.size} files, ${result.external.size} external, depth ${result.depth}`);

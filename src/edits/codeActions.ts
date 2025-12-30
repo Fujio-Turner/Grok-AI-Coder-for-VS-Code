@@ -769,6 +769,110 @@ export async function revertToChangeSet(targetChangeSetId: string): Promise<bool
     return true;
 }
 
+// ============================================================================
+// Agent Step Revert Functions
+// ============================================================================
+
+import { getAgentStepTracker, AgentStep, AgentWorkflow, StepRevertResult } from '../agent/agentStepTracker';
+
+/**
+ * Preview what would be reverted if we revert a specific step.
+ * Returns the list of steps and ChangeSets that would be affected.
+ */
+export async function previewStepRevert(stepId: string): Promise<{
+    stepsToRevert: Array<{ id: string; stepNumber: number; description: string }>;
+    changeSetsToRevert: string[];
+    filesAffected: string[];
+}> {
+    const tracker = getAgentStepTracker();
+    const result = await tracker.revertStep(stepId, true); // dry run
+    
+    const workflow = tracker.getCurrentWorkflow();
+    const stepsToRevert = result.revertedSteps.map(sid => {
+        const step = workflow?.steps.find(s => s.id === sid);
+        return {
+            id: sid,
+            stepNumber: step?.stepNumber || 0,
+            description: step?.description || 'Unknown step'
+        };
+    });
+    
+    // Get all files affected by the ChangeSets
+    const filesAffected = new Set<string>();
+    const history = changeTracker.getHistory();
+    for (const csId of result.revertedChangeSets) {
+        const cs = history.find(c => c.id === csId);
+        if (cs) {
+            for (const file of cs.files) {
+                filesAffected.add(file.filePath);
+            }
+        }
+    }
+    
+    return {
+        stepsToRevert,
+        changeSetsToRevert: result.revertedChangeSets,
+        filesAffected: Array.from(filesAffected)
+    };
+}
+
+/**
+ * Revert a step and all its dependent steps.
+ * This is the main entry point for step-based rollback.
+ */
+export async function revertAgentStep(stepId: string): Promise<StepRevertResult> {
+    const tracker = getAgentStepTracker();
+    const result = await tracker.revertStep(stepId, false);
+    
+    if (result.success) {
+        debug(`[AgentStep] Reverted step ${stepId}: ${result.revertedSteps.length} steps, ${result.revertedChangeSets.length} ChangeSets`);
+    } else {
+        debug(`[AgentStep] Failed to revert step ${stepId}: ${result.errors.join(', ')}`);
+    }
+    
+    return result;
+}
+
+/**
+ * Revert to a specific step number (revert everything after it).
+ */
+export async function revertToAgentStep(stepNumber: number): Promise<StepRevertResult> {
+    const tracker = getAgentStepTracker();
+    return tracker.revertToStep(stepNumber);
+}
+
+/**
+ * Get current workflow status for UI display.
+ */
+export function getWorkflowStatus(): {
+    hasActiveWorkflow: boolean;
+    workflow: AgentWorkflow | null;
+    currentStep: AgentStep | null;
+    summary: {
+        totalSteps: number;
+        completedSteps: number;
+        currentStepNumber: number;
+        status: string;
+    };
+} {
+    const tracker = getAgentStepTracker();
+    const workflow = tracker.getCurrentWorkflow();
+    const currentStep = tracker.getCurrentStep();
+    const summary = tracker.getWorkflowSummary();
+    
+    return {
+        hasActiveWorkflow: summary.hasActiveWorkflow,
+        workflow,
+        currentStep,
+        summary: {
+            totalSteps: summary.totalSteps,
+            completedSteps: summary.completedSteps,
+            currentStepNumber: summary.currentStepNumber,
+            status: summary.status
+        }
+    };
+}
+
 export async function reapplyFromChangeSet(targetChangeSetId: string): Promise<boolean> {
     const history = changeTracker.getHistory();
     const currentPosition = changeTracker.getCurrentPosition();

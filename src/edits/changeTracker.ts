@@ -33,6 +33,7 @@ class ChangeTracker {
     private currentPosition: number = -1;
     private startTime: number = 0;
     private onChangeCallback?: (changes: ChangeSet[], position: number) => void;
+    private onChangeSetAddedCallback?: (changeSet: ChangeSet) => void;
 
     startTracking(): void {
         this.startTime = Date.now();
@@ -142,6 +143,12 @@ class ChangeTracker {
         this.startTime = 0;
 
         this.notifyChange();
+        
+        // Notify listeners that a new ChangeSet was added (for AgentStepTracker)
+        if (this.onChangeSetAddedCallback) {
+            this.onChangeSetAddedCallback(changeSet);
+        }
+        
         return changeSet;
     }
 
@@ -236,6 +243,14 @@ class ChangeTracker {
 
     onChange(callback: (changes: ChangeSet[], position: number) => void): void {
         this.onChangeCallback = callback;
+    }
+
+    /**
+     * Register callback for when a new ChangeSet is added.
+     * Used by AgentStepTracker to auto-link ChangeSets to steps.
+     */
+    onChangeSetAdded(callback: (changeSet: ChangeSet) => void): void {
+        this.onChangeSetAddedCallback = callback;
     }
 
     private notifyChange(): void {

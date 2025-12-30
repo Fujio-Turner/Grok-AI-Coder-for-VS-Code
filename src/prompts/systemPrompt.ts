@@ -18,6 +18,14 @@ function getResponseFormat(): string {
     return config.get<string>('responseFormat') || 'json';
 }
 
+/**
+ * Get the prompt verbosity setting
+ */
+function getPromptVerbosity(): 'full' | 'compact' | 'minimal' {
+    const config = vscode.workspace.getConfiguration('grok');
+    return config.get<'full' | 'compact' | 'minimal'>('promptVerbosity') || 'compact';
+}
+
 export const SYSTEM_PROMPT_BASE = `You are Grok, an AI coding assistant integrated into VS Code. Help users with coding tasks.
 
 ## ⚠️ CRITICAL: FILE ACCESS RULES
@@ -184,6 +192,28 @@ For MODIFYING existing files, use lineOperations for precise, validated changes:
 - \`insert\`: Insert at line number (pushes existing content down)
 - \`insertAfter\`: Insert after specified line
 - \`insertBefore\`: Insert before specified line
+
+**🔑 BATCH CONTIGUOUS LINES - Use \`endLine\` for ranges!**
+
+When modifying multiple consecutive lines, use a SINGLE operation with \`line\` and \`endLine\`:
+
+\`\`\`json
+// ❌ BAD - 3 separate operations (wasteful):
+{"type": "replace", "line": 10, "newContent": "line 10 new"},
+{"type": "replace", "line": 11, "newContent": "line 11 new"},
+{"type": "replace", "line": 12, "newContent": "line 12 new"}
+
+// ✅ GOOD - 1 operation with range (efficient):
+{"type": "replace", "line": 10, "endLine": 12, "expectedContent": "line 10", "newContent": "line 10 new\\nline 11 new\\nline 12 new"}
+\`\`\`
+
+Range operations:
+- \`line\`: Start line (1-indexed)
+- \`endLine\`: End line (1-indexed, inclusive) - optional, defaults to single line
+- \`newContent\`: Use \\n for multi-line content
+- \`expectedContent\`: Content from FIRST line of range (for validation)
+
+**ALWAYS batch contiguous changes into a single operation!** This reduces tokens and is more reliable.
 
 **⚠️ LINE NUMBERS ARE 1-INDEXED:**
 - Line 1 is the FIRST line of the file (not line 0)
@@ -438,11 +468,31 @@ Complex tasks with 3+ steps: Execute ONE STEP AT A TIME.
 `;
     }
     
-    // Try to load from config file, fall back to hardcoded SYSTEM_PROMPT_BASE
-    const configPrompt = getPromptFromConfig('system-prompt', '');
+    // Check verbosity setting to determine which prompt to load
+    const verbosity = getPromptVerbosity();
+    const configNameMap: Record<string, string> = {
+        'minimal': 'system-prompt-minimal',
+        'compact': 'system-prompt-compact',
+        'full': 'system-prompt'
+    };
+    const configName = configNameMap[verbosity] || 'system-prompt-compact';
+    
+    // Try to load from config file
+    const configPrompt = getPromptFromConfig(configName, '');
     if (configPrompt) {
-        debug('Loaded system prompt from config/system-prompt.json');
+        debug(`Loaded system prompt from config/${configName}.json (verbosity: ${verbosity})`);
         return configPrompt;
+    }
+    
+    // Fallback chain: minimal -> compact -> full
+    const fallbackOrder = ['system-prompt-compact', 'system-prompt-minimal', 'system-prompt'];
+    for (const fallbackName of fallbackOrder) {
+        if (fallbackName === configName) continue;
+        const fallbackPrompt = getPromptFromConfig(fallbackName, '');
+        if (fallbackPrompt) {
+            debug(`Loaded fallback system prompt from config/${fallbackName}.json`);
+            return fallbackPrompt;
+        }
     }
     
     debug('Using hardcoded SYSTEM_PROMPT_BASE (config not found)');

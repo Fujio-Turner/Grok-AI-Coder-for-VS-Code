@@ -7,6 +7,7 @@ import { initStatusBar, showUsageSummary } from './usage/tokenTracker';
 import { getChangeTracker } from './edits/codeActions';
 import { testApiConnection } from './api/grokClient';
 import { listSessions } from './storage/chatSessionRepository';
+import { initializeStepTracking, getAgentStepTracker } from './agent/agentStepTracker';
 
 export function activate(context: vscode.ExtensionContext) {
     // Initialize logger first
@@ -22,6 +23,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Initialize status bar for token tracking
     initStatusBar(context);
+    
+    // Initialize agent step tracking (for multi-step workflows)
+    initializeStepTracking();
 
     // Register the chat view provider
     const chatViewProvider = new ChatViewProvider(context.extensionUri, context);

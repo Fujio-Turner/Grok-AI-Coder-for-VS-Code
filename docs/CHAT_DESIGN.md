@@ -1720,6 +1720,239 @@ When truncation is detected (incomplete JSON with recoverable file changes):
 
 ---
 
+## Agent Step Workflow System
+
+The Agent Step Workflow system provides step-based grouping on top of the existing ChangeTracker, enabling multi-step agent workflows with cascading rollback capabilities.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    subgraph Workflow["📋 AgentWorkflow"]
+        W[Workflow ID]
+        W --> S1[Step 1]
+        W --> S2[Step 2]
+        W --> S3[Step 3]
+    end
+    
+    subgraph Steps["🔢 AgentStep"]
+        S1 --> CS1[ChangeSet A]
+        S1 --> CS2[ChangeSet B]
+        S2 --> CS3[ChangeSet C]
+        S3 --> CS4[ChangeSet D]
+    end
+    
+    subgraph Tracker["📝 ChangeTracker"]
+        CS1 --> F1[file1.ts]
+        CS2 --> F2[file2.ts]
+        CS3 --> F3[file3.ts]
+        CS4 --> F4[file4.ts]
+    end
+    
+    style Workflow fill:#7c3aed,stroke:#fff,color:#fff
+    style Steps fill:#1a3a1a,stroke:#4ec9b0,color:#fff
+    style Tracker fill:#1a2a3a,stroke:#569cd6,color:#fff
+```
+
+### Key Interfaces
+
+#### AgentStep
+
+```typescript
+interface AgentStep {
+    id: string;                      // Unique step ID
+    stepNumber: number;              // Sequential: 1, 2, 3...
+    sessionId: string;               // Links to ChatSession
+    description: string;             // What this step does
+    intent: string;                  // Original user request
+    dependsOn: string[];             // Step IDs this depends on
+    dependents: string[];            // Steps that depend on this one
+    changeSetIds: string[];          // ChangeSet IDs from ChangeTracker
+    execution?: {
+        commands: AgentCommand[];    // Commands executed
+        success: boolean;
+        error?: string;
+    };
+    status: 'pending' | 'in-progress' | 'applied' | 'reverted' | 'failed';
+    createdAt: string;
+    appliedAt?: string;
+    revertedAt?: string;
+}
+```
+
+#### AgentWorkflow
+
+```typescript
+interface AgentWorkflow {
+    id: string;
+    sessionId: string;
+    userRequest: string;             // Original user request
+    steps: AgentStep[];
+    currentStepIndex: number;        // -1 = not started
+    status: 'planning' | 'executing' | 'completed' | 'failed' | 'cancelled';
+    createdAt: string;
+    completedAt?: string;
+}
+```
+
+### Workflow Creation Flow
+
+```mermaid
+flowchart LR
+    A[AI Response] --> B{TODOs > 1?}
+    B -->|Yes| C[Create Workflow]
+    C --> D[Add Step per TODO]
+    D --> E[Start First Step]
+    E --> F[Link ChangeSets]
+    B -->|No| G[Single operation]
+    
+    style C fill:#7c3aed,stroke:#fff,color:#fff
+```
+
+When the AI returns a response with 2+ TODOs, the system automatically:
+1. Creates a new `AgentWorkflow` for the session
+2. Adds an `AgentStep` for each TODO item
+3. Starts the first step (status: `in-progress`)
+4. Auto-links ChangeSets to the current step via the `onChangeSetAdded` callback
+
+### ChangeSet Auto-Linking
+
+The `ChangeTracker` emits an event when a new ChangeSet is added:
+
+```typescript
+// In changeTracker.ts
+onChangeSetAdded(callback: (changeSet: ChangeSet) => void): void {
+    this.onChangeSetAddedCallback = callback;
+}
+
+// Called in addChangeSet()
+if (this.onChangeSetAddedCallback) {
+    this.onChangeSetAddedCallback(changeSet);
+}
+```
+
+The `AgentStepTracker` listens for this event and automatically links new ChangeSets to the current step:
+
+```typescript
+// In agentStepTracker.ts - initializeStepTracking()
+changeTracker.onChangeSetAdded((changeSet: ChangeSet) => {
+    agentStepTracker.linkChangeSet(changeSet.id);
+});
+```
+
+### Cascading Rollback
+
+When reverting a step, all dependent steps are also reverted:
+
+```mermaid
+flowchart TD
+    A[User clicks Revert Step 2] --> B[Find dependent steps]
+    B --> C[Step 3 depends on Step 2]
+    B --> D[Step 4 depends on Step 3]
+    C --> E[Revert Step 4 first]
+    D --> E
+    E --> F[Revert Step 3]
+    F --> G[Revert Step 2]
+    G --> H[Update workflow status]
+    
+    style A fill:#c44,stroke:#fff,color:#fff
+```
+
+**Preview Before Revert:**
+
+Before executing a revert, the system shows a preview:
+
+```
+⚠️ Reverting this step will also revert:
+
+Step 2: Create auth middleware
+Step 3: Add login/register routes
+
+Files affected: auth.ts, routes.ts
+
+[Cancel] [Revert]
+```
+
+### UI Components
+
+#### Workflow Timeline Bar
+
+The workflow timeline appears above the TODO panel when a workflow is active:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 📋 Workflow                                      2/4    ✕  │
+│ ┌────┐───┌────┐───┌────┐───┌────┐                          │
+│ │ ✓  │───│ ●  │───│ 3  │───│ 4  │                          │
+│ │auth│   │test│   │docs│   │dep │                          │
+│ └────┘   └────┘   └────┘   └────┘                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Step Icon States:**
+
+| Status | Icon | Color | Description |
+|--------|------|-------|-------------|
+| `pending` | `○` | Gray dashed | Not started |
+| `in-progress` | `●` | Blue pulsing | Currently executing |
+| `applied` | `✓` | Green | Completed successfully |
+| `reverted` | `↺` | Gray | Rolled back |
+| `failed` | `✗` | Red | Failed with error |
+
+**Interactions:**
+- Hover on step → shows full description tooltip
+- Click revert button (↺) → shows preview dialog
+- Click ✕ → cancels entire workflow
+
+### Message Types
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `getWorkflowStatus` | Webview → Extension | Request current workflow state |
+| `workflowStatus` | Extension → Webview | Send workflow data for rendering |
+| `previewStepRevert` | Webview → Extension | Request revert preview |
+| `stepRevertPreview` | Extension → Webview | Send preview data |
+| `revertStep` | Webview → Extension | Execute step revert |
+| `revertToStep` | Webview → Extension | Revert to specific step number |
+| `cancelWorkflow` | Webview → Extension | Cancel active workflow |
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/agent/agentStepTracker.ts` | Core step tracking logic, workflow management |
+| `src/edits/changeTracker.ts` | ChangeSet management, `onChangeSetAdded` callback |
+| `src/edits/codeActions.ts` | `previewStepRevert()`, `revertAgentStep()`, `revertToAgentStep()` |
+| `src/storage/chatSessionRepository.ts` | `AgentWorkflowDocument`, CRUD operations |
+| `src/views/ChatViewProvider.ts` | UI handlers, `_updateWorkflowFromTodos()` |
+
+### Couchbase Document Schema
+
+```json
+{
+  "id": "agent-workflow::workflow-1234567890-abc123",
+  "docType": "agent-workflow",
+  "sessionId": "session-uuid",
+  "userRequest": "Add authentication to my Express app",
+  "steps": [
+    {
+      "id": "step-1234567890-xyz789",
+      "stepNumber": 1,
+      "description": "Install jsonwebtoken and bcrypt packages",
+      "status": "applied",
+      "changeSetIds": ["cs-1234567890"],
+      "dependsOn": [],
+      "dependents": ["step-2345678901-abc012"]
+    }
+  ],
+  "currentStepIndex": 2,
+  "status": "executing",
+  "createdAt": "2024-12-29T10:00:00.000Z"
+}
+```
+
+---
+
 ## Response Recovery Flow
 
 When an AI response has errors (truncation, malformed JSON, or parsing failures), the system attempts recovery and presents users with clear action options.
