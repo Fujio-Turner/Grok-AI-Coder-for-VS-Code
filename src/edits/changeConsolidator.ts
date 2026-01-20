@@ -10,6 +10,8 @@
  */
 
 import { FileChange, LineOperation } from '../prompts/responseSchema';
+import * as vscode from 'vscode';
+import { type DiffChange } from '../views/InlineDiffWidgets';
 
 export interface ConsolidationResult {
     /** Consolidated file changes - one per unique file path */
@@ -237,21 +239,21 @@ function resolveLineConflict(
  * Merge content-based changes.
  * For diff changes, combines them. For full content, last one wins.
  */
-function mergeContentChanges(changes: FileChange[]): string {
+async function mergeContentChanges(changes: FileChange[]) {
     const diffChanges = changes.filter(c => c.isDiff);
-    const fullChanges = changes.filter(c => !c.isDiff);
+    // const fullChanges = changes.filter(c => !c.isDiff);
+    await vscode.commands.executeCommand('grok.previewChanges', diffChanges);
+    // if (fullChanges.length > 0) {
+    //     // Last full content change wins
+    //     return fullChanges[fullChanges.length - 1].content;
+    // }
 
-    if (fullChanges.length > 0) {
-        // Last full content change wins
-        return fullChanges[fullChanges.length - 1].content;
-    }
+    // if (diffChanges.length > 0) {
+    //     // Combine diff contents
+    //     return diffChanges.map(c => c.content).join('\n');
+    // }
 
-    if (diffChanges.length > 0) {
-        // Combine diff contents
-        return diffChanges.map(c => c.content).join('\n');
-    }
-
-    return changes[changes.length - 1].content;
+    // return changes[changes.length - 1].content;
 }
 
 /**

@@ -8,6 +8,7 @@ import { getChangeTracker } from './edits/codeActions';
 import { testApiConnection } from './api/grokClient';
 import { listSessions } from './storage/chatSessionRepository';
 import { initializeStepTracking, getAgentStepTracker } from './agent/agentStepTracker';
+import { InlineDiffWidget } from './views/InlineDiffWidget';
 
 export function activate(context: vscode.ExtensionContext) {
     // Initialize logger first
@@ -236,6 +237,30 @@ export function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // Create diff widget
+    const diffWidget = new InlineDiffWidget(context);
+    
+    // Register diff preview command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.previewChanges', async (changes) => {
+            await diffWidget.showDiff(changes);
+        })
+    );
+    
+    // Register navigation commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.diffNext', async () => {
+            await diffWidget.nextChange();
+        })
+    );
+    
+    context.subscriptions.push(
+        vscode.commands.registerCommand('grok.diffPrevious', async () => {
+            await diffWidget.previousChange();
+        })
+    );
+    
 
     info('All commands registered');
     
